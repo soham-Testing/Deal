@@ -1,23 +1,84 @@
-import streamlit as st
-import pandas as pd
-from pandas.api.types import is_numeric_dtype
+"""
+Flipkart BBD Deal Tracker & Live Price Radar
+--------------------------------------------
+A single-page Streamlit application that tracks catalogue prices against
+6-month averages and last Big Billion Days floor prices, scores each deal,
+applies card-offer maths and maintains a persistent personal wishlist.
+
+Fix history (v12):
+  * FIXED  E002 / blank product page: URLs are no longer rewritten into the
+           non-existent "/item/p/product?pid=" route. Original PDP paths are
+           preserved and only tracking parameters are stripped.
+  * FIXED  Duplicate/unverifiable "itm" product IDs now degrade gracefully to
+           a guaranteed-valid Flipkart search URL instead of a dead PDP.
+  * FIXED  Infinite rerun loop triggered by the in-table wishlist checkbox.
+  * FIXED  Non-atomic JSON writes that could corrupt the local store.
+  * FIXED  Global random.seed() side effect and several unguarded edge cases.
+
+Run with:  streamlit run flipkart_deal_tracker.py
+"""
+
+from __future__ import annotations
+
+import datetime as dt
 import json
+import logging
 import os
-import uuid
-import datetime
 import random
 import re
+import tempfile
+import uuid
+from collections import Counter
+from typing import Any, Dict, Iterable, List, Tuple
+from urllib.parse import parse_qsl, quote_plus, urlencode, urlparse, urlunparse
 
-# --- PAGE CONFIGURATION ---
+import pandas as pd
+import streamlit as st
+
+# --------------------------------------------------------------------------- #
+# CONSTANTS & CONFIGURATION
+# --------------------------------------------------------------------------- #
+
+APP_TITLE = "Flipkart BBD Deal Tracker & Live Price Radar"
+TRACKER_VERSION = "v12_safe_url_resolver"
+TRACKER_DB_FILE = os.environ.get("TRACKER_DB_FILE", "tracker_store.json")
+
+FLIPKART_BASE = "https://www.flipkart.com"
+FLIPKART_SEARCH = FLIPKART_BASE + "/search?q={query}"
+ALLOWED_HOSTS = {"flipkart.com", "www.flipkart.com", "dl.flipkart.com"}
+
+# Query parameters Flipkart genuinely needs to render a PDP.
+KEEP_PARAMS = {"pid", "lid", "marketplace", "q", "otracker", "store"}
+# Referral / analytics noise that can break or pollute the PDP.
+DROP_PARAM_PATTERN = re.compile(
+    r"^(utm_.*|affid|affExtParam\d*|cmpid|pageuid|lastviewedpid|ppt|ppn|ssid|srno|qh|iid|fm|sattr\d*)$",
+    re.IGNORECASE,
+)
+# A genuine Flipkart PDP id looks like: itm + 15 hexadecimal characters.
+ITM_ID_PATTERN = re.compile(r"/p/(itm[0-9a-f]{15})\b", re.IGNORECASE)
+
+INSTANT_DISCOUNT_RATE = 0.10
+INSTANT_DISCOUNT_CAP = 1500
+CASHBACK_RATE = 0.05
+BBD_PREDICTION_FACTOR = 0.93
+STRONG_DISCOUNT_THRESHOLD = 28.0
+
+CARD_AUTO = "Auto-Best Card"
+CARD_INSTANT = "Axis / ICICI (10% Instant, Cap ₹1.5k)"
+CARD_CASHBACK = "Flipkart Axis (5% Unlimited Cashback)"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("deal_tracker")
+
 st.set_page_config(
-    page_title="Flipkart BBD Deal Tracker & Live Price Radar",
+    page_title=APP_TITLE,
     page_icon="⚡",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="collapsed",
 )
 
-# Custom Styling
-st.markdown("""
+st.markdown(
+    """
 <style>
     .kpi-container { background-color: #0f172a; padding: 12px; border-radius: 8px; border: 1px solid #1e293b; text-align: center; }
     .kpi-number { font-size: 1.35rem; font-weight: 800; color: #38bdf8; }
@@ -27,609 +88,759 @@ st.markdown("""
     .section-title-ads { background: linear-gradient(90deg, #1e3a8a, #172554); padding: 12px 18px; border-radius: 8px; border-left: 6px solid #a855f7; margin: 30px 0 15px 0; color: white; }
     .section-title-wishlist { background: linear-gradient(90deg, #831843, #500724); padding: 12px 18px; border-radius: 8px; border-left: 6px solid #ec4899; margin: 30px 0 15px 0; color: white; }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-TRACKER_VERSION = "v12_bulletproof_pdp"
-TRACKER_DB_FILE = "tracker_store.json"
 
-def clean_url_safe(raw_url):
+# --------------------------------------------------------------------------- #
+# URL RESOLUTION  (root cause of the blank page / E002 error)
+# --------------------------------------------------------------------------- #
+
+
+def search_url(*terms: str) -> str:
+    """Return a Flipkart search URL. This route is always valid and never 404s."""
+    query = " ".join(t for t in terms if t).strip() or "deals"
+    return FLIPKART_SEARCH.format(query=quote_plus(query))
+
+
+def sanitize_url(raw_url: str) -> str:
     """
-    Cleans tracking/affiliate tokens while strictly preserving product slugs,
-    the pid parameter, and marketplace=FLIPKART to prevent blank pages or E002.
+    Normalise a Flipkart URL by removing referral/analytics parameters while
+    preserving the product path, `pid`, `lid` and `marketplace`.
+
+    The product path is NEVER reconstructed: Flipkart's PDP is served from
+    /<slug>/p/<itm-id>, so synthesising a path such as /item/p/product returns
+    an empty SPA shell and the client-side E002 error.
     """
-    if not raw_url:
-        return "https://www.flipkart.com"
-    clean = raw_url.strip()
+    if not raw_url or not isinstance(raw_url, str):
+        return ""
 
-    # Extract PID if present and construct verified canonical URL
-    pid_match = re.search(r'[?&]pid=([A-Z0-9]+)', clean, re.IGNORECASE)
-    if pid_match:
-        pid = pid_match.group(1).upper()
-        return f"https://www.flipkart.com/item/p/product?pid={pid}&marketplace=FLIPKART"
+    candidate = raw_url.strip().strip('",)\u200b')
+    if not candidate:
+        return ""
+    if candidate.startswith("//"):
+        candidate = "https:" + candidate
+    if not candidate.lower().startswith(("http://", "https://")):
+        candidate = "https://" + candidate.lstrip("/")
 
-    if clean.startswith("http"):
-        # Strip marketing trackers only; preserve core URL
-        clean = re.sub(r'([?&])(utm_[^&]+|affid=[^&]+|cmpid=[^&]+|pageUID=[^&]+|lastViewedPid=[^&]+)', '', clean)
-        clean = clean.replace('?&', '?').rstrip('?&')
-    return clean
+    try:
+        parsed = urlparse(candidate)
+    except ValueError:
+        logger.warning("Unparseable URL discarded: %s", raw_url)
+        return ""
 
-# --- AUDITED PRODUCT CATALOG WITH REAL, 100% VERIFIED WORKING FLIPKART LINKS ---
-CAT_DATA_MATRIX = {
+    if parsed.netloc.lower() not in ALLOWED_HOSTS:
+        return ""
+
+    kept = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=False)
+        if key.lower() in KEEP_PARAMS and not DROP_PARAM_PATTERN.match(key)
+    ]
+    return urlunparse(
+        ("https", "www.flipkart.com", parsed.path, "", urlencode(kept), "")
+    )
+
+
+def is_pdp(url: str) -> bool:
+    """True when the URL points at a well-formed product detail page."""
+    return bool(url) and bool(ITM_ID_PATTERN.search(urlparse(url).path))
+
+
+def extract_itm_id(url: str) -> str:
+    match = ITM_ID_PATTERN.search(urlparse(url or "").path)
+    return match.group(1).lower() if match else ""
+
+
+def resolve_product_url(raw_url: str, *fallback_terms: str, blocked_ids: Iterable[str] = ()) -> str:
+    """
+    Return the safest usable link for a product.
+
+    Order of preference:
+      1. A sanitised, well-formed PDP whose product id is not known-bad.
+      2. A sanitised non-PDP Flipkart URL (category/search pages still render).
+      3. A Flipkart search URL built from the product name.
+    """
+    clean = sanitize_url(raw_url)
+    if is_pdp(clean) and extract_itm_id(clean) not in set(blocked_ids):
+        return clean
+    if clean and not is_pdp(clean):
+        return clean
+    return search_url(*fallback_terms)
+
+
+# --------------------------------------------------------------------------- #
+# PRODUCT CATALOGUE
+# --------------------------------------------------------------------------- #
+
+# (brand, name, mrp, six_month_avg, last_bbd_low, current_price, url)
+CatalogItem = Tuple[str, str, int, int, int, int, str]
+
+CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
     "Men's Fashion": {
-        "slug": "mens_fashion", "icon": "👔",
+        "slug": "mens_fashion",
+        "icon": "👔",
         "items": [
-            ("Levi's", "511 Slim Fit Stretch Jeans", 2999, 1749, 1099, 1056, "https://www.flipkart.com/levi-s-511-slim-men-blue-jeans/p/itm28448ec8d098a?pid=JEAGH4GFGZGHZ7ZZ&marketplace=FLIPKART"),
-            ("U.S. Polo Assn", "Solid Cotton Polo T-Shirt", 1999, 1399, 849, 899, "https://www.flipkart.com/u-s-polo-assn-solid-men-polo-neck-blue-t-shirt/p/itm68a18fa40bc75?pid=TSHGWGX7FGHVHGZZ&marketplace=FLIPKART"),
-            ("Louis Philippe", "2-Piece Formal Slim Suit", 10999, 8999, 5499, 5390, "https://www.flipkart.com/louis-philippe-2-piece-solid-men-suit/p/itmbfb64d2750157?pid=SUIGTAGPTB3VS24W&marketplace=FLIPKART"),
-            ("Allen Solly", "Slim Fit Poplin Formal Shirt", 2199, 1599, 999, 1049, "https://www.flipkart.com/allen-solly-men-solid-formal-white-shirt/p/itm3d22bdf55f9a2?pid=SHTGWD64Y57YGGHJ&marketplace=FLIPKART"),
-            ("Peter England", "Slim Fit Formal Trousers", 2499, 1799, 1099, 1149, "https://www.flipkart.com/peter-england-men-slim-fit-black-trousers/p/itme9b28a2a4b86e?pid=TROHYZGXNZZZHHQG&marketplace=FLIPKART"),
-            ("Wildcraft", "Active Windproof Bomber Jacket", 4299, 2799, 1599, 1699, "https://www.flipkart.com/wildcraft-solid-men-jacket/p/itm1717849e75520?pid=JCKGYX7FZGYGYGZZ&marketplace=FLIPKART"),
-            ("Bewakoof", "Heavyweight Boxy Graphic Tee", 1299, 799, 449, 499, "https://www.flipkart.com/bewakoof-men-printed-round-neck-black-t-shirt/p/itm878df080e7d56?pid=TSHGV6YFXHHG7ZZZ&marketplace=FLIPKART"),
-            ("Highlander", "Cargo Jogger Pants with Drawstring", 2299, 1499, 899, 949, "https://www.flipkart.com/highlander-men-cargo-olive-trousers/p/itm4b232a549d9c2?pid=TROGXX7FZGZZZZZZ&marketplace=FLIPKART"),
-            ("Snitch", "Linen Blend Casual Mandarin Shirt", 2799, 1999, 1299, 1349, "https://www.flipkart.com/snitch-men-solid-casual-mandarin-shirt/p/itmdcf4f5d2ec757?pid=SHTGS7FZFZZZZZZZ&marketplace=FLIPKART"),
-            ("Roadster", "Classic Denim Trucker Jacket", 3599, 2399, 1499, 1549, "https://www.flipkart.com/roadster-men-solid-denim-jacket/p/itm8fa82ea2ba475?pid=JCKFSDGZZZZZZZZZ&marketplace=FLIPKART")
-        ]
+            ("Levi's", "511 Slim Fit Stretch Jeans", 2999, 1749, 1099, 1056, "https://www.flipkart.com/levi-s-511-slim-men-blue-jeans/p/itm28448ec8d098a"),
+            ("U.S. Polo Assn", "Solid Cotton Polo T-Shirt", 1999, 1399, 849, 899, ""),
+            ("Louis Philippe", "2-Piece Formal Slim Suit", 10999, 8999, 5499, 5390, "https://www.flipkart.com/louis-philippe-2-piece-solid-men-suit/p/itmbfb64d2750157"),
+            ("Allen Solly", "Slim Fit Poplin Formal Shirt", 2199, 1599, 999, 1049, ""),
+            ("Peter England", "Slim Fit Formal Trousers", 2499, 1799, 1099, 1149, ""),
+            ("Wildcraft", "Active Windproof Bomber Jacket", 4299, 2799, 1599, 1699, ""),
+            ("Bewakoof", "Heavyweight Boxy Graphic Tee", 1299, 799, 449, 499, ""),
+            ("Highlander", "Cargo Jogger Pants with Drawstring", 2299, 1499, 899, 949, ""),
+            ("Snitch", "Linen Blend Casual Mandarin Shirt", 2799, 1999, 1299, 1349, ""),
+            ("Roadster", "Classic Denim Trucker Jacket", 3599, 2399, 1499, 1549, ""),
+        ],
     },
     "Women's Fashion": {
-        "slug": "womens_fashion", "icon": "👗",
+        "slug": "womens_fashion",
+        "icon": "👗",
         "items": [
-            ("Biba", "Embroidered Anarkali Kurta Set", 4999, 2999, 1799, 1699, "https://www.flipkart.com/biba-women-kurta-pant-set/p/itm914d021c3bfa8?pid=SETGZZZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("W for Woman", "Pure Cotton Straight Kurta", 1999, 1349, 699, 649, "https://www.flipkart.com/w-women-printed-straight-kurta/p/itm8109ad7b2c9d8?pid=KRTGTGZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("ONLY", "High-Rise Wide Leg Denim Jeans", 2999, 1999, 1199, 1249, "https://www.flipkart.com/only-women-wide-leg-high-rise-blue-jeans/p/itm68a18fa40bc75?pid=JEAG5TZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Vero Moda", "Floral Summer Tiered Maxi Dress", 3499, 2299, 1299, 1349, "https://www.flipkart.com/vero-moda-women-maxi-multicolor-dress/p/itm1df5a072049ec?pid=DREG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Soch", "Chanderi Woven Silk Festive Saree", 5999, 3999, 2199, 2299, "https://www.flipkart.com/soch-embroidered-chanderi-silk-saree/p/itm0a27181347076?pid=SARG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("AND", "Casual Rayon Peplum Tunic Top", 1799, 1199, 649, 699, "https://www.flipkart.com/and-women-peplum-top/p/itmd5d59016be32c?pid=TOPG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Madame", "Knitted Ribbed Full-Sleeve Cardigan", 2499, 1699, 949, 999, "https://www.flipkart.com/madame-women-cardigan/p/itme9b28a2a4b86e?pid=SWTG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Aurelia", "Cotton Rich Festive Kurta Pant Set", 3999, 2499, 1399, 1449, "https://www.flipkart.com/aurelia-women-kurta-pant-set/p/itm1717849e75520?pid=SETG7FZZZZZZYYYY&marketplace=FLIPKART"),
-            ("Tokyo Talkies", "Cargo Utility Wide Leg Trousers", 2199, 1399, 799, 849, "https://www.flipkart.com/tokyo-talkies-women-cargo-trousers/p/itm4b232a549d9c2?pid=TROG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Libas", "Ethnic Foil Printed Straight Kurti", 1599, 999, 549, 599, "https://www.flipkart.com/libas-women-printed-straight-kurta/p/itm3d22bdf55f9a2?pid=KRTG7FZZZZZZZZZZ&marketplace=FLIPKART")
-        ]
+            ("Biba", "Embroidered Anarkali Kurta Set", 4999, 2999, 1799, 1699, ""),
+            ("W for Woman", "Pure Cotton Straight Kurta", 1999, 1349, 699, 649, ""),
+            ("ONLY", "High-Rise Wide Leg Denim Jeans", 2999, 1999, 1199, 1249, ""),
+            ("Vero Moda", "Floral Summer Tiered Maxi Dress", 3499, 2299, 1299, 1349, ""),
+            ("Soch", "Chanderi Woven Silk Festive Saree", 5999, 3999, 2199, 2299, ""),
+            ("AND", "Casual Rayon Peplum Tunic Top", 1799, 1199, 649, 699, ""),
+            ("Madame", "Knitted Ribbed Full-Sleeve Cardigan", 2499, 1699, 949, 999, ""),
+            ("Aurelia", "Cotton Rich Festive Kurta Pant Set", 3999, 2499, 1399, 1449, ""),
+            ("Tokyo Talkies", "Cargo Utility Wide Leg Trousers", 2199, 1399, 799, 849, ""),
+            ("Libas", "Ethnic Foil Printed Straight Kurti", 1599, 999, 549, 599, ""),
+        ],
     },
     "Footwear & Shoes": {
-        "slug": "footwear", "icon": "👟",
+        "slug": "footwear",
+        "icon": "👟",
         "items": [
-            ("Puma", "Conduct Pro Performance Running Shoes", 6499, 4899, 3299, 3199, "https://www.flipkart.com/item/p/product?pid=SHOHPPYFJTHG9HHR&marketplace=FLIPKART"),
-            ("Nike", "Revolution 7 Road Running Shoes", 3695, 3695, 2399, 2995, "https://www.flipkart.com/nike-revolution-7-running-shoes-men/p/itm4ea4909a341b1?pid=SHOG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Puma", "Smash V2 Leather Streetstyle Sneakers", 5599, 3599, 2399, 2429, "https://www.flipkart.com/puma-smash-v2-leather-sneakers-men/p/itm35c15694f479a?pid=SHOG7FZZZZZZYYYY&marketplace=FLIPKART"),
-            ("Asics", "Gel-Contend 8 Neutral Road Running", 5499, 4099, 2899, 2899, "https://www.flipkart.com/asics-gel-contend-8-running-shoes-men/p/itmfcfa56156e507?pid=SHOG7FZZZZZZXXXX&marketplace=FLIPKART"),
-            ("Woodland", "Camel Leather High-Traction Boots", 5995, 4595, 3295, 3495, "https://www.flipkart.com/woodland-boots-men/p/itm0ea622bc13d80?pid=SHOG7FZZZZZZWWWW&marketplace=FLIPKART"),
-            ("Skechers", "Go Run Elevate Daily Walking Shoes", 2499, 1699, 1099, 1149, "https://www.flipkart.com/skechers-go-run-elevate-running-shoes-men/p/itma7c0dcfd54406?pid=SHOG7FZZZZZZVVVV&marketplace=FLIPKART"),
-            ("Red Tape", "Airflow Chunky Retro Sneakers", 4999, 1899, 1199, 1249, "https://www.flipkart.com/red-tape-sneakers-men/p/itm18cb5732c53a6?pid=SHOG7FZZZZZZUUUU&marketplace=FLIPKART"),
-            ("Bata", "Formal Genuine Leather Derby Shoes", 3999, 2899, 1799, 1899, "https://www.flipkart.com/bata-derby-formal-shoes-men/p/itm71dae298ee787?pid=SHOG7FZZZZZZTTTT&marketplace=FLIPKART"),
-            ("Crocs", "Classic Unisex Foam Slip-On Clogs", 3495, 2695, 1799, 1995, "https://www.flipkart.com/crocs-classic-clogs/p/itm8fa82ea2ba475?pid=SHOG7FZZZZZZSSSS&marketplace=FLIPKART"),
-            ("Adidas", "Clinch-X Responsive Gym Trainer", 4499, 2999, 1899, 1999, "https://www.flipkart.com/adidas-clinch-x-running-shoes-men/p/itm9372e9c2c62c2?pid=SHOG7FZZZZZZRRRR&marketplace=FLIPKART")
-        ]
+            ("Puma", "Conduct Pro Performance Running Shoes", 6499, 4899, 3299, 3199, ""),
+            ("Nike", "Revolution 7 Road Running Shoes", 3695, 3695, 2399, 2995, "https://www.flipkart.com/nike-revolution-7-running-shoes-men/p/itm4ea4909a341b1"),
+            ("Puma", "Smash V2 Leather Streetstyle Sneakers", 5599, 3599, 2399, 2429, ""),
+            ("Asics", "Gel-Contend 8 Neutral Road Running", 5499, 4099, 2899, 2899, ""),
+            ("Woodland", "Camel Leather High-Traction Boots", 5995, 4595, 3295, 3495, "https://www.flipkart.com/woodland-boots-men/p/itm0ea622bc13d80"),
+            ("Skechers", "Go Run Elevate Daily Walking Shoes", 2499, 1699, 1099, 1149, ""),
+            ("Red Tape", "Airflow Chunky Retro Sneakers", 4999, 1899, 1199, 1249, ""),
+            ("Bata", "Formal Genuine Leather Derby Shoes", 3999, 2899, 1799, 1899, ""),
+            ("Crocs", "Classic Unisex Foam Slip-On Clogs", 3495, 2695, 1799, 1995, ""),
+            ("Adidas", "Clinch-X Responsive Gym Trainer", 4499, 2999, 1899, 1999, ""),
+        ],
     },
     "Watches & Eyewear": {
-        "slug": "watches", "icon": "⌚",
+        "slug": "watches",
+        "icon": "⌚",
         "items": [
-            ("Casio", "Vintage Stainless Steel Digital Watch", 1895, 1745, 1249, 1271, "https://www.flipkart.com/casio-a158wa-1df-vintage-series-digital-watch-men-women/p/itmffyy88z4gqfgg?pid=WATDFGFHHZ6ZNZAZ&marketplace=FLIPKART"),
-            ("Casio", "G-Shock GA-2100 Octagonal Tough Watch", 9995, 8495, 6495, 6995, "https://www.flipkart.com/casio-ga-2100-1a1dr-g-shock-analog-digital-watch-men/p/itm1717849e75520?pid=WATDGHZ6ZNZAZZZZ&marketplace=FLIPKART"),
-            ("Titan", "Karishma Champagne Dial Formal Watch", 2195, 1995, 1449, 1499, "https://www.flipkart.com/titan-karishma-analog-watch-men/p/itmfa8c8c7f20ec6?pid=WATDGHZ6ZNZAZYYY&marketplace=FLIPKART"),
-            ("Fastrack", "Revoltt FS1 1.83\" BT Calling Smartwatch", 3999, 1699, 1199, 1299, "https://www.flipkart.com/fastrack-revoltt-fs1-1-83-display-bt-calling-fastcharge-110-sports-mode-smartwatch/p/itm9372e9c2c62c2?pid=SMWDGHZ6ZNZAZXXX&marketplace=FLIPKART"),
-            ("Ray-Ban", "Polarized Classic Aviator Sunglasses", 9290, 8290, 5999, 7490, "https://www.flipkart.com/ray-ban-aviator-sunglasses/p/itmf3z8h9bphxvy8?pid=SGLDGHZ6ZNZAZWWW&marketplace=FLIPKART"),
-            ("Timex", "Expedition Rugged Field Outdoor Watch", 3995, 3195, 2199, 2299, "https://www.flipkart.com/timex-expedition-analog-watch-men/p/itm7ea0e9e4f55ef?pid=WATDGHZ6ZNZAZVVV&marketplace=FLIPKART"),
-            ("Fossil", "Grant Chronograph Leather Quartz Watch", 13495, 8995, 5995, 6495, "https://www.flipkart.com/fossil-grant-chronograph-watch-men/p/itm8a8f117c0c1ea?pid=WATDGHZ6ZNZAZUUU&marketplace=FLIPKART"),
-            ("Fastrack", "Wayfarer UV400 Protective Sunglasses", 1399, 1099, 649, 719, "https://www.flipkart.com/fastrack-wayfarer-sunglasses/p/itm5a38bbff92c3a?pid=SGLDGHZ6ZNZAZTTT&marketplace=FLIPKART"),
-            ("Oakley", "Holbrook Polarized Matte Sunglasses", 7990, 6490, 4490, 4990, "https://www.flipkart.com/oakley-holbrook-sunglasses/p/itm4ea4909a341b1?pid=SGLDGHZ6ZNZAZSSS&marketplace=FLIPKART"),
-            ("Citizen", "Eco-Drive Solar Powered Analog Watch", 8995, 6995, 4799, 5199, "https://www.flipkart.com/citizen-eco-drive-analog-watch-men/p/itm35c15694f479a?pid=WATDGHZ6ZNZAZRRR&marketplace=FLIPKART")
-        ]
+            ("Casio", "Vintage Stainless Steel Digital Watch", 1895, 1745, 1249, 1271, ""),
+            ("Casio", "G-Shock GA-2100 Octagonal Tough Watch", 9995, 8495, 6495, 6995, ""),
+            ("Titan", "Karishma Champagne Dial Formal Watch", 2195, 1995, 1449, 1499, "https://www.flipkart.com/titan-karishma-analog-watch-men/p/itmfa8c8c7f20ec6"),
+            ("Fastrack", 'Revoltt FS1 1.83" BT Calling Smartwatch', 3999, 1699, 1199, 1299, ""),
+            ("Ray-Ban", "Polarized Classic Aviator Sunglasses", 9290, 8290, 5999, 7490, ""),
+            ("Timex", "Expedition Rugged Field Outdoor Watch", 3995, 3195, 2199, 2299, ""),
+            ("Fossil", "Grant Chronograph Leather Quartz Watch", 13495, 8995, 5995, 6495, "https://www.flipkart.com/fossil-grant-chronograph-watch-men/p/itm8a8f117c0c1ea"),
+            ("Fastrack", "Wayfarer UV400 Protective Sunglasses", 1399, 1099, 649, 719, ""),
+            ("Oakley", "Holbrook Polarized Matte Sunglasses", 7990, 6490, 4490, 4990, ""),
+            ("Citizen", "Eco-Drive Solar Powered Analog Watch", 8995, 6995, 4799, 5199, ""),
+        ],
     },
     "Smartphones": {
-        "slug": "smartphones", "icon": "📱",
+        "slug": "smartphones",
+        "icon": "📱",
         "items": [
-            ("Apple", "iPhone 15 (Black, 128 GB)", 69900, 63499, 52999, 54999, "https://www.flipkart.com/apple-iphone-15-black-128-gb/p/itm6ac6485515ae4?pid=MOBGTAGPTB3VS24W&marketplace=FLIPKART"),
-            ("Apple", "iPhone 14 (Blue, 128 GB)", 59900, 52999, 44999, 47999, "https://www.flipkart.com/apple-iphone-14-blue-128-gb/p/itmdb77f40da6b6d?pid=MOBGH7FZFZZZZZZZ&marketplace=FLIPKART"),
-            ("Samsung", "Galaxy S23 5G (Phantom Black, 128 GB)", 74999, 49999, 36999, 38999, "https://www.flipkart.com/samsung-galaxy-s23-5g-phantom-black-128-gb/p/itm2271ff5d3bc64?pid=MOBGH7FZGZZZZZZZ&marketplace=FLIPKART"),
-            ("Samsung", "Galaxy S23 FE 5G (Mint, 128 GB)", 59999, 39999, 29999, 29999, "https://www.flipkart.com/samsung-galaxy-s23-fe-mint-128-gb/p/itm5a38bbff92c3a?pid=MOBGWGX7FGHVHGXX&marketplace=FLIPKART"),
-            ("Motorola", "Edge 50 Fusion (Marshmallow Blue, 128 GB)", 27999, 23999, 20999, 21999, "https://www.flipkart.com/motorola-edge-50-fusion-marshmallow-blue-128-gb/p/itme9b28a2a4b86e?pid=MOBHYZGXNZZZHHQG&marketplace=FLIPKART"),
-            ("Nothing", "Phone (2a) 5G (Black, 128 GB)", 25999, 23499, 19999, 20999, "https://www.flipkart.com/nothing-phone-2a-5g-black-128-gb/p/itmd5d59016be32c?pid=MOBGWD64Y57YGGHJ&marketplace=FLIPKART"),
-            ("OnePlus", "12R 5G (Iron Gray, 128 GB)", 39999, 36999, 32999, 34999, "https://www.flipkart.com/oneplus-12r-iron-gray-128-gb/p/itmdcf4f5d2ec757?pid=MOBGYX7FZGYGYGZZ&marketplace=FLIPKART"),
-            ("Vivo", "T3x 5G (Crimson Bliss, 128 GB)", 17499, 13999, 11999, 12499, "https://www.flipkart.com/vivo-t3x-5g-crimson-bliss-128-gb/p/itm35c15694f479a?pid=MOBGV6YFXHHG7ZZZ&marketplace=FLIPKART"),
-            ("Google", "Pixel 8a (Aloe, 128 GB)", 52999, 44999, 34999, 37999, "https://www.flipkart.com/google-pixel-8a-aloe-128-gb/p/itm3d22bdf55f9a2?pid=MOBGS7FZFZZZZZZZ&marketplace=FLIPKART"),
-            ("CMF by Nothing", "Phone 1 (Black, 128 GB)", 19999, 15999, 13999, 14499, "https://www.flipkart.com/cmf-nothing-phone-1-black-128-gb/p/itmfcfa56156e507?pid=MOBGXX7FZGZZZZZZ&marketplace=FLIPKART")
-        ]
+            ("Apple", "iPhone 15 (Black, 128 GB)", 69900, 63499, 52999, 54999, "https://www.flipkart.com/apple-iphone-15-black-128-gb/p/itm6ac6485515ae4"),
+            ("Apple", "iPhone 14 (Blue, 128 GB)", 59900, 52999, 44999, 47999, "https://www.flipkart.com/apple-iphone-14-blue-128-gb/p/itmdb77f40da6b6d"),
+            ("Samsung", "Galaxy S23 5G (Phantom Black, 128 GB)", 74999, 49999, 36999, 38999, "https://www.flipkart.com/samsung-galaxy-s23-5g-phantom-black-128-gb/p/itm2271ff5d3bc64"),
+            ("Samsung", "Galaxy S23 FE 5G (Mint, 128 GB)", 59999, 39999, 29999, 29999, ""),
+            ("Motorola", "Edge 50 Fusion (Marshmallow Blue, 128 GB)", 27999, 23999, 20999, 21999, ""),
+            ("Nothing", "Phone (2a) 5G (Black, 128 GB)", 25999, 23499, 19999, 20999, ""),
+            ("OnePlus", "12R 5G (Iron Gray, 128 GB)", 39999, 36999, 32999, 34999, ""),
+            ("Vivo", "T3x 5G (Crimson Bliss, 128 GB)", 17499, 13999, 11999, 12499, ""),
+            ("Google", "Pixel 8a (Aloe, 128 GB)", 52999, 44999, 34999, 37999, ""),
+            ("CMF by Nothing", "Phone 1 (Black, 128 GB)", 19999, 15999, 13999, 14499, ""),
+        ],
     },
     "Audio, Monitors & Laptops": {
-        "slug": "audio_monitors", "icon": "💻",
+        "slug": "audio_monitors",
+        "icon": "💻",
         "items": [
-            ("Sony", "WH-1000XM4 ANC Wireless Headphones", 29990, 22990, 18490, 18990, "https://www.flipkart.com/sony-wh-1000xm4-bluetooth-headset/p/itm878df080e7d56?pid=ACCFSDGZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Sony", "WH-1000XM5 ANC Wireless Headphones", 34990, 29990, 24990, 25990, "https://www.flipkart.com/sony-wh-1000xm5-bluetooth-headset/p/itm18cb5732c53a6?pid=ACCGZZZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("LG", "UltraGear 27\" 165Hz IPS QHD 2K Monitor", 32000, 24499, 18999, 19499, "https://www.flipkart.com/lg-ultragear-27-inch-qhd-ips-gaming-monitor/p/itm6ba19d67e7161?pid=MONFSDGZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Samsung", "Odyssey G3 24\" 165Hz FHD 1ms Display", 19000, 13999, 9999, 10499, "https://www.flipkart.com/samsung-odyssey-g3-24-inch-gaming-monitor/p/itm914d021c3bfa8?pid=MONFSDGZZZZZZYYY&marketplace=FLIPKART"),
-            ("Apple", "iPad 10th Gen (Wi-Fi, 64GB Silver)", 39900, 34490, 29999, 30900, "https://www.flipkart.com/apple-ipad-10th-gen-64-gb-rom-10-9-inch-wi-fi-only-silver/p/itm71dae298ee787?pid=TABG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("boAt", "Airdopes 161 ANC TWS Earbuds", 3990, 1499, 899, 999, "https://www.flipkart.com/boat-airdopes-161-anc-bluetooth-headset/p/itm3f2c5d1b7e61a?pid=ACCG5TZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("JBL", "Flip 6 30W Waterproof Bluetooth Speaker", 13999, 9999, 7499, 8499, "https://www.flipkart.com/jbl-flip-6-30-w-bluetooth-speaker/p/itmd41334c44f07e?pid=ACCG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Marshall", "Emberton II Portable Bluetooth Speaker", 17499, 14999, 11999, 12999, "https://www.flipkart.com/marshall-emberton-ii-portable-bluetooth-speaker/p/itm8109ad7b2c9d8?pid=ACCG7FZZZZZZYYYY&marketplace=FLIPKART"),
-            ("OnePlus", "Bullets Wireless Z2 Bluetooth Earphones", 2299, 1699, 1299, 1399, "https://www.flipkart.com/oneplus-bullets-wireless-z2-bluetooth-headset/p/itm4b232a549d9c2?pid=ACCG7FZZZZZZXXXX&marketplace=FLIPKART"),
-            ("Acer", "Nitro V Core i5 13th Gen (RTX 4050 Laptop)", 88999, 74990, 62990, 64990, "https://www.flipkart.com/acer-nitro-v-core-i5-13th-gen-rtx-4050-gaming-laptop/p/itm7e28df13b19aa?pid=COMFSDGZZZZZZXXX&marketplace=FLIPKART")
-        ]
+            ("Sony", "WH-1000XM4 ANC Wireless Headphones", 29990, 22990, 18490, 18990, ""),
+            ("Sony", "WH-1000XM5 ANC Wireless Headphones", 34990, 29990, 24990, 25990, ""),
+            ("LG", 'UltraGear 27" 165Hz IPS QHD 2K Monitor', 32000, 24499, 18999, 19499, "https://www.flipkart.com/lg-ultragear-27-inch-qhd-ips-gaming-monitor/p/itm6ba19d67e7161"),
+            ("Samsung", 'Odyssey G3 24" 165Hz FHD 1ms Display', 19000, 13999, 9999, 10499, ""),
+            ("Apple", "iPad 10th Gen (Wi-Fi, 64GB Silver)", 39900, 34490, 29999, 30900, ""),
+            ("boAt", "Airdopes 161 ANC TWS Earbuds", 3990, 1499, 899, 999, ""),
+            ("JBL", "Flip 6 30W Waterproof Bluetooth Speaker", 13999, 9999, 7499, 8499, "https://www.flipkart.com/jbl-flip-6-30-w-bluetooth-speaker/p/itmd41334c44f07e"),
+            ("Marshall", "Emberton II Portable Bluetooth Speaker", 17499, 14999, 11999, 12999, ""),
+            ("OnePlus", "Bullets Wireless Z2 Bluetooth Earphones", 2299, 1699, 1299, 1399, ""),
+            ("Acer", "Nitro V Core i5 13th Gen (RTX 4050 Laptop)", 88999, 74990, 62990, 64990, "https://www.flipkart.com/acer-nitro-v-core-i5-13th-gen-rtx-4050-gaming-laptop/p/itm7e28df13b19aa"),
+        ],
     },
     "Cosmetics & Grooming": {
-        "slug": "cosmetics", "icon": "💄",
+        "slug": "cosmetics",
+        "icon": "💄",
         "items": [
-            ("Minimalist", "10% Niacinamide Glowing Face Serum", 599, 509, 399, 449, "https://www.flipkart.com/minimalist-10-niacinamide-face-serum/p/itm7ea0e9e4f55ef?pid=SMPG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Maybelline", "Superstay 16H Matte Liquid Lipstick", 699, 549, 384, 449, "https://www.flipkart.com/maybelline-new-york-super-stay-matte-ink-liquid-lipstick/p/itm68a18fa40bc75?pid=LIPG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Philips", "OneBlade QP1424 Hybrid Trimmer & Shaver", 1699, 1399, 999, 1149, "https://www.flipkart.com/philips-oneblade-qp1424-hybrid-trimmer/p/itm5a38bbff92c3a?pid=TRMG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Beardo", "Godfather Perfume EDP (100ml)", 1200, 799, 499, 549, "https://www.flipkart.com/beardo-godfather-perfume/p/itmd5d59016be32c?pid=PERG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Neutrogena", "Hydro Boost Hyaluronic Water Gel (50g)", 1150, 920, 690, 749, "https://www.flipkart.com/neutrogena-hydro-boost-water-gel/p/itme9b28a2a4b86e?pid=CRMG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Cetaphil", "Gentle Skin Daily Balancing Cleanser", 635, 570, 445, 499, "https://www.flipkart.com/cetaphil-gentle-skin-cleanser/p/itm1717849e75520?pid=CLSG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Bombay Shaving Co", "6-in-1 Precision Salon Grooming Kit", 2450, 1499, 899, 999, "https://www.flipkart.com/bombay-shaving-company-grooming-kit/p/itm4b232a549d9c2?pid=TRMG7FZZZZZZYYYY&marketplace=FLIPKART"),
-            ("Bella Vita", "Luxury Unisex Eau De Parfum Set (4x20ml)", 1099, 649, 449, 499, "https://www.flipkart.com/bella-vita-luxury-unisex-perfume-set/p/itmdcf4f5d2ec757?pid=PERG7FZZZZZZXXXX&marketplace=FLIPKART"),
-            ("Biotique", "Bio Kelp Protein Anti-Hairfall Shampoo", 450, 315, 210, 249, "https://www.flipkart.com/biotique-bio-kelp-protein-shampoo/p/itm3d22bdf55f9a2?pid=SHPG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Forest Essentials", "Soundarya Radiance Herbal Face Cream", 4200, 3780, 3150, 3499, "https://www.flipkart.com/forest-essentials-soundarya-cream/p/itm1df5a072049ec?pid=CRMG7FZZZZZZYYYY&marketplace=FLIPKART")
-        ]
+            ("Minimalist", "10% Niacinamide Glowing Face Serum", 599, 509, 399, 449, ""),
+            ("Maybelline", "Superstay 16H Matte Liquid Lipstick", 699, 549, 384, 449, ""),
+            ("Philips", "OneBlade QP1424 Hybrid Trimmer & Shaver", 1699, 1399, 999, 1149, ""),
+            ("Beardo", "Godfather Perfume EDP (100ml)", 1200, 799, 499, 549, ""),
+            ("Neutrogena", "Hydro Boost Hyaluronic Water Gel (50g)", 1150, 920, 690, 749, ""),
+            ("Cetaphil", "Gentle Skin Daily Balancing Cleanser", 635, 570, 445, 499, ""),
+            ("Bombay Shaving Co", "6-in-1 Precision Salon Grooming Kit", 2450, 1499, 899, 999, ""),
+            ("Bella Vita", "Luxury Unisex Eau De Parfum Set (4x20ml)", 1099, 649, 449, 499, ""),
+            ("Biotique", "Bio Kelp Protein Anti-Hairfall Shampoo", 450, 315, 210, 249, ""),
+            ("Forest Essentials", "Soundarya Radiance Herbal Face Cream", 4200, 3780, 3150, 3499, ""),
+        ],
     },
     "Home Appliances": {
-        "slug": "appliances", "icon": "🔌",
+        "slug": "appliances",
+        "icon": "🔌",
         "items": [
-            ("Philips", "GC1905 1440W EasyGlide Steam Iron", 2795, 2349, 1599, 1699, "https://www.flipkart.com/philips-gc1905-steam-iron/p/itm35c15694f479a?pid=IRNG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Bajaj", "DX-7 1000W Lightweight Non-Stick Dry Iron", 1125, 849, 549, 599, "https://www.flipkart.com/bajaj-dx-7-dry-iron/p/itmfcfa56156e507?pid=IRNG7FZZZZZZYYYY&marketplace=FLIPKART"),
-            ("Kent", "Grand Plus RO+UV+UF+TDS Water Purifier", 20000, 16999, 12499, 13999, "https://www.flipkart.com/kent-grand-plus-ro-uv-uf-tds-water-purifier/p/itm8a8f117c0c1ea?pid=WPFRG7FZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Aquaguard", "Aura 7L RO+UV Active Copper Purifier", 18000, 14499, 10999, 11499, "https://www.flipkart.com/aquaguard-aura-ro-uv-water-purifier/p/itm0ea622bc13d80?pid=WPFRG7FZZZZZZYYY&marketplace=FLIPKART"),
-            ("Philips", "HD9200/20 4.1L Digital Oil-Free Air Fryer", 9995, 7399, 5199, 5499, "https://www.flipkart.com/philips-hd9200-20-air-fryer/p/itm7ea0e9e4f55ef?pid=FRYRG7FZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Prestige", "Iris 750W 4-Jar Heavy Duty Mixer Grinder", 4495, 3299, 2299, 2499, "https://www.flipkart.com/prestige-iris-mixer-grinder/p/itma7c0dcfd54406?pid=MIXG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Havells", "Glaze 30L Storage High-Pressure Water Geyser", 14490, 9990, 6999, 7499, "https://www.flipkart.com/havells-glaze-30l-storage-water-geyser/p/itm18cb5732c53a6?pid=WHTRG7FZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Atomberg", "Renesa 1200mm BLDC Energy Saving Silent Fan", 5190, 3990, 3199, 3499, "https://www.flipkart.com/atomberg-renesa-bldc-ceiling-fan/p/itm71dae298ee787?pid=FANG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Eureka Forbes", "Robo Vac n Mop Smart Robotic Cleaner", 29999, 17999, 11999, 13999, "https://www.flipkart.com/eureka-forbes-robotic-vacuum-cleaner/p/itm8fa82ea2ba475?pid=VACG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Dyson", "V8 Absolute Cordless Stick Vacuum Cleaner", 43900, 32900, 26900, 29900, "https://www.flipkart.com/dyson-v8-absolute-cordless-vacuum-cleaner/p/itm9372e9c2c62c2?pid=VACG7FZZZZZZYYYY&marketplace=FLIPKART")
-        ]
+            ("Philips", "GC1905 1440W EasyGlide Steam Iron", 2795, 2349, 1599, 1699, ""),
+            ("Bajaj", "DX-7 1000W Lightweight Non-Stick Dry Iron", 1125, 849, 549, 599, ""),
+            ("Kent", "Grand Plus RO+UV+UF+TDS Water Purifier", 20000, 16999, 12499, 13999, ""),
+            ("Aquaguard", "Aura 7L RO+UV Active Copper Purifier", 18000, 14499, 10999, 11499, ""),
+            ("Philips", "HD9200/20 4.1L Digital Oil-Free Air Fryer", 9995, 7399, 5199, 5499, ""),
+            ("Prestige", "Iris 750W 4-Jar Heavy Duty Mixer Grinder", 4495, 3299, 2299, 2499, ""),
+            ("Havells", "Glaze 30L Storage High-Pressure Water Geyser", 14490, 9990, 6999, 7499, ""),
+            ("Atomberg", "Renesa 1200mm BLDC Energy Saving Silent Fan", 5190, 3990, 3199, 3499, ""),
+            ("Eureka Forbes", "Robo Vac n Mop Smart Robotic Cleaner", 29999, 17999, 11999, 13999, ""),
+            ("Dyson", "V8 Absolute Cordless Stick Vacuum Cleaner", 43900, 32900, 26900, 29900, ""),
+        ],
     },
     "Stationery & Books": {
-        "slug": "stationery_books", "icon": "📚",
+        "slug": "stationery_books",
+        "icon": "📚",
         "items": [
-            ("Classmate", "Pulse Regular Hardcover Notebook (Pack of 6)", 540, 450, 320, 349, "https://www.flipkart.com/classmate-pulse-regular-notebook-single-rule-180-pages/p/itm4b232a549d9c2?pid=NTBG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Parker", "Vector Matte Black CT Rollerball Pen", 1200, 950, 649, 699, "https://www.flipkart.com/parker-vector-matte-black-ct-roller-ball-pen/p/itmfa8c8c7f20ec6?pid=PENG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Casio", "FX-991CW Scientific Engineering Calculator", 1595, 1450, 1199, 1249, "https://www.flipkart.com/casio-fx-991cw-scientific-calculator/p/itm0dc8963283f51?pid=CALG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Penguin", "Atomic Habits by James Clear (Paperback)", 499, 399, 249, 279, "https://www.flipkart.com/atomic-habits/p/itmd5b306443c2eb?pid=9781847941831&marketplace=FLIPKART"),
-            ("Camlin", "Artists Acrylic Colour Set (12 Shades x 20ml)", 1899, 1499, 999, 1099, "https://www.flipkart.com/camlin-artists-acrylic-colour-set/p/itm7ea0e9e4f55ef?pid=PNTG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Solo", "Mesh Metal 3-Tier Desk Document Organizer", 999, 749, 449, 499, "https://www.flipkart.com/solo-mesh-tray-desk-organizer/p/itm8a8f117c0c1ea?pid=ORGG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Kangaro", "Heavy Duty Steel Stapler & Punch Combo Set", 650, 499, 329, 369, "https://www.flipkart.com/kangaro-stapler-punch-combo/p/itm5a38bbff92c3a?pid=STPG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Faber-Castell", "Textliner Chisel Tip Highlighter Set (10 Pcs)", 450, 349, 219, 249, "https://www.flipkart.com/faber-castell-textliner-highlighter-set/p/itm4ea4909a341b1?pid=HLTG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Doms", "Mathematical Drawing Instruments Geometry Box", 399, 310, 199, 229, "https://www.flipkart.com/doms-mathematical-drawing-instruments-geometry-box/p/itm35c15694f479a?pid=GEOG7FZZZZZZZZZZ&marketplace=FLIPKART"),
-            ("Penguin", "Classic Literature Hardbound Masterpiece Edition", 799, 649, 399, 449, "https://www.flipkart.com/penguin-classics-hardcover-edition/p/itmbfb64d2750157?pid=9780141399867&marketplace=FLIPKART")
-        ]
-    }
+            ("Classmate", "Pulse Regular Hardcover Notebook (Pack of 6)", 540, 450, 320, 349, ""),
+            ("Parker", "Vector Matte Black CT Rollerball Pen", 1200, 950, 649, 699, "https://www.flipkart.com/parker-vector-matte-black-ct-roller-ball-pen/p/itmfa8c8c7f20ec6"),
+            ("Casio", "FX-991CW Scientific Engineering Calculator", 1595, 1450, 1199, 1249, "https://www.flipkart.com/casio-fx-991cw-scientific-calculator/p/itm0dc8963283f51"),
+            ("Penguin", "Atomic Habits by James Clear (Paperback)", 499, 399, 249, 279, "https://www.flipkart.com/atomic-habits/p/itmd5b306443c2eb"),
+            ("Camlin", "Artists Acrylic Colour Set (12 Shades x 20ml)", 1899, 1499, 999, 1099, ""),
+            ("Solo", "Mesh Metal 3-Tier Desk Document Organizer", 999, 749, 449, 499, ""),
+            ("Kangaro", "Heavy Duty Steel Stapler & Punch Combo Set", 650, 499, 329, 369, ""),
+            ("Faber-Castell", "Textliner Chisel Tip Highlighter Set (10 Pcs)", 450, 349, 219, 249, ""),
+            ("Doms", "Mathematical Drawing Instruments Geometry Box", 399, 310, 199, 229, ""),
+            ("Penguin", "Classic Literature Hardbound Masterpiece Edition", 799, 649, 399, 449, ""),
+        ],
+    },
 }
 
-# --- INITIAL CATALOG SEEDING ---
-def generate_seed_catalog():
-    catalog = []
-    random.seed(42)
 
-    for cat_name, data in CAT_DATA_MATRIX.items():
-        for i_idx, item_tuple in enumerate(data["items"]):
-            brand = item_tuple[0]
-            item_name = item_tuple[1]
-            mrp = item_tuple[2]
-            avg_6m = item_tuple[3]
-            last_bbd = item_tuple[4]
-            curr = item_tuple[5]
-            base_url = clean_url_safe(item_tuple[6])
-            bbd_pred = int(last_bbd * 0.93)
-            product_title = f"{brand} {item_name}"
+def _duplicate_itm_ids() -> set:
+    """
+    Product ids reused by more than one catalogue entry cannot all be correct;
+    such links are the second source of the E002 error page, so they are
+    demoted to search URLs.
+    """
+    ids = Counter()
+    for meta in CAT_DATA_MATRIX.values():
+        for item in meta["items"]:
+            itm = extract_itm_id(item[6])
+            if itm:
+                ids[itm] += 1
+    return {itm for itm, count in ids.items() if count > 1}
 
-            catalog.append({
-                "id": str(uuid.uuid4()),
-                "Category": cat_name,
-                "Brand": brand,
-                "Product": product_title,
-                "MRP": mrp,
-                "6-Month Avg": avg_6m,
-                "Last BBD Low": last_bbd,
-                "Current Price": curr,
-                "Predicted BBD Low": bbd_pred,
-                "URL": base_url,
-                "is_wishlist": False,
-                "is_ad": (i_idx % 4 == 0),
-                "Last Checked": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "version": TRACKER_VERSION
-            })
+
+BLOCKED_ITM_IDS = _duplicate_itm_ids()
+
+
+# --------------------------------------------------------------------------- #
+# PERSISTENCE
+# --------------------------------------------------------------------------- #
+
+
+def save_tracker_data(data: List[Dict[str, Any]]) -> None:
+    """Atomically persist the tracker store so a crash cannot truncate it."""
+    directory = os.path.dirname(os.path.abspath(TRACKER_DB_FILE)) or "."
+    os.makedirs(directory, exist_ok=True)
+    handle, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, TRACKER_DB_FILE)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+
+def generate_seed_catalog() -> List[Dict[str, Any]]:
+    """Build the initial catalogue with fully validated product links."""
+    catalog: List[Dict[str, Any]] = []
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    for category, meta in CAT_DATA_MATRIX.items():
+        for index, (brand, name, mrp, avg_6m, last_bbd, current, raw_url) in enumerate(meta["items"]):
+            catalog.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "Category": category,
+                    "Brand": brand,
+                    "Product": f"{brand} {name}",
+                    "MRP": int(mrp),
+                    "6-Month Avg": int(avg_6m),
+                    "Last BBD Low": int(last_bbd),
+                    "Current Price": int(current),
+                    "Predicted BBD Low": int(last_bbd * BBD_PREDICTION_FACTOR),
+                    "URL": resolve_product_url(raw_url, brand, name, blocked_ids=BLOCKED_ITM_IDS),
+                    "is_wishlist": False,
+                    "is_ad": index % 4 == 0,
+                    "Last Checked": now,
+                    "version": TRACKER_VERSION,
+                }
+            )
     return catalog
 
-def save_tracker_data(data):
-    with open(TRACKER_DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
 
-def load_tracker_data():
-    """Wipes old broken links and ensures only verified version data loads."""
+def load_tracker_data() -> List[Dict[str, Any]]:
+    """Load the store, rebuilding it whenever it is missing, corrupt or stale."""
     if os.path.exists(TRACKER_DB_FILE):
         try:
-            with open(TRACKER_DB_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list) and len(data) > 0:
-                    if data[0].get("version") == TRACKER_VERSION:
-                        return data
-        except Exception:
-            pass
-    fresh_catalog = generate_seed_catalog()
-    save_tracker_data(fresh_catalog)
-    return fresh_catalog
+            with open(TRACKER_DB_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, list) and data and all(isinstance(r, dict) for r in data):
+                if data[0].get("version") == TRACKER_VERSION:
+                    return data
+                logger.info("Store version mismatch - rebuilding with verified links.")
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Tracker store unreadable (%s) - rebuilding.", exc)
 
-saved_db = load_tracker_data()
+    fresh = generate_seed_catalog()
+    save_tracker_data(fresh)
+    return fresh
 
-# --- RE-TRACKING SIMULATOR / UPDATER ---
-def refresh_all_live_prices():
-    current_data = load_tracker_data()
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    for item in current_data:
-        shift = random.choice([-50, -20, 0, 30, -70, 10])
-        item["Current Price"] = max(item["Last BBD Low"] - 120, item["Current Price"] + shift)
-        item["Last Checked"] = now_str
+def refresh_all_live_prices() -> int:
+    """Simulate a live re-scan and persist the updated prices."""
+    rng = random.Random()  # local RNG: no global seed side effects
+    records = load_tracker_data()
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    save_tracker_data(current_data)
-    return len(current_data)
+    for item in records:
+        shift = rng.choice([-70, -50, -20, 0, 10, 30])
+        floor = item["Last BBD Low"] - 120
+        item["Current Price"] = max(floor, item["Current Price"] + shift, 1)
+        item["Last Checked"] = now
 
-# --- PROCESS ANALYTICS & CREDIT CARDS ---
-def process_analytics(catalog, card_selection):
+    save_tracker_data(records)
+    return len(records)
+
+
+# --------------------------------------------------------------------------- #
+# ANALYTICS
+# --------------------------------------------------------------------------- #
+
+PREMIUM_HOLD_KEYWORDS = ("Dyson", "Ray-Ban", "Oakley", "Fossil")
+
+
+def _verdict(category: str, product: str, current: int, last_bbd: int,
+             predicted: int, discount_pct: float) -> str:
+    if category == "Smartphones" or any(k in product for k in PREMIUM_HOLD_KEYWORDS):
+        return "BUY NOW" if current <= predicted * 1.05 else "WAIT (BBD)"
+    if current <= last_bbd or discount_pct >= STRONG_DISCOUNT_THRESHOLD:
+        return "BUY NOW"
+    return "WAIT"
+
+
+def _best_card(current: int, preference: str) -> Tuple[str, int]:
+    instant = min(int(current * INSTANT_DISCOUNT_RATE), INSTANT_DISCOUNT_CAP)
+    cashback = int(current * CASHBACK_RATE)
+
+    if preference == CARD_INSTANT:
+        return "Axis/ICICI (10%)", current - instant
+    if preference == CARD_CASHBACK:
+        return "Flipkart Axis (5%)", current - cashback
+    if instant >= cashback:
+        return "Axis/ICICI (10%)", current - instant
+    return "Flipkart Axis (5%)", current - cashback
+
+
+def process_analytics(catalog: List[Dict[str, Any]], card_selection: str) -> pd.DataFrame:
+    """Convert raw records into the analytics DataFrame rendered by the UI."""
     records = []
-    for d in catalog:
-        curr = d["Current Price"]
-        avg_6m = d["6-Month Avg"]
-        last_bbd = d["Last BBD Low"]
-        mrp = d["MRP"]
-        bbd_pred = d["Predicted BBD Low"]
+    for entry in catalog:
+        try:
+            current = int(entry["Current Price"])
+            avg_6m = int(entry["6-Month Avg"])
+            last_bbd = int(entry["Last BBD Low"])
+            mrp = int(entry["MRP"])
+        except (KeyError, TypeError, ValueError):
+            logger.warning("Skipping malformed record: %s", entry.get("Product", "<unknown>"))
+            continue
 
-        savings_vs_6m = avg_6m - curr
-        disc_vs_6m = round((savings_vs_6m / avg_6m) * 100, 1) if avg_6m > 0 else 0
-        diff_vs_last_bbd = curr - last_bbd
+        predicted = int(entry.get("Predicted BBD Low") or last_bbd * BBD_PREDICTION_FACTOR)
+        savings = avg_6m - current
+        discount_pct = round((savings / avg_6m) * 100, 1) if avg_6m > 0 else 0.0
+        product = entry.get("Product", "")
+        card_title, net_price = _best_card(current, card_selection)
 
-        # Decision Verdict
-        if "Smartphones" in d["Category"] or "Dyson" in d["Product"] or "Ray-Ban" in d["Product"]:
-            verdict = "WAIT (BBD)" if curr > (bbd_pred * 1.05) else "BUY NOW"
-        elif curr <= last_bbd or disc_vs_6m >= 28:
-            verdict = "BUY NOW"
-        else:
-            verdict = "WAIT"
+        records.append(
+            {
+                "id": entry.get("id", str(uuid.uuid4())),
+                "Category": entry.get("Category", "Uncategorised"),
+                "Brand": entry.get("Brand", "—"),
+                "Product": product,
+                "Current Price": current,
+                "6-Month Avg": avg_6m,
+                "Last BBD Low": last_bbd,
+                "Real Savings (vs 6M)": savings,
+                "Real Disc % (vs 6M)": discount_pct,
+                "Diff vs Last BBD": current - last_bbd,
+                "Predicted BBD Low": predicted,
+                "Verdict": _verdict(entry.get("Category", ""), product, current,
+                                    last_bbd, predicted, discount_pct),
+                "Optimal Card": card_title,
+                "Net Price": net_price,
+                "MRP": mrp,
+                "URL": resolve_product_url(entry.get("URL", ""), product,
+                                           blocked_ids=BLOCKED_ITM_IDS),
+                "is_wishlist": bool(entry.get("is_wishlist", False)),
+                "is_ad": bool(entry.get("is_ad", False)),
+                "Last Checked": entry.get("Last Checked", "Recently"),
+            }
+        )
 
-        # Card Engine
-        instant_10 = min(int(curr * 0.10), 1500)
-        cashback_5 = int(curr * 0.05)
+    return pd.DataFrame(records, columns=ANALYTICS_COLUMNS)
 
-        if card_selection == "Axis / ICICI (10% Instant, Cap ₹1.5k)":
-            card_title, net_price = "Axis/ICICI (10%)", curr - instant_10
-        elif card_selection == "Flipkart Axis (5% Unlimited Cashback)":
-            card_title, net_price = "Flipkart Axis (5%)", curr - cashback_5
-        else:
-            if instant_10 >= cashback_5:
-                card_title, net_price = "Axis/ICICI (10%)", curr - instant_10
-            else:
-                card_title, net_price = "Flipkart Axis (5%)", curr - cashback_5
 
-        clean_url = clean_url_safe(d.get("URL", ""))
+ANALYTICS_COLUMNS = [
+    "id", "Category", "Brand", "Product", "Current Price", "6-Month Avg",
+    "Last BBD Low", "Real Savings (vs 6M)", "Real Disc % (vs 6M)",
+    "Diff vs Last BBD", "Predicted BBD Low", "Verdict", "Optimal Card",
+    "Net Price", "MRP", "URL", "is_wishlist", "is_ad", "Last Checked",
+]
 
-        records.append({
-            "id": d.get("id", str(uuid.uuid4())),
-            "Category": d["Category"],
-            "Brand": d["Brand"],
-            "Product": d["Product"],
-            "Current Price": curr,
-            "6-Month Avg": avg_6m,
-            "Last BBD Low": last_bbd,
-            "Real Savings (vs 6M)": savings_vs_6m,
-            "Real Disc % (vs 6M)": disc_vs_6m,
-            "Diff vs Last BBD": diff_vs_last_bbd,
-            "Predicted BBD Low": bbd_pred,
-            "Verdict": verdict,
-            "Optimal Card": card_title,
-            "Net Price": net_price,
-            "MRP": mrp,
-            "URL": clean_url,
-            "is_wishlist": d.get("is_wishlist", False),
-            "is_ad": d.get("is_ad", False),
-            "Last Checked": d.get("Last Checked", "Recently")
-        })
-    return pd.DataFrame(records)
 
-def detect_category(title):
-    t = title.lower()
-    if any(k in t for k in ["pant", "jean", "denim", "trouser", "cargo", "chino", "jogger", "shorts", "bottom"]):
-        return "Wishlist: Pants & Jeans"
-    elif any(k in t for k in ["shirt", "t-shirt", "tee", "polo", "hoodie", "jacket", "blazer", "suit", "top", "kurta", "kurti", "sweater"]):
-        return "Wishlist: Shirts & Tops"
-    elif any(k in t for k in ["shoe", "sneaker", "boot", "loafer", "sandal", "clog", "slide", "running", "trainer", "derby", "oxford"]):
-        return "Wishlist: Footwear"
-    elif any(k in t for k in ["watch", "smartwatch", "sunglass", "spectacle", "aviator", "shades", "wayfarer", "eyeglass", "analog", "chronograph"]):
-        return "Wishlist: Watches & Eyewear"
-    elif any(k in t for k in ["phone", "mobile", "iphone", "samsung", "oneplus", "pixel", "5g", "galaxy", "realme", "poco", "motorola", "iqoo", "vivo"]):
-        return "Wishlist: Smartphones"
-    elif any(k in t for k in ["laptop", "monitor", "headphone", "earphone", "airpods", "speaker", "tws", "audio", "display", "tablet", "ipad", "macbook"]):
-        return "Wishlist: Tech & Audio"
-    elif any(k in t for k in ["purifier", "iron", "cooker", "fryer", "grinder", "geyser", "fan", "vacuum", "cleaner", "refrigerator", "washing machine", "airwrap", "otg"]):
-        return "Wishlist: Appliances"
-    elif any(k in t for k in ["book", "novel", "pen", "notebook", "calculator", "diary", "marker", "paint", "stapler", "highlighter", "geometry"]):
-        return "Wishlist: Books & Stationery"
-    elif any(k in t for k in ["serum", "lipstick", "trimmer", "perfume", "cream", "shampoo", "cleanser", "grooming", "shaver", "styler"]):
-        return "Wishlist: Cosmetics & Grooming"
-    else:
-        return "Wishlist: General"
+# --------------------------------------------------------------------------- #
+# WISHLIST
+# --------------------------------------------------------------------------- #
 
-def add_product_to_wishlist(product_row):
-    title = product_row.get("Product", "")
-    target_cat = detect_category(title)
-    current_data = load_tracker_data()
+CATEGORY_KEYWORDS: List[Tuple[str, Tuple[str, ...]]] = [
+    ("Wishlist: Pants & Jeans", ("pant", "jean", "denim", "trouser", "cargo", "chino", "jogger", "shorts", "bottom")),
+    ("Wishlist: Shirts & Tops", ("shirt", "t-shirt", "tee", "polo", "hoodie", "jacket", "blazer", "suit", "top", "kurta", "kurti", "sweater", "cardigan", "saree", "dress")),
+    ("Wishlist: Footwear", ("shoe", "sneaker", "boot", "loafer", "sandal", "clog", "slide", "running", "trainer", "derby", "oxford")),
+    ("Wishlist: Watches & Eyewear", ("watch", "smartwatch", "sunglass", "spectacle", "aviator", "shades", "wayfarer", "eyeglass", "analog", "chronograph")),
+    ("Wishlist: Tech & Audio", ("laptop", "monitor", "headphone", "earphone", "earbud", "airpods", "speaker", "tws", "audio", "display", "tablet", "ipad", "macbook")),
+    ("Wishlist: Smartphones", ("phone", "mobile", "iphone", "galaxy", "oneplus", "pixel", "5g", "realme", "poco", "motorola", "iqoo", "vivo")),
+    ("Wishlist: Appliances", ("purifier", "iron", "cooker", "fryer", "grinder", "geyser", "fan", "vacuum", "cleaner", "refrigerator", "washing machine", "airwrap", "otg")),
+    ("Wishlist: Books & Stationery", ("book", "novel", "pen", "notebook", "calculator", "diary", "marker", "paint", "stapler", "highlighter", "geometry")),
+    ("Wishlist: Cosmetics & Grooming", ("serum", "lipstick", "trimmer", "perfume", "cream", "shampoo", "cleanser", "grooming", "shaver", "styler")),
+]
 
-    already_exists = any(
-        x.get("is_wishlist") and x.get("Category") == target_cat and x.get("Product") == title
-        for x in current_data
-    )
-    if already_exists:
-        return False, target_cat
 
-    direct_url = clean_url_safe(product_row.get("URL", ""))
+def detect_category(title: str) -> str:
+    lowered = (title or "").lower()
+    for category, keywords in CATEGORY_KEYWORDS:
+        if any(keyword in lowered for keyword in keywords):
+            return category
+    return "Wishlist: General"
 
-    new_item = {
+
+def build_wishlist_item(title: str, url: str, brand: str = "", current: int = 999,
+                        **overrides: Any) -> Dict[str, Any]:
+    current = max(int(current or 999), 1)
+    item = {
         "id": str(uuid.uuid4()),
-        "Category": target_cat,
-        "Brand": product_row.get("Brand", "Brand"),
-        "Product": title,
-        "MRP": product_row.get("MRP", int(product_row.get("Current Price", 999) * 1.35)),
-        "6-Month Avg": product_row.get("6-Month Avg", int(product_row.get("Current Price", 999) * 1.15)),
-        "Last BBD Low": product_row.get("Last BBD Low", int(product_row.get("Current Price", 999) * 0.94)),
-        "Current Price": product_row.get("Current Price", 999),
-        "Predicted BBD Low": product_row.get("Predicted BBD Low", int(product_row.get("Current Price", 999) * 0.88)),
-        "URL": direct_url,
+        "Category": detect_category(title),
+        "Brand": (brand or title.strip().split()[0] if title.strip() else "Brand").title(),
+        "Product": title.strip(),
+        "MRP": int(current * 1.35),
+        "6-Month Avg": int(current * 1.15),
+        "Last BBD Low": int(current * 0.94),
+        "Current Price": current,
+        "Predicted BBD Low": int(current * 0.88),
+        "URL": resolve_product_url(url, title, blocked_ids=BLOCKED_ITM_IDS),
         "is_wishlist": True,
         "is_ad": False,
-        "Last Checked": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "version": TRACKER_VERSION
+        "Last Checked": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "version": TRACKER_VERSION,
     }
+    item.update({k: v for k, v in overrides.items() if v is not None})
+    return item
 
-    current_data.append(new_item)
-    save_tracker_data(current_data)
-    return True, target_cat
 
-# --- TOP ACTION BAR & CONTROLS ---
-st.title("⚡ Flipkart Persistent Deal Tracker & BBD Steals Radar")
-st.caption("Live Flipkart price intelligence engine on a single unified page with verified direct links, BBD benchmarks, ads scanner, and wishlist tracking.")
+def add_product_to_wishlist(product_row: Dict[str, Any]) -> Tuple[bool, str]:
+    """Persist a catalogue row to the wishlist. Returns (added, category)."""
+    title = str(product_row.get("Product", "")).strip()
+    if not title:
+        return False, ""
 
-col_top1, col_top2, col_top3, col_top4 = st.columns([1.5, 1.3, 1.2, 1.2])
+    target_category = detect_category(title)
+    records = load_tracker_data()
 
-with col_top1:
-    if st.button("🔄 Scan & Re-Check Live Prices on Flipkart", type="primary", use_container_width=True):
-        with st.spinner("Connecting to Flipkart, checking active discounts, and updating local tracker..."):
-            count = refresh_all_live_prices()
-            st.success(f"Updated live prices for {count} products in database!")
-            st.rerun()
+    if any(r.get("is_wishlist") and r.get("Product") == title
+           and r.get("Category") == target_category for r in records):
+        return False, target_category
 
-with col_top2:
-    if st.button("🚨 Reset Database & Purge Broken Links", use_container_width=True, help="Force-cleans legacy cached links and replaces them with verified working URLs"):
-        fresh = generate_seed_catalog()
-        save_tracker_data(fresh)
-        st.success("Successfully purged broken links! All URLs have been updated.")
-        st.rerun()
-
-with col_top3:
-    expand_all = st.checkbox("📂 Expand All Category Tables", value=False)
-
-with col_top4:
-    card_preference = st.selectbox(
-        "💳 Card Strategy:",
-        ["Auto-Best Card", "Axis / ICICI (10% Instant, Cap ₹1.5k)", "Flipkart Axis (5% Unlimited Cashback)"]
+    records.append(
+        build_wishlist_item(
+            title=title,
+            url=product_row.get("URL", ""),
+            brand=product_row.get("Brand", ""),
+            current=product_row.get("Current Price", 999),
+            MRP=product_row.get("MRP"),
+            **{
+                "6-Month Avg": product_row.get("6-Month Avg"),
+                "Last BBD Low": product_row.get("Last BBD Low"),
+                "Predicted BBD Low": product_row.get("Predicted BBD Low"),
+            },
+        )
     )
+    save_tracker_data(records)
+    return True, target_category
 
-# Process Master DataFrame
-all_saved_records = load_tracker_data()
-master_df = process_analytics(all_saved_records, card_preference)
 
-# Summary KPIs
-k1, k2, k3, k4 = st.columns(4)
-with k1:
-    st.markdown('<div class="kpi-container"><div class="kpi-number">' + f"{len(master_df):,}" + '</div><div class="kpi-label">Monitored Products</div></div>', unsafe_allow_html=True)
-with k2:
-    bbd_cheapest = len(master_df[master_df["Diff vs Last BBD"] <= 0])
-    st.markdown('<div class="kpi-container"><div class="kpi-number" style="color:#facc15;">' + f"{bbd_cheapest:,}" + '</div><div class="kpi-label">🔥 Cheaper Than Last BBD</div></div>', unsafe_allow_html=True)
-with k3:
-    wishlist_total = len(master_df[master_df["is_wishlist"] == True])
-    st.markdown('<div class="kpi-container"><div class="kpi-number" style="color:#ec4899;">' + f"{wishlist_total:,}" + '</div><div class="kpi-label">Saved Wishlist Items</div></div>', unsafe_allow_html=True)
-with k4:
-    tot_savings = master_df["Real Savings (vs 6M)"].sum()
-    st.markdown('<div class="kpi-container"><div class="kpi-number" style="color:#4ade80;">₹' + f"{tot_savings/100000:,.1f} Lakh" + '</div><div class="kpi-label">Total Consumer Savings</div></div>', unsafe_allow_html=True)
+def delete_record(record_id: str) -> None:
+    records = [r for r in load_tracker_data() if r.get("id") != record_id]
+    save_tracker_data(records)
 
-st.divider()
 
-# Shared Table Column Formatter (Direct Product Link Display)
-col_config = {
-    "➕ Wishlist": st.column_config.CheckboxColumn("Add to Wishlist", help="Check this box to immediately send this item to your personal wishlist", default=False),
+# --------------------------------------------------------------------------- #
+# UI
+# --------------------------------------------------------------------------- #
+
+DISPLAY_COLUMNS = [
+    "➕ Wishlist", "Brand", "Product", "Current Price", "6-Month Avg",
+    "Last BBD Low", "Real Savings (vs 6M)", "Real Disc % (vs 6M)",
+    "Diff vs Last BBD", "Verdict", "Predicted BBD Low", "Optimal Card",
+    "Net Price", "Last Checked", "URL",
+]
+
+COLUMN_CONFIG = {
+    "➕ Wishlist": st.column_config.CheckboxColumn(
+        "Add to Wishlist", help="Tick to send this item to your personal wishlist", default=False
+    ),
     "Current Price": st.column_config.NumberColumn(format="₹%d"),
     "6-Month Avg": st.column_config.NumberColumn(format="₹%d"),
     "Last BBD Low": st.column_config.NumberColumn(format="₹%d"),
     "Real Savings (vs 6M)": st.column_config.NumberColumn(format="₹%d"),
-    "Real Disc % (vs 6M)": st.column_config.ProgressColumn(format="%d%%", min_value=-10, max_value=70),
-    "Diff vs Last BBD": st.column_config.NumberColumn(format="₹%d", help="Negative value means CURRENTLY CHEAPER than last year BBD!"),
+    "Real Disc % (vs 6M)": st.column_config.ProgressColumn(format="%.1f%%", min_value=-10, max_value=70),
+    "Diff vs Last BBD": st.column_config.NumberColumn(
+        format="₹%d", help="Negative means it is currently cheaper than last year's BBD low"
+    ),
     "Predicted BBD Low": st.column_config.NumberColumn(format="₹%d"),
     "Net Price": st.column_config.NumberColumn(format="₹%d"),
-    "URL": st.column_config.LinkColumn("Direct Product Link")
+    "URL": st.column_config.LinkColumn("Direct Product Link", display_text="Open on Flipkart ↗"),
 }
 
-display_columns = [
-    "➕ Wishlist", "Brand", "Product", "Current Price", "6-Month Avg", "Last BBD Low", 
-    "Real Savings (vs 6M)", "Real Disc % (vs 6M)", "Diff vs Last BBD", 
-    "Verdict", "Predicted BBD Low", "Optimal Card", "Net Price", "Last Checked", "URL"
-]
 
-# ==============================================================================
-# ➕ 2-FIELD QUICK ADD WISHLIST MANAGER (NAME + LINK ONLY)
-# ==============================================================================
-with st.expander("➕ Add Direct Product to Wishlist (Only 2 Inputs: Name & Link)", expanded=False):
-    st.markdown("Paste your real Flipkart product link copied from your browser. It will be saved permanently and routed to its dedicated wishlist category.")
-    with st.form("quick_2_field_form", clear_on_submit=True):
-        f_name = st.text_input("📦 Product Name:", placeholder="e.g. Levi's 511 Slim Jeans")
-        f_url = st.text_input("🔗 Direct Flipkart Product Link:", placeholder="Paste exact Flipkart product page URL here")
-        submit_btn = st.form_submit_button("💾 Save Direct Product to Wishlist", type="primary")
+def kpi(value: str, label: str, colour: str = "#38bdf8") -> str:
+    return (
+        f'<div class="kpi-container"><div class="kpi-number" style="color:{colour};">{value}</div>'
+        f'<div class="kpi-label">{label}</div></div>'
+    )
 
-        if submit_btn:
-            if not f_name.strip() or not f_url.strip():
-                st.error("Please enter both Name and Link.")
-            else:
-                cat_assigned = detect_category(f_name)
-                clean_url = clean_url_safe(f_url)
-                curr_p = 999
-                mrp_p = int(curr_p * 1.35)
 
-                new_item = {
-                    "id": str(uuid.uuid4()),
-                    "Category": cat_assigned,
-                    "Brand": f_name.strip().split()[0].title(),
-                    "Product": f_name.strip(),
-                    "MRP": mrp_p,
-                    "6-Month Avg": int(mrp_p * 0.85),
-                    "Last BBD Low": int(curr_p * 0.94),
-                    "Current Price": curr_p,
-                    "Predicted BBD Low": int(curr_p * 0.88),
-                    "URL": clean_url,
-                    "is_wishlist": True,
-                    "is_ad": False,
-                    "Last Checked": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "version": TRACKER_VERSION
-                }
-
-                current_records = load_tracker_data()
-                current_records.append(new_item)
-                save_tracker_data(current_records)
-                st.success(f"Saved '{f_name}' into '{cat_assigned}' with direct product link!")
-                st.rerun()
-
-# --- REUSABLE COLLAPSIBLE TABLE BUILDER WITH IN-TABLE WISHLIST CHECKBOX ---
-def render_collapsible_table(df_subset, category_title, slug, icon, is_expanded, allow_deletion=False):
-    if df_subset.empty:
+def render_collapsible_table(df_subset: pd.DataFrame, category_title: str, slug: str,
+                             icon: str, is_expanded: bool, allow_deletion: bool = False) -> None:
+    if df_subset is None or df_subset.empty:
         return
 
-    expander_title = f"{icon} {category_title} — ({len(df_subset)} Products Available)"
-    
-    with st.expander(expander_title, expanded=is_expanded):
-        f_col1, f_col2, f_col3, f_col4, f_col5 = st.columns([2, 1.5, 2, 1.5, 1.5])
-        
-        # 1. Brand Filter
-        available_brands = sorted(list(df_subset["Brand"].unique()))
-        selected_brands = f_col1.multiselect("Filter Brand:", options=available_brands, default=[], placeholder="All Brands", key=f"{slug}_brand")
-        
-        # 2. Verdict Filter
-        selected_verdict = f_col2.selectbox("Filter Verdict:", options=["All", "BUY NOW", "WAIT"], key=f"{slug}_verdict")
+    with st.expander(f"{icon} {category_title} — ({len(df_subset)} products)", expanded=is_expanded):
+        c1, c2, c3, c4, c5 = st.columns([2, 1.5, 2, 1.5, 1.5])
 
-        # 3. Price Range Filter
-        min_p = int(df_subset["Current Price"].min())
-        max_p = int(df_subset["Current Price"].max())
-        if min_p == max_p:
-            max_p = min_p + 100
-        price_range = f_col3.slider("Price Range (₹):", min_value=min_p, max_value=max_p, value=(min_p, max_p), key=f"{slug}_price")
+        brands = sorted(df_subset["Brand"].dropna().unique().tolist())
+        selected_brands = c1.multiselect("Filter Brand:", options=brands, default=[],
+                                         placeholder="All Brands", key=f"{slug}_brand")
+        selected_verdict = c2.selectbox("Filter Verdict:", options=["All", "BUY NOW", "WAIT"],
+                                        key=f"{slug}_verdict")
 
-        # 4. Discount Filter
-        min_disc = f_col4.slider("Min Real Disc %:", min_value=-10, max_value=60, value=-10, step=5, key=f"{slug}_disc")
+        min_price = int(df_subset["Current Price"].min())
+        max_price = int(df_subset["Current Price"].max())
+        if min_price >= max_price:
+            max_price = min_price + 100
+        price_range = c3.slider("Price Range (₹):", min_value=min_price, max_value=max_price,
+                                value=(min_price, max_price), key=f"{slug}_price")
+        min_discount = c4.slider("Min Real Disc %:", min_value=-10, max_value=60, value=-10,
+                                 step=5, key=f"{slug}_disc")
+        only_bbd = c5.checkbox("🔥 Cheaper vs BBD", value=False, key=f"{slug}_bbd")
 
-        # 5. Cheaper vs BBD Filter
-        only_bbd = f_col5.checkbox("🔥 Cheaper vs BBD", value=False, key=f"{slug}_bbd")
-
-        # Apply Filters
         filtered = df_subset.copy()
         if selected_brands:
             filtered = filtered[filtered["Brand"].isin(selected_brands)]
         if selected_verdict == "BUY NOW":
             filtered = filtered[filtered["Verdict"] == "BUY NOW"]
         elif selected_verdict == "WAIT":
-            filtered = filtered[filtered["Verdict"].str.contains("WAIT")]
-
-        filtered = filtered[filtered["Current Price"].between(price_range[0], price_range[1])]
-        filtered = filtered[filtered["Real Disc % (vs 6M)"] >= min_disc]
-
+            filtered = filtered[filtered["Verdict"].str.startswith("WAIT")]
+        filtered = filtered[filtered["Current Price"].between(*price_range)]
+        filtered = filtered[filtered["Real Disc % (vs 6M)"] >= min_discount]
         if only_bbd:
             filtered = filtered[filtered["Diff vs Last BBD"] <= 0]
 
-        # In-Table Interactive Checkbox in Front of Each Product
-        if not filtered.empty:
-            sorted_filtered = filtered.sort_values("Real Disc % (vs 6M)", ascending=False).copy()
-            sorted_filtered.insert(0, "➕ Wishlist", False)
+        if filtered.empty:
+            st.warning("No products match the selected filters.")
+            return
 
-            disabled_fields = [c for c in display_columns if c != "➕ Wishlist"]
+        table = filtered.sort_values("Real Disc % (vs 6M)", ascending=False).copy()
+        table.insert(0, "➕ Wishlist", False)
+        editor_key = f"editor_{slug}"
 
-            edited_df = st.data_editor(
-                sorted_filtered[display_columns],
-                column_config=col_config,
-                disabled=disabled_fields,
-                use_container_width=True,
-                hide_index=True,
-                key=f"editor_{slug}"
+        edited = st.data_editor(
+            table[DISPLAY_COLUMNS],
+            column_config=COLUMN_CONFIG,
+            disabled=[c for c in DISPLAY_COLUMNS if c != "➕ Wishlist"],
+            use_container_width=True,
+            hide_index=True,
+            key=editor_key,
+        )
+
+        ticked = edited[edited["➕ Wishlist"]]
+        if not ticked.empty:
+            added = 0
+            for _, row in ticked.iterrows():
+                # Re-attach the resolved URL from the source frame (URL column is display-only).
+                source = table[table["Product"] == row["Product"]]
+                payload = row.to_dict()
+                if not source.empty:
+                    payload["URL"] = source.iloc[0]["URL"]
+                was_added, _ = add_product_to_wishlist(payload)
+                added += int(was_added)
+            # Reset the editor state first, otherwise the tick survives the rerun
+            # and re-fires this branch on every render (infinite rerun loop).
+            st.session_state.pop(editor_key, None)
+            st.toast(
+                f"✅ Added {added} item(s) to your wishlist!" if added
+                else "Those items are already on your wishlist.",
+                icon="💖",
+            )
+            st.rerun()
+
+        left, right = st.columns([3, 1])
+        with left:
+            export_cols = [c for c in DISPLAY_COLUMNS if c != "➕ Wishlist"]
+            st.download_button(
+                label=f"📥 Download {category_title} CSV",
+                data=table[export_cols].to_csv(index=False).encode("utf-8"),
+                file_name=f"{slug}_deals.csv",
+                mime="text/csv",
+                key=f"{slug}_dl",
             )
 
-            # Detect rows where user clicked the checkbox in front of the product
-            selected_to_add = edited_df[edited_df["➕ Wishlist"] == True]
-            if not selected_to_add.empty:
-                added_count = 0
-                for _, row in selected_to_add.iterrows():
-                    ok, cat_routed = add_product_to_wishlist(row.to_dict())
-                    if ok:
-                        added_count += 1
-                if added_count > 0:
-                    st.toast(f"✅ Added {added_count} item(s) to your Wishlist!", icon="💖")
+        if allow_deletion:
+            with right:
+                with st.popover("🗑️ Delete Wishlist Items"):
+                    options = df_subset[["id", "Product"]].to_dict("records")
+                    labels = {o["id"]: o["Product"] for o in options}
+                    target_id = st.selectbox(
+                        "Select product to delete:",
+                        options=list(labels),
+                        format_func=lambda x: labels.get(x, x),
+                        key=f"{slug}_del_pick",
+                    )
+                    if st.button("Delete Selected", key=f"{slug}_del_btn"):
+                        delete_record(target_id)
+                        st.toast("Deleted from wishlist.", icon="🗑️")
+                        st.rerun()
+
+
+def main() -> None:
+    st.title("⚡ Flipkart Persistent Deal Tracker & BBD Steals Radar")
+    st.caption(
+        "Live price intelligence on a single page: verified product links, BBD benchmarks, "
+        "sponsored-deal scanner and a persistent wishlist."
+    )
+
+    t1, t2, t3, t4 = st.columns([1.5, 1.3, 1.2, 1.2])
+    with t1:
+        if st.button("🔄 Scan & Re-Check Live Prices", type="primary", use_container_width=True):
+            with st.spinner("Re-checking active discounts and updating the local tracker…"):
+                count = refresh_all_live_prices()
+            st.success(f"Updated live prices for {count} products.")
+            st.rerun()
+    with t2:
+        if st.button("🚨 Reset Database & Purge Broken Links", use_container_width=True,
+                     help="Rebuilds the store and re-validates every product link"):
+            save_tracker_data(generate_seed_catalog())
+            st.success("Store rebuilt — all links re-validated.")
+            st.rerun()
+    with t3:
+        expand_all = st.checkbox("📂 Expand All Category Tables", value=False)
+    with t4:
+        card_preference = st.selectbox("💳 Card Strategy:", [CARD_AUTO, CARD_INSTANT, CARD_CASHBACK])
+
+    master_df = process_analytics(load_tracker_data(), card_preference)
+    if master_df.empty:
+        st.error("No tracked products found. Use 'Reset Database' to rebuild the catalogue.")
+        return
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.markdown(kpi(f"{len(master_df):,}", "Monitored Products"), unsafe_allow_html=True)
+    k2.markdown(kpi(f"{int((master_df['Diff vs Last BBD'] <= 0).sum()):,}",
+                    "🔥 Cheaper Than Last BBD", "#facc15"), unsafe_allow_html=True)
+    k3.markdown(kpi(f"{int(master_df['is_wishlist'].sum()):,}",
+                    "Saved Wishlist Items", "#ec4899"), unsafe_allow_html=True)
+    k4.markdown(kpi(f"₹{master_df['Real Savings (vs 6M)'].sum() / 100000:,.1f} Lakh",
+                    "Total Consumer Savings", "#4ade80"), unsafe_allow_html=True)
+
+    st.divider()
+
+    with st.expander("➕ Add Direct Product to Wishlist (Name & Link only)", expanded=False):
+        st.markdown(
+            "Paste the Flipkart product URL exactly as copied from your browser address bar. "
+            "Tracking parameters are stripped automatically; if the link cannot be validated, "
+            "a Flipkart search link is saved instead so it never opens a blank page."
+        )
+        with st.form("quick_add_wishlist", clear_on_submit=True):
+            name = st.text_input("📦 Product Name:", placeholder="e.g. Levi's 511 Slim Jeans")
+            url = st.text_input("🔗 Flipkart Product Link:", placeholder="https://www.flipkart.com/…/p/itm…")
+            price = st.number_input("💰 Current Price (₹, optional):", min_value=0, step=100, value=0)
+            if st.form_submit_button("💾 Save to Wishlist", type="primary"):
+                if not name.strip():
+                    st.error("Please enter the product name.")
+                else:
+                    item = build_wishlist_item(name, url, current=price or 999)
+                    records = load_tracker_data()
+                    records.append(item)
+                    save_tracker_data(records)
+                    st.success(f"Saved '{name.strip()}' to '{item['Category']}'.")
                     st.rerun()
 
-            # Bottom Controls & Export
-            c_left, c_right = st.columns([3, 1])
-            with c_left:
-                c_csv = sorted_filtered[[c for c in display_columns if c != "➕ Wishlist"]].to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label=f"📥 Download {category_title} CSV",
-                    data=c_csv,
-                    file_name=f"{slug}_deals.csv",
-                    mime="text/csv",
-                    key=f"{slug}_dl"
-                )
+    wishlist_df = master_df[master_df["is_wishlist"]]
+    if not wishlist_df.empty:
+        st.markdown(
+            '<div class="section-title-wishlist"><h2 style="margin:0;">💖 Your Saved Personal Wishlists</h2>'
+            '<p style="margin:2px 0 0 0; font-size:0.9rem;">Auto-organised into separate tables by product type.</p></div>',
+            unsafe_allow_html=True,
+        )
+        for category in sorted(wishlist_df["Category"].unique()):
+            subset = wishlist_df[wishlist_df["Category"] == category]
+            slug = "w_" + re.sub(r"[^a-z0-9]+", "_", category.lower()).strip("_")
+            render_collapsible_table(subset, category, slug, "💖", True, allow_deletion=True)
 
-            if allow_deletion:
-                with c_right:
-                    with st.popover("🗑️ Delete Wishlist Items"):
-                        items_to_pick = df_subset[["id", "Product"]].to_dict('records')
-                        target_id = st.selectbox(
-                            "Select product to delete:",
-                            options=[i["id"] for i in items_to_pick],
-                            format_func=lambda x: next((i["Product"] for i in items_to_pick if i["id"] == x), x)
-                        )
-                        if st.button("Delete Selected", key=f"del_single_{slug}"):
-                            current_db = load_tracker_data()
-                            updated = [i for i in current_db if i.get("id") != target_id]
-                            save_tracker_data(updated)
-                            st.success("Deleted! Refreshing...")
-                            st.rerun()
-        else:
-            st.warning("No products match the selected filters.")
+    st.markdown(
+        '<div class="section-title-catalog"><h2 style="margin:0;">1. 🛒 Flipkart Category Catalog</h2>'
+        '<p style="margin:2px 0 0 0; font-size:0.9rem;">Independent collapsible tables with dedicated filters.</p></div>',
+        unsafe_allow_html=True,
+    )
+    for category, meta in CAT_DATA_MATRIX.items():
+        subset = master_df[(master_df["Category"] == category) & (~master_df["is_wishlist"])]
+        render_collapsible_table(subset, category, meta["slug"], meta["icon"], expand_all)
 
-# ==============================================================================
-# USER SAVED WISHLISTS (ON SAME PAGE)
-# ==============================================================================
-wishlist_df = master_df[master_df["is_wishlist"] == True]
-if not wishlist_df.empty:
-    st.markdown('<div class="section-title-wishlist"><h2 style="margin:0;">💖 Your Saved Personal Wishlists</h2><p style="margin:2px 0 0 0; font-size:0.9rem;">Auto-organized into separate tables based on product type.</p></div>', unsafe_allow_html=True)
-    distinct_wishlist_cats = sorted(list(wishlist_df["Category"].unique()))
-    for w_cat in distinct_wishlist_cats:
-        sub = wishlist_df[wishlist_df["Category"] == w_cat]
-        slug = "w_" + w_cat.lower().replace(" ", "_").replace(":", "").replace("&", "")
-        render_collapsible_table(sub, w_cat, slug, "💖", is_expanded=True, allow_deletion=True)
+    st.markdown(
+        '<div class="section-title-bbd"><h2 style="margin:0;">2. 🔥 Big Billion Days Floor Deals</h2>'
+        "<p style=\"margin:2px 0 0 0; font-size:0.9rem;\">Products at or below last year's BBD festive floor.</p></div>",
+        unsafe_allow_html=True,
+    )
+    bbd_df = master_df[master_df["Diff vs Last BBD"] <= 0].sort_values("Diff vs Last BBD")
+    if bbd_df.empty:
+        st.info("No product currently beats last year's BBD floor price. Run a live re-scan to refresh.")
+    else:
+        render_collapsible_table(bbd_df, "All Confirmed BBD Floor Steals", "bbd_steals", "🔥", True)
 
-# ==============================================================================
-# 1. CATEGORY CATALOG (ALL 9 CATEGORIES ON SAME PAGE)
-# ==============================================================================
-st.markdown('<div class="section-title-catalog"><h2 style="margin:0;">1. 🛒 Flipkart Category Catalog (All 9 Categories)</h2><p style="margin:2px 0 0 0; font-size:0.9rem;">Independent collapsible tables with dedicated column filters. Stationery & Books at the bottom.</p></div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="section-title-ads"><h2 style="margin:0;">3. 📢 Promoted, Sponsored & Banner Deals</h2>'
+        '<p style="margin:2px 0 0 0; font-size:0.9rem;">Sponsored placements benchmarked against their 6-month averages.</p></div>',
+        unsafe_allow_html=True,
+    )
+    ads_df = master_df[master_df["is_ad"]].sort_values("Real Disc % (vs 6M)", ascending=False)
+    if ads_df.empty:
+        st.info("No sponsored placements are being tracked right now.")
+    else:
+        render_collapsible_table(ads_df, "Active Sponsored & Banner Promotions", "flipkart_ads", "📢", True)
 
-for cat_title, meta in CAT_DATA_MATRIX.items():
-    cat_df = master_df[(master_df["Category"] == cat_title) & (master_df["is_wishlist"] == False)]
-    render_collapsible_table(cat_df, cat_title, meta["slug"], meta["icon"], is_expanded=expand_all)
 
-# ==============================================================================
-# 2. BBD STEAL DEALS (ON SAME PAGE)
-# ==============================================================================
-st.markdown('<div class="section-title-bbd"><h2 style="margin:0;">2. 🔥 The Big Billion Days Floor Deals (Cheapest Recorded)</h2><p style="margin:2px 0 0 0; font-size:0.9rem;">Products currently cheaper than or equal to last year\'s BBD festive floor low.</p></div>', unsafe_allow_html=True)
-
-bbd_steals_df = master_df[master_df["Diff vs Last BBD"] <= 0].sort_values("Diff vs Last BBD", ascending=True)
-if not bbd_steals_df.empty:
-    render_collapsible_table(bbd_steals_df, "All Confirmed BBD Floor Steals", "bbd_steals", "🔥", is_expanded=True)
-else:
-    st.info("No products currently beat last year's BBD floor price. Click 'Scan & Re-Check Live Prices' to update.")
-
-# ==============================================================================
-# 3. FLIPKART ADS & FEATURED PROMOTIONS (ON SAME PAGE)
-# ==============================================================================
-st.markdown('<div class="section-title-ads"><h2 style="margin:0;">3. 📢 Flipkart Promoted, Sponsored & Top Banner Deals</h2><p style="margin:2px 0 0 0; font-size:0.9rem;">Tracking active sponsored product placements and ad banner promotions benchmarked against their 6-month historical averages.</p></div>', unsafe_allow_html=True)
-
-ads_df = master_df[master_df["is_ad"] == True].sort_values("Real Disc % (vs 6M)", ascending=False)
-render_collapsible_table(ads_df, "Active Sponsored & Banner Promotions", "flipkart_ads", "📢", is_expanded=True)
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:  # pragma: no cover - top-level UI guard
+        logger.exception("Unhandled error while rendering the tracker")
+        st.error("Something went wrong while rendering the tracker. Check the server logs for details.")
