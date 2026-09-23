@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 from pandas.api.types import is_numeric_dtype
-import plotly.graph_objects as go
 import random
 
 # --- PAGE CONFIGURATION ---
@@ -18,8 +17,7 @@ st.markdown("""
     .kpi-container { background-color: #0f172a; padding: 12px; border-radius: 8px; border: 1px solid #1e293b; text-align: center; }
     .kpi-number { font-size: 1.35rem; font-weight: 800; color: #38bdf8; }
     .kpi-label { font-size: 0.72rem; color: #94a3b8; text-transform: uppercase; margin-top: 3px; }
-    .cat-header { background: linear-gradient(90deg, #1e293b, #0f172a); padding: 10px 16px; border-radius: 8px; border-left: 5px solid #38bdf8; margin-top: 25px; margin-bottom: 12px; }
-    .quick-nav { background-color: #131d33; padding: 12px; border-radius: 8px; border: 1px solid #1e293b; margin-bottom: 20px; }
+    .streamlit-expanderHeader { font-size: 1.1rem !important; font-weight: 700 !important; color: #38bdf8 !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -237,7 +235,6 @@ def process_analytics(catalog, card_selection):
             else:
                 card_title, net_price = "Flipkart Axis (5%)", curr - cashback_5
 
-        # Key-safe URL assignment prevents KeyError crashes
         item_url = d.get("URL") or d.get("url") or "https://www.flipkart.com"
 
         records.append({
@@ -264,14 +261,11 @@ raw_catalog = generate_master_catalog()
 
 # --- TOP BAR & CONTROLS ---
 st.title("⚡ Flipkart Multi-Category Price Intelligence Portal")
-st.caption(f"Tracking **{len(raw_catalog):,} verified products** across 8 independent category tables. Every table includes its own dedicated column filtering controls.")
+st.caption(f"Tracking **{len(raw_catalog):,} verified products** across 8 independent category tables with collapsible cards and column filters.")
 
 col_top1, col_top2 = st.columns([2, 1])
 with col_top1:
-    st.markdown("""
-    **Quick Navigation:**
-    [👔 Men's](#mens_fashion) | [👗 Women's](#womens_fashion) | [👟 Footwear](#footwear) | [⌚ Watches](#watches) | [📱 Smartphones](#smartphones) | [💻 Audio & Tech](#audio_monitors) | [💄 Cosmetics](#cosmetics) | [🔌 Appliances](#appliances)
-    """)
+    expand_all = st.checkbox("📂 Expand All Category Tables", value=False, help="Toggle to open or collapse all category tables simultaneously.")
 with col_top2:
     card_preference = st.selectbox(
         "💳 Credit Card Strategy:",
@@ -316,16 +310,15 @@ display_columns = [
     "Verdict", "Predicted BBD Low", "Optimal Card", "Net Price", "URL"
 ]
 
-# --- RENDER CATEGORY TABLE WITH INBUILT COLUMN FILTERS ---
-def render_independent_category_table(category_name, slug, icon):
+# --- RENDER COLLAPSIBLE CATEGORY TABLE WITH INBUILT FILTERS ---
+def render_collapsible_category_table(category_name, slug, icon, is_expanded):
     df_cat = master_df[master_df["Category"] == category_name]
+    expander_title = f"{icon} {category_name} — ({len(df_cat)} Products Available)"
     
-    # Anchor for Quick Navigation
-    st.markdown(f'<div id="{slug}"></div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="cat-header"><h3 style="margin:0; color:#f8fafc;">{icon} {category_name} ({len(df_cat)} Available)</h3></div>', unsafe_allow_html=True)
-
-    # --- INBUILT COLUMN-LEVEL FILTERS FOR THIS TABLE ---
-    with st.expander(f"🔍 Column Filters & Controls for {category_name}", expanded=True):
+    # The entire category section (filters + table) collapses together
+    with st.expander(expander_title, expanded=is_expanded):
+        st.markdown(f"#### 🔍 Column Filters & Controls for {category_name}")
+        
         f_col1, f_col2, f_col3, f_col4, f_col5 = st.columns([2, 1.5, 2, 1.5, 1.5])
         
         # 1. Filter by Brand Column
@@ -345,7 +338,7 @@ def render_independent_category_table(category_name, slug, icon):
             key=f"{slug}_verdict_filter"
         )
 
-        # 3. Filter by Current Price Column (Slider)
+        # 3. Filter by Current Price Column
         min_p = int(df_cat["Current Price"].min())
         max_p = int(df_cat["Current Price"].max())
         price_range = f_col3.slider(
@@ -366,69 +359,51 @@ def render_independent_category_table(category_name, slug, icon):
             key=f"{slug}_disc_slider"
         )
 
-        # 5. Filter: Cheaper than Last BBD Column
+        # 5. Filter by Cheaper than BBD Low
         only_bbd = f_col5.checkbox(
             "🔥 Cheaper vs BBD",
             value=False,
             key=f"{slug}_bbd_checkbox"
         )
 
-    # Apply Column Filters to this Category's DataFrame
-    filtered_cat = df_cat.copy()
-    
-    if selected_brands:
-        filtered_cat = filtered_cat[filtered_cat["Brand"].isin(selected_brands)]
-    
-    if selected_verdict == "BUY NOW":
-        filtered_cat = filtered_cat[filtered_cat["Verdict"] == "BUY NOW"]
-    elif selected_verdict == "WAIT":
-        filtered_cat = filtered_cat[filtered_cat["Verdict"].str.contains("WAIT")]
-
-    filtered_cat = filtered_cat[filtered_cat["Current Price"].between(price_range[0], price_range[1])]
-    filtered_cat = filtered_cat[filtered_cat["Real Disc % (vs 6M)"] >= min_disc]
-
-    if only_bbd:
-        filtered_cat = filtered_cat[filtered_cat["Diff vs Last BBD"] <= 0]
-
-    # Render Table
-    if not filtered_cat.empty:
-        st.dataframe(
-            filtered_cat[display_columns].sort_values("Real Disc % (vs 6M)", ascending=False),
-            column_config=col_config,
-            use_container_width=True,
-            hide_index=True
-        )
+        # Apply Column Filters to this Category's DataFrame
+        filtered_cat = df_cat.copy()
         
-        # Download Button for this Category
-        c_csv = filtered_cat[display_columns].to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label=f"📥 Download {category_name} CSV ({len(filtered_cat)} items)",
-            data=c_csv,
-            file_name=f"flipkart_{slug}_deals.csv",
-            mime="text/csv",
-            key=f"{slug}_dl_btn"
-        )
-    else:
-        st.warning(f"No products in {category_name} match the column filter settings above. Adjust the Brand, Price Range, or Discount sliders.")
+        if selected_brands:
+            filtered_cat = filtered_cat[filtered_cat["Brand"].isin(selected_brands)]
+        
+        if selected_verdict == "BUY NOW":
+            filtered_cat = filtered_cat[filtered_cat["Verdict"] == "BUY NOW"]
+        elif selected_verdict == "WAIT":
+            filtered_cat = filtered_cat[filtered_cat["Verdict"].str.contains("WAIT")]
 
-    st.write("")
+        filtered_cat = filtered_cat[filtered_cat["Current Price"].between(price_range[0], price_range[1])]
+        filtered_cat = filtered_cat[filtered_cat["Real Disc % (vs 6M)"] >= min_disc]
 
-# --- RENDER ALL 8 SEPARATE CATEGORY TABLES ON THE SAME PAGE ---
+        if only_bbd:
+            filtered_cat = filtered_cat[filtered_cat["Diff vs Last BBD"] <= 0]
+
+        # Render Table inside Expander
+        if not filtered_cat.empty:
+            st.dataframe(
+                filtered_cat[display_columns].sort_values("Real Disc % (vs 6M)", ascending=False),
+                column_config=col_config,
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            # Download Button for this Category
+            c_csv = filtered_cat[display_columns].to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label=f"📥 Download {category_name} CSV ({len(filtered_cat)} items)",
+                data=c_csv,
+                file_name=f"flipkart_{slug}_deals.csv",
+                mime="text/csv",
+                key=f"{slug}_dl_btn"
+            )
+        else:
+            st.warning(f"No products in {category_name} match the column filter settings above. Adjust the Brand, Price Range, or Discount sliders.")
+
+# --- RENDER ALL 8 SEPARATE COLLAPSIBLE CATEGORY TABLES ON THE SAME PAGE ---
 for cat_title, meta in CAT_DATA_MATRIX.items():
-    render_independent_category_table(cat_title, meta["slug"], meta["icon"])
-
-# --- VISUAL BENCHMARK CHARTS AT BOTTOM OF PAGE ---
-st.divider()
-st.subheader("📊 Category Price Benchmark Visualizer")
-st.caption("Visualizes a sample of 15 products comparing regular 6-month averages against festive lows and current deal prices.")
-
-chart_cat = st.selectbox("Select Category to View Chart:", options=list(CAT_DATA_MATRIX.keys()))
-chart_df = master_df[master_df["Category"] == chart_cat].head(15)
-
-if not chart_df.empty:
-    fig = go.Figure()
-    fig.add_trace(go.Bar(name='6-Month Average', x=chart_df['Product'], y=chart_df['6-Month Avg'], marker_color='#475569'))
-    fig.add_trace(go.Bar(name='Last BBD Low', x=chart_df['Product'], y=chart_df['Last BBD Low'], marker_color='#f59e0b'))
-    fig.add_trace(go.Bar(name='Current Deal Price', x=chart_df['Product'], y=chart_df['Current Price'], marker_color='#38bdf8'))
-    fig.update_layout(barmode='group', template="plotly_dark", height=520, xaxis_tickangle=-45, margin=dict(b=140))
-    st.plotly_chart(fig, use_container_width=True)
+    render_collapsible_category_table(cat_title, meta["slug"], meta["icon"], expand_all)
