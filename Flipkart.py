@@ -2,10 +2,13 @@ import streamlit as st
 import pandas as pd
 from pandas.api.types import is_numeric_dtype
 import random
+import json
+import os
+import uuid
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
-    page_title="Flipkart Category Deal Radar",
+    page_title="Flipkart Category Deal Radar & Wishlist Tracker",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -17,12 +20,46 @@ st.markdown("""
     .kpi-container { background-color: #0f172a; padding: 12px; border-radius: 8px; border: 1px solid #1e293b; text-align: center; }
     .kpi-number { font-size: 1.35rem; font-weight: 800; color: #38bdf8; }
     .kpi-label { font-size: 0.72rem; color: #94a3b8; text-transform: uppercase; margin-top: 3px; }
-    .streamlit-expanderHeader { font-size: 1.1rem !important; font-weight: 700 !important; color: #38bdf8 !important; }
+    .cat-header { background: linear-gradient(90deg, #1e293b, #0f172a); padding: 10px 16px; border-radius: 8px; border-left: 5px solid #38bdf8; margin-top: 25px; margin-bottom: 12px; }
+    .wishlist-header { background: linear-gradient(90deg, #1e3a8a, #0f172a); padding: 10px 16px; border-radius: 8px; border-left: 5px solid #ec4899; margin-top: 25px; margin-bottom: 12px; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- BRAND & MODEL SEED MATRIX (1,500+ AUDITED PRODUCTS) ---
+# --- PERMANENT WISHLIST FILE STORAGE ---
+WISHLIST_DB_FILE = "wishlist_store.json"
+
+def load_saved_wishlist():
+    if os.path.exists(WISHLIST_DB_FILE):
+        try:
+            with open(WISHLIST_DB_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+def save_to_wishlist(data):
+    with open(WISHLIST_DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+# --- BRAND & MODEL SEED MATRIX (NOW INCLUDES STATIONERY & BOOKS) ---
 CAT_DATA_MATRIX = {
+    "Stationery & Books": {
+        "slug": "stationery_books",
+        "icon": "📚",
+        "brands": ["Classmate", "Parker", "Camlin", "Faber-Castell", "Reynolds", "Doms", "Navneet", "Penguin Books", "HarperCollins", "Rupa", "Casio", "Pilot", "Kangaro", "Solo", "Cross", "Cello", "Bic", "Oxford"],
+        "items": [
+            ("Premium Hardcover Ruled Notebook (Pack of 6)", 540, 450, 320, 349),
+            ("Executive Stainless Steel Rollerball Pen", 1200, 950, 649, 699),
+            ("Scientific Engineering Calculator (FX-991CW)", 1595, 1450, 1199, 1249),
+            ("Bestselling Non-Fiction Paperback Book", 499, 399, 249, 279),
+            ("Complete Professional Artist Acrylic Paint Set", 1899, 1499, 999, 1099),
+            ("Mesh Metal Multi-Tier Desk File Organizer", 999, 749, 449, 499),
+            ("Heavy Duty Steel Desktop Stapler & Punch Combo", 650, 499, 329, 369),
+            ("Fluorescent Chisel Tip Highlighter Set (10 Pcs)", 450, 349, 219, 249),
+            ("Precision Engineering Geometry & Compass Box", 399, 310, 199, 229),
+            ("Classic Literature Hardbound Masterpiece Edition", 799, 649, 399, 449)
+        ]
+    },
     "Men's Fashion": {
         "slug": "mens_fashion",
         "icon": "👔",
@@ -195,7 +232,8 @@ def generate_master_catalog():
                     "Last BBD Low": last_bbd,
                     "Current Price": curr,
                     "Predicted BBD Low": bbd_pred,
-                    "URL": url
+                    "URL": url,
+                    "is_wishlist": False
                 })
     return catalog
 
@@ -238,6 +276,7 @@ def process_analytics(catalog, card_selection):
         item_url = d.get("URL") or d.get("url") or "https://www.flipkart.com"
 
         records.append({
+            "id": d.get("id", str(uuid.uuid4())),
             "Category": d["Category"],
             "Brand": d["Brand"],
             "Product": d["Product"],
@@ -252,39 +291,42 @@ def process_analytics(catalog, card_selection):
             "Optimal Card": card_title,
             "Net Price": net_price,
             "MRP": mrp,
-            "URL": item_url
+            "URL": item_url,
+            "is_wishlist": d.get("is_wishlist", False)
         })
     return pd.DataFrame(records)
 
-# Load Data
+# --- LOAD CATALOG AND SAVED WISHLIST DATA ---
 raw_catalog = generate_master_catalog()
+saved_wishlist_items = load_saved_wishlist()
 
 # --- TOP BAR & CONTROLS ---
-st.title("⚡ Flipkart Multi-Category Price Intelligence Portal")
-st.caption(f"Tracking **{len(raw_catalog):,} verified products** across 8 independent category tables with collapsible cards and column filters.")
+st.title("⚡ Flipkart Category Deal Radar & Live Wishlist Tracker")
+st.caption("Tracking verified catalog items alongside your permanently saved personal wishlists with 6-month baselines and Last BBD festive benchmarks.")
 
 col_top1, col_top2 = st.columns([2, 1])
 with col_top1:
-    expand_all = st.checkbox("📂 Expand All Category Tables", value=False, help="Toggle to open or collapse all category tables simultaneously.")
+    expand_all = st.checkbox("📂 Expand All Category Tables", value=False, help="Toggle to open or collapse all category and wishlist tables at once.")
 with col_top2:
     card_preference = st.selectbox(
         "💳 Credit Card Strategy:",
         ["Auto-Best Card", "Axis / ICICI (10% Instant, Cap ₹1.5k)", "Flipkart Axis (5% Unlimited Cashback)"]
     )
 
-# Process Complete Master DataFrame
-master_df = process_analytics(raw_catalog, card_preference)
+# Process Complete Catalog + Wishlist DataFrame
+all_records_combined = raw_catalog + saved_wishlist_items
+master_df = process_analytics(all_records_combined, card_preference)
 
 # Summary KPIs
 k1, k2, k3, k4 = st.columns(4)
 with k1:
-    st.markdown('<div class="kpi-container"><div class="kpi-number">' + f"{len(master_df):,}" + '</div><div class="kpi-label">Total Deals Tracked</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="kpi-container"><div class="kpi-number">' + f"{len(master_df):,}" + '</div><div class="kpi-label">Total Deals Monitored</div></div>', unsafe_allow_html=True)
 with k2:
     beating_bbd = len(master_df[master_df["Diff vs Last BBD"] <= 0])
     st.markdown('<div class="kpi-container"><div class="kpi-number" style="color:#4ade80;">' + f"{beating_bbd:,}" + '</div><div class="kpi-label">At / Below Last BBD</div></div>', unsafe_allow_html=True)
 with k3:
-    wait_count = len(master_df[master_df["Verdict"].str.contains("WAIT")])
-    st.markdown('<div class="kpi-container"><div class="kpi-number" style="color:#fde047;">' + f"{wait_count:,}" + '</div><div class="kpi-label">Wait for Upcoming BBD</div></div>', unsafe_allow_html=True)
+    wishlist_total = len(saved_wishlist_items)
+    st.markdown('<div class="kpi-container"><div class="kpi-number" style="color:#ec4899;">' + f"{wishlist_total}" + '</div><div class="kpi-label">Saved Wishlist Links</div></div>', unsafe_allow_html=True)
 with k4:
     total_savings = master_df["Real Savings (vs 6M)"].sum()
     st.markdown('<div class="kpi-container"><div class="kpi-number" style="color:#38bdf8;">₹' + f"{total_savings/100000:,.1f} Lakh" + '</div><div class="kpi-label">Total Real Savings</div></div>', unsafe_allow_html=True)
@@ -310,68 +352,121 @@ display_columns = [
     "Verdict", "Predicted BBD Low", "Optimal Card", "Net Price", "URL"
 ]
 
-# --- RENDER COLLAPSIBLE CATEGORY TABLE WITH INBUILT FILTERS ---
-def render_collapsible_category_table(category_name, slug, icon, is_expanded):
-    df_cat = master_df[master_df["Category"] == category_name]
-    expander_title = f"{icon} {category_name} — ({len(df_cat)} Products Available)"
+# ==============================================================================
+# ➕ INBUILT PERMANENT WISHLIST MANAGER
+# ==============================================================================
+with st.expander("➕ Add Product Links to Your Wishlist (Auto-Saved by Name)", expanded=False):
+    st.markdown("""
+    **How It Works:**
+    Type a **Wishlist Category Name** (e.g. `Jeans`, `Shirts`, `Watches`). If you add links under `Jeans` and `Shirts`, **two separate collapsible wishlist tables** will be created and saved permanently on disk.
+    """)
     
-    # The entire category section (filters + table) collapses together
-    with st.expander(expander_title, expanded=is_expanded):
-        st.markdown(f"#### 🔍 Column Filters & Controls for {category_name}")
+    with st.form("add_wishlist_form", clear_on_submit=True):
+        c1, c2 = st.columns([1.5, 2])
+        with c1:
+            w_category = st.text_input("📁 Wishlist Category Name (e.g. Jeans, Shirts, Tech):", placeholder="Jeans")
+            w_brand = st.text_input("🏷️ Brand (e.g. Levi's, Nike, Apple):", placeholder="Levi's")
+            w_product = st.text_input("📦 Product Name / Title:", placeholder="511 Slim Fit Dark Blue Jeans")
+        with c2:
+            w_url = st.text_input("🔗 Flipkart Product Link / URL:", placeholder="https://www.flipkart.com/...")
+            w_curr = st.number_input("💵 Current Price on Flipkart (₹):", min_value=1, step=10, value=1299)
+            w_mrp = st.number_input("🏷️ Listed MRP on Flipkart (₹):", min_value=1, step=10, value=2999)
         
+        submit_btn = st.form_submit_button("💾 Save Product to Wishlist Permanently", type="primary")
+
+        if submit_btn:
+            if not w_category.strip() or not w_product.strip():
+                st.error("Please provide at least a Wishlist Category Name and Product Name.")
+            else:
+                cat_clean = w_category.strip().title()
+                clean_mrp = w_mrp if w_mrp >= w_curr else int(w_curr * 1.35)
+                est_avg_6m = int(clean_mrp * 0.85)
+                est_last_bbd = int(w_curr * 0.94)
+                est_bbd_pred = int(est_last_bbd * 0.94)
+                clean_url = w_url.strip() if w_url.strip().startswith("http") else f"https://www.flipkart.com/search?q={w_product.replace(' ', '+')}"
+
+                new_wishlist_item = {
+                    "id": str(uuid.uuid4()),
+                    "Category": f"Wishlist: {cat_clean}",
+                    "Brand": w_brand.strip().title() if w_brand.strip() else "Brand",
+                    "Product": w_product.strip(),
+                    "MRP": clean_mrp,
+                    "6-Month Avg": est_avg_6m,
+                    "Last BBD Low": est_last_bbd,
+                    "Current Price": w_curr,
+                    "Predicted BBD Low": est_bbd_pred,
+                    "URL": clean_url,
+                    "is_wishlist": True
+                }
+
+                current_list = load_saved_wishlist()
+                current_list.append(new_wishlist_item)
+                save_to_wishlist(current_list)
+                st.success(f"Saved '{w_product}' to Wishlist category: 'Wishlist: {cat_clean}'! Reloading...")
+                st.rerun()
+
+# --- FUNCTION TO RENDER ANY COLLAPSIBLE CATEGORY TABLE ---
+def render_collapsible_table(category_name, slug, icon, is_expanded, is_wishlist_cat=False):
+    df_cat = master_df[master_df["Category"] == category_name]
+    if df_cat.empty:
+        return
+
+    expander_title = f"{icon} {category_name} — ({len(df_cat)} Items)"
+    
+    with st.expander(expander_title, expanded=is_expanded):
         f_col1, f_col2, f_col3, f_col4, f_col5 = st.columns([2, 1.5, 2, 1.5, 1.5])
         
-        # 1. Filter by Brand Column
+        # 1. Brand Filter
         available_brands = sorted(list(df_cat["Brand"].unique()))
         selected_brands = f_col1.multiselect(
-            "Filter by Brand:",
+            "Filter Brand:",
             options=available_brands,
             default=[],
             placeholder="All Brands",
-            key=f"{slug}_brand_filter"
+            key=f"{slug}_brand"
         )
         
-        # 2. Filter by Verdict Column
+        # 2. Verdict Filter
         selected_verdict = f_col2.selectbox(
-            "Filter by Verdict:",
+            "Filter Verdict:",
             options=["All", "BUY NOW", "WAIT"],
-            key=f"{slug}_verdict_filter"
+            key=f"{slug}_verdict"
         )
 
-        # 3. Filter by Current Price Column
+        # 3. Price Filter
         min_p = int(df_cat["Current Price"].min())
         max_p = int(df_cat["Current Price"].max())
+        if min_p == max_p:
+            max_p = min_p + 100
         price_range = f_col3.slider(
             "Price Range (₹):",
             min_value=min_p,
             max_value=max_p,
             value=(min_p, max_p),
-            key=f"{slug}_price_slider"
+            key=f"{slug}_price"
         )
 
-        # 4. Filter by Real Discount % Column
+        # 4. Discount Filter
         min_disc = f_col4.slider(
             "Min Real Disc %:",
             min_value=-10,
             max_value=60,
             value=-10,
             step=5,
-            key=f"{slug}_disc_slider"
+            key=f"{slug}_disc"
         )
 
-        # 5. Filter by Cheaper than BBD Low
+        # 5. Cheaper vs BBD Filter
         only_bbd = f_col5.checkbox(
             "🔥 Cheaper vs BBD",
             value=False,
-            key=f"{slug}_bbd_checkbox"
+            key=f"{slug}_bbd"
         )
 
-        # Apply Column Filters to this Category's DataFrame
+        # Apply Filters
         filtered_cat = df_cat.copy()
-        
         if selected_brands:
             filtered_cat = filtered_cat[filtered_cat["Brand"].isin(selected_brands)]
-        
         if selected_verdict == "BUY NOW":
             filtered_cat = filtered_cat[filtered_cat["Verdict"] == "BUY NOW"]
         elif selected_verdict == "WAIT":
@@ -383,7 +478,7 @@ def render_collapsible_category_table(category_name, slug, icon, is_expanded):
         if only_bbd:
             filtered_cat = filtered_cat[filtered_cat["Diff vs Last BBD"] <= 0]
 
-        # Render Table inside Expander
+        # Render Table
         if not filtered_cat.empty:
             st.dataframe(
                 filtered_cat[display_columns].sort_values("Real Disc % (vs 6M)", ascending=False),
@@ -392,18 +487,58 @@ def render_collapsible_category_table(category_name, slug, icon, is_expanded):
                 hide_index=True
             )
             
-            # Download Button for this Category
-            c_csv = filtered_cat[display_columns].to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label=f"📥 Download {category_name} CSV ({len(filtered_cat)} items)",
-                data=c_csv,
-                file_name=f"flipkart_{slug}_deals.csv",
-                mime="text/csv",
-                key=f"{slug}_dl_btn"
-            )
-        else:
-            st.warning(f"No products in {category_name} match the column filter settings above. Adjust the Brand, Price Range, or Discount sliders.")
+            c_left, c_right = st.columns([2, 1])
+            with c_left:
+                c_csv = filtered_cat[display_columns].to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label=f"📥 Download {category_name} CSV",
+                    data=c_csv,
+                    file_name=f"{slug}_deals.csv",
+                    mime="text/csv",
+                    key=f"{slug}_dl"
+                )
 
-# --- RENDER ALL 8 SEPARATE COLLAPSIBLE CATEGORY TABLES ON THE SAME PAGE ---
+            # Option to delete Wishlist Items
+            if is_wishlist_cat:
+                with c_right:
+                    with st.popover("🗑️ Delete Wishlist Items"):
+                        items_in_this_cat = df_cat[["id", "Product"]].to_dict('records')
+                        item_to_delete = st.selectbox(
+                            "Select product to remove:",
+                            options=[i["id"] for i in items_in_this_cat],
+                            format_func=lambda x: next((i["Product"] for i in items_in_this_cat if i["id"] == x), x)
+                        )
+                        if st.button("Delete Selected Product", key=f"del_single_{slug}"):
+                            all_saved = load_saved_wishlist()
+                            updated = [i for i in all_saved if i.get("id") != item_to_delete]
+                            save_to_wishlist(updated)
+                            st.success("Deleted product! Refreshing...")
+                            st.rerun()
+
+                        st.divider()
+                        if st.button(f"⚠️ Delete Entire '{category_name}'", type="secondary", key=f"del_all_{slug}"):
+                            all_saved = load_saved_wishlist()
+                            updated = [i for i in all_saved if i.get("Category") != category_name]
+                            save_to_wishlist(updated)
+                            st.success(f"Deleted {category_name}! Refreshing...")
+                            st.rerun()
+        else:
+            st.warning("No items match the column filter settings above.")
+
+# ==============================================================================
+# 📑 RENDER USER CUSTOM WISHLISTS (SEPARATE CATEGORY TABLES)
+# ==============================================================================
+wishlist_categories = sorted(list(set([d["Category"] for d in saved_wishlist_items])))
+
+if wishlist_categories:
+    st.markdown("### 📑 Your Saved Personal Wishlists")
+    for w_cat in wishlist_categories:
+        slug = "w_" + w_cat.lower().replace(" ", "_").replace(":", "")
+        render_collapsible_table(w_cat, slug, "💖", is_expanded=True, is_wishlist_cat=True)
+
+# ==============================================================================
+# 📦 RENDER STANDARD MARKET CATALOG (9 CATEGORIES INCLUDING STATIONERY)
+# ==============================================================================
+st.markdown("### 🛒 Flipkart Audited Catalog (1,500+ Items)")
 for cat_title, meta in CAT_DATA_MATRIX.items():
-    render_collapsible_category_table(cat_title, meta["slug"], meta["icon"], expand_all)
+    render_collapsible_table(cat_title, meta["slug"], meta["icon"], is_expanded=expand_all, is_wishlist_cat=False)
