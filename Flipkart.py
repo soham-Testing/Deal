@@ -40,7 +40,7 @@ import streamlit as st
 # --------------------------------------------------------------------------- #
 
 APP_TITLE = "Flipkart BBD Deal Tracker & Live Price Radar"
-TRACKER_VERSION = "v12_safe_url_resolver"
+TRACKER_VERSION = "v13_search_first_links"
 TRACKER_DB_FILE = os.environ.get("TRACKER_DB_FILE", "tracker_store.json")
 
 FLIPKART_BASE = "https://www.flipkart.com"
@@ -48,14 +48,25 @@ FLIPKART_SEARCH = FLIPKART_BASE + "/search?q={query}"
 ALLOWED_HOSTS = {"flipkart.com", "www.flipkart.com", "dl.flipkart.com"}
 
 # Query parameters Flipkart genuinely needs to render a PDP.
+SAFE_NON_PDP_PREFIXES = ("/search", "/pr", "/offers-store", "/all")
+
 KEEP_PARAMS = {"pid", "lid", "marketplace", "q", "otracker", "store"}
 # Referral / analytics noise that can break or pollute the PDP.
 DROP_PARAM_PATTERN = re.compile(
     r"^(utm_.*|affid|affExtParam\d*|cmpid|pageuid|lastviewedpid|ppt|ppn|ssid|srno|qh|iid|fm|sattr\d*)$",
     re.IGNORECASE,
 )
-# A genuine Flipkart PDP id looks like: itm + 15 hexadecimal characters.
-ITM_ID_PATTERN = re.compile(r"/p/(itm[0-9a-f]{15})\b", re.IGNORECASE)
+# A genuine Flipkart PDP id is "itm" followed by 12-18 hexadecimal characters.
+# NOTE: a well-formed id is not necessarily a LIVE id - Flipkart answers with the
+# client-side E002 error for any product id absent from its catalogue, which is why
+# unverified seed links are never shipped (see TRUST_SEED_PDP_LINKS below).
+ITM_ID_PATTERN = re.compile(r"/p/(itm[0-9a-f]{12,18})(?:[/?]|$)", re.IGNORECASE)
+
+# Seed links are demonstration data and cannot be verified against Flipkart's live
+# catalogue offline. Shipping them produces the E002 "Something went wrong" page, so
+# every seeded product resolves to a Flipkart search URL, which always renders.
+# Links you paste yourself in "Add Direct Product to Wishlist" are used verbatim.
+TRUST_SEED_PDP_LINKS = False
 
 INSTANT_DISCOUNT_RATE = 0.10
 INSTANT_DISCOUNT_CAP = 1500
@@ -165,7 +176,11 @@ def resolve_product_url(raw_url: str, *fallback_terms: str, blocked_ids: Iterabl
     clean = sanitize_url(raw_url)
     if is_pdp(clean) and extract_itm_id(clean) not in set(blocked_ids):
         return clean
-    if clean and not is_pdp(clean):
+    # Non-product Flipkart routes are only trusted when they are browse/search
+    # pages; anything else is a malformed path that renders the E002 shell.
+    if clean and urlparse(clean).path.split("/")[1:2][0:1] and any(
+        urlparse(clean).path.startswith(prefix) for prefix in SAFE_NON_PDP_PREFIXES
+    ):
         return clean
     return search_url(*fallback_terms)
 
@@ -182,9 +197,9 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
         "slug": "mens_fashion",
         "icon": "👔",
         "items": [
-            ("Levi's", "511 Slim Fit Stretch Jeans", 2999, 1749, 1099, 1056, "https://www.flipkart.com/levi-s-511-slim-men-blue-jeans/p/itm28448ec8d098a"),
+            ("Levi's", "511 Slim Fit Stretch Jeans", 2999, 1749, 1099, 1056, ""),
             ("U.S. Polo Assn", "Solid Cotton Polo T-Shirt", 1999, 1399, 849, 899, ""),
-            ("Louis Philippe", "2-Piece Formal Slim Suit", 10999, 8999, 5499, 5390, "https://www.flipkart.com/louis-philippe-2-piece-solid-men-suit/p/itmbfb64d2750157"),
+            ("Louis Philippe", "2-Piece Formal Slim Suit", 10999, 8999, 5499, 5390, ""),
             ("Allen Solly", "Slim Fit Poplin Formal Shirt", 2199, 1599, 999, 1049, ""),
             ("Peter England", "Slim Fit Formal Trousers", 2499, 1799, 1099, 1149, ""),
             ("Wildcraft", "Active Windproof Bomber Jacket", 4299, 2799, 1599, 1699, ""),
@@ -215,10 +230,10 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
         "icon": "👟",
         "items": [
             ("Puma", "Conduct Pro Performance Running Shoes", 6499, 4899, 3299, 3199, ""),
-            ("Nike", "Revolution 7 Road Running Shoes", 3695, 3695, 2399, 2995, "https://www.flipkart.com/nike-revolution-7-running-shoes-men/p/itm4ea4909a341b1"),
+            ("Nike", "Revolution 7 Road Running Shoes", 3695, 3695, 2399, 2995, ""),
             ("Puma", "Smash V2 Leather Streetstyle Sneakers", 5599, 3599, 2399, 2429, ""),
             ("Asics", "Gel-Contend 8 Neutral Road Running", 5499, 4099, 2899, 2899, ""),
-            ("Woodland", "Camel Leather High-Traction Boots", 5995, 4595, 3295, 3495, "https://www.flipkart.com/woodland-boots-men/p/itm0ea622bc13d80"),
+            ("Woodland", "Camel Leather High-Traction Boots", 5995, 4595, 3295, 3495, ""),
             ("Skechers", "Go Run Elevate Daily Walking Shoes", 2499, 1699, 1099, 1149, ""),
             ("Red Tape", "Airflow Chunky Retro Sneakers", 4999, 1899, 1199, 1249, ""),
             ("Bata", "Formal Genuine Leather Derby Shoes", 3999, 2899, 1799, 1899, ""),
@@ -232,11 +247,11 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
         "items": [
             ("Casio", "Vintage Stainless Steel Digital Watch", 1895, 1745, 1249, 1271, ""),
             ("Casio", "G-Shock GA-2100 Octagonal Tough Watch", 9995, 8495, 6495, 6995, ""),
-            ("Titan", "Karishma Champagne Dial Formal Watch", 2195, 1995, 1449, 1499, "https://www.flipkart.com/titan-karishma-analog-watch-men/p/itmfa8c8c7f20ec6"),
+            ("Titan", "Karishma Champagne Dial Formal Watch", 2195, 1995, 1449, 1499, ""),
             ("Fastrack", 'Revoltt FS1 1.83" BT Calling Smartwatch', 3999, 1699, 1199, 1299, ""),
             ("Ray-Ban", "Polarized Classic Aviator Sunglasses", 9290, 8290, 5999, 7490, ""),
             ("Timex", "Expedition Rugged Field Outdoor Watch", 3995, 3195, 2199, 2299, ""),
-            ("Fossil", "Grant Chronograph Leather Quartz Watch", 13495, 8995, 5995, 6495, "https://www.flipkart.com/fossil-grant-chronograph-watch-men/p/itm8a8f117c0c1ea"),
+            ("Fossil", "Grant Chronograph Leather Quartz Watch", 13495, 8995, 5995, 6495, ""),
             ("Fastrack", "Wayfarer UV400 Protective Sunglasses", 1399, 1099, 649, 719, ""),
             ("Oakley", "Holbrook Polarized Matte Sunglasses", 7990, 6490, 4490, 4990, ""),
             ("Citizen", "Eco-Drive Solar Powered Analog Watch", 8995, 6995, 4799, 5199, ""),
@@ -246,9 +261,9 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
         "slug": "smartphones",
         "icon": "📱",
         "items": [
-            ("Apple", "iPhone 15 (Black, 128 GB)", 69900, 63499, 52999, 54999, "https://www.flipkart.com/apple-iphone-15-black-128-gb/p/itm6ac6485515ae4"),
-            ("Apple", "iPhone 14 (Blue, 128 GB)", 59900, 52999, 44999, 47999, "https://www.flipkart.com/apple-iphone-14-blue-128-gb/p/itmdb77f40da6b6d"),
-            ("Samsung", "Galaxy S23 5G (Phantom Black, 128 GB)", 74999, 49999, 36999, 38999, "https://www.flipkart.com/samsung-galaxy-s23-5g-phantom-black-128-gb/p/itm2271ff5d3bc64"),
+            ("Apple", "iPhone 15 (Black, 128 GB)", 69900, 63499, 52999, 54999, ""),
+            ("Apple", "iPhone 14 (Blue, 128 GB)", 59900, 52999, 44999, 47999, ""),
+            ("Samsung", "Galaxy S23 5G (Phantom Black, 128 GB)", 74999, 49999, 36999, 38999, ""),
             ("Samsung", "Galaxy S23 FE 5G (Mint, 128 GB)", 59999, 39999, 29999, 29999, ""),
             ("Motorola", "Edge 50 Fusion (Marshmallow Blue, 128 GB)", 27999, 23999, 20999, 21999, ""),
             ("Nothing", "Phone (2a) 5G (Black, 128 GB)", 25999, 23499, 19999, 20999, ""),
@@ -264,14 +279,14 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
         "items": [
             ("Sony", "WH-1000XM4 ANC Wireless Headphones", 29990, 22990, 18490, 18990, ""),
             ("Sony", "WH-1000XM5 ANC Wireless Headphones", 34990, 29990, 24990, 25990, ""),
-            ("LG", 'UltraGear 27" 165Hz IPS QHD 2K Monitor', 32000, 24499, 18999, 19499, "https://www.flipkart.com/lg-ultragear-27-inch-qhd-ips-gaming-monitor/p/itm6ba19d67e7161"),
+            ("LG", 'UltraGear 27" 165Hz IPS QHD 2K Monitor', 32000, 24499, 18999, 19499, ""),
             ("Samsung", 'Odyssey G3 24" 165Hz FHD 1ms Display', 19000, 13999, 9999, 10499, ""),
             ("Apple", "iPad 10th Gen (Wi-Fi, 64GB Silver)", 39900, 34490, 29999, 30900, ""),
             ("boAt", "Airdopes 161 ANC TWS Earbuds", 3990, 1499, 899, 999, ""),
-            ("JBL", "Flip 6 30W Waterproof Bluetooth Speaker", 13999, 9999, 7499, 8499, "https://www.flipkart.com/jbl-flip-6-30-w-bluetooth-speaker/p/itmd41334c44f07e"),
+            ("JBL", "Flip 6 30W Waterproof Bluetooth Speaker", 13999, 9999, 7499, 8499, ""),
             ("Marshall", "Emberton II Portable Bluetooth Speaker", 17499, 14999, 11999, 12999, ""),
             ("OnePlus", "Bullets Wireless Z2 Bluetooth Earphones", 2299, 1699, 1299, 1399, ""),
-            ("Acer", "Nitro V Core i5 13th Gen (RTX 4050 Laptop)", 88999, 74990, 62990, 64990, "https://www.flipkart.com/acer-nitro-v-core-i5-13th-gen-rtx-4050-gaming-laptop/p/itm7e28df13b19aa"),
+            ("Acer", "Nitro V Core i5 13th Gen (RTX 4050 Laptop)", 88999, 74990, 62990, 64990, ""),
         ],
     },
     "Cosmetics & Grooming": {
@@ -311,9 +326,9 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
         "icon": "📚",
         "items": [
             ("Classmate", "Pulse Regular Hardcover Notebook (Pack of 6)", 540, 450, 320, 349, ""),
-            ("Parker", "Vector Matte Black CT Rollerball Pen", 1200, 950, 649, 699, "https://www.flipkart.com/parker-vector-matte-black-ct-roller-ball-pen/p/itmfa8c8c7f20ec6"),
-            ("Casio", "FX-991CW Scientific Engineering Calculator", 1595, 1450, 1199, 1249, "https://www.flipkart.com/casio-fx-991cw-scientific-calculator/p/itm0dc8963283f51"),
-            ("Penguin", "Atomic Habits by James Clear (Paperback)", 499, 399, 249, 279, "https://www.flipkart.com/atomic-habits/p/itmd5b306443c2eb"),
+            ("Parker", "Vector Matte Black CT Rollerball Pen", 1200, 950, 649, 699, ""),
+            ("Casio", "FX-991CW Scientific Engineering Calculator", 1595, 1450, 1199, 1249, ""),
+            ("Penguin", "Atomic Habits by James Clear (Paperback)", 499, 399, 249, 279, ""),
             ("Camlin", "Artists Acrylic Colour Set (12 Shades x 20ml)", 1899, 1499, 999, 1099, ""),
             ("Solo", "Mesh Metal 3-Tier Desk Document Organizer", 999, 749, 449, 499, ""),
             ("Kangaro", "Heavy Duty Steel Stapler & Punch Combo Set", 650, 499, 329, 369, ""),
@@ -381,7 +396,10 @@ def generate_seed_catalog() -> List[Dict[str, Any]]:
                     "Last BBD Low": int(last_bbd),
                     "Current Price": int(current),
                     "Predicted BBD Low": int(last_bbd * BBD_PREDICTION_FACTOR),
-                    "URL": resolve_product_url(raw_url, brand, name, blocked_ids=BLOCKED_ITM_IDS),
+                    "URL": resolve_product_url(
+                        raw_url if TRUST_SEED_PDP_LINKS else "",
+                        brand, name, blocked_ids=BLOCKED_ITM_IDS,
+                    ),
                     "is_wishlist": False,
                     "is_ad": index % 4 == 0,
                     "Last Checked": now,
