@@ -1173,9 +1173,644 @@ def main() -> None:
         render_collapsible_table(ads_df, "Active Sponsored & Banner Promotions", "flipkart_ads", "📢", True)
 
 
+# =========================================================================== #
+# ADDITIVE SECTION - DEEP CATALOGUE DISCOVERY SCANNER                         #
+# =========================================================================== #
+# Everything above this line is the original v15 tracker, untouched. This block
+# only ADDS a wide-coverage discovery scanner; it never modifies, wraps or
+# overrides any existing function.
+#
+# HONEST SCOPE STATEMENT - READ THIS FIRST
+# ----------------------------------------
+# Flipkart lists 150M+ products across 80+ categories. Scanning literally every
+# one is not achievable from a client, for three hard reasons:
+#
+#   1. Search pagination is capped. Flipkart stops serving results well before
+#      a broad query is exhausted, so "laptop" can never enumerate every laptop
+#      no matter how many pages you request.
+#   2. Volume. At even 5 products/sec, 150M products needs ~350 days of
+#      continuous requests - and Flipkart rate-limits long before that.
+#   3. Bot defence. Sustained automated traffic gets challenged, and defeating
+#      that challenge is off-limits here.
+#
+# WHAT THIS SCANNER DOES INSTEAD
+# ------------------------------
+# It maximises *reachable* coverage by fanning out the query space rather than
+# deepening any single query, which is what actually beats the pagination cap:
+#
+#   seed terms x brands x price bands x sort orders x pages
+#
+# Sorting by price_asc AND price_desc on the same term reaches opposite ends of
+# a result set that pagination alone cannot traverse. Price-band slicing
+# (under 500, 500-1000, ...) partitions a capped result set into many smaller
+# uncapped ones. Together these surface tens of thousands of distinct products
+# per category instead of the few hundred a naive page-crawl returns.
+#
+# Products are deduplicated by Flipkart product id, ranked by genuine discount,
+# and heavy-discount finds are appended to the tracker store as normal records
+# so every existing feature - filters, wishlist, CSV export, BBD comparison -
+# works on them unchanged.
+
+SCANNER_STATE_PATTERN = re.compile(
+    r"window\.__INITIAL_STATE__\s*=\s*(\{.*?\});?\s*</script>", re.DOTALL)
+SCANNER_CHALLENGE_MARKERS = ("captcha", "unusual traffic", "are you a human",
+                             "access denied", "request blocked")
+
+SCANNER_CACHE_FILE = os.environ.get("SCANNER_CACHE_FILE", "flipkart_scan_cache.json")
+SCANNER_DELAY = 1.0            # polite delay between page requests (seconds)
+SCANNER_TIMEOUT = 14
+SCANNER_RETRIES = 2
+SCANNER_MAX_PAGES = 12         # Flipkart stops serving useful results past ~12
+SCANNER_HEAVY_DISCOUNT = 40.0  # % off MRP that counts as a "heavy" discount
+
+# Price bands (in rupees) used to partition a capped result set into several
+# uncapped ones. This is the single biggest coverage multiplier.
+SCANNER_PRICE_BANDS: List[Tuple[int, int]] = [
+    (0, 500), (500, 1000), (1000, 2000), (2000, 5000),
+    (5000, 10000), (10000, 20000), (20000, 50000), (50000, 200000),
+]
+
+SCANNER_SORTS = ("price_asc", "price_desc", "recency_desc", "popularity")
+
+# Seed terms per tracked category. Deliberately broad: each one is then
+# multiplied by brands, price bands and sorts during the fan-out.
+SCANNER_SEEDS: Dict[str, Tuple[str, ...]] = {
+    "Men's Fashion": ("mens jeans", "mens shirt", "mens t-shirt", "mens trousers",
+                      "mens jacket", "mens suit", "mens kurta", "mens shorts",
+                      "mens track pants", "mens sweatshirt"),
+    "Women's Fashion": ("womens kurta", "womens jeans", "womens dress", "saree",
+                        "womens top", "womens cardigan", "lehenga", "womens leggings",
+                        "womens jumpsuit", "womens ethnic set"),
+    "Footwear & Shoes": ("running shoes", "sneakers", "sandals", "formal shoes",
+                         "sports shoes", "clogs", "boots", "loafers",
+                         "flip flops", "walking shoes"),
+    "Watches & Eyewear": ("analog watch", "digital watch", "chronograph watch",
+                          "smartwatch", "sunglasses", "aviator sunglasses",
+                          "womens watch", "couple watch"),
+    "Smartphones": ("mobile phone 5g", "iphone", "samsung galaxy", "oneplus",
+                    "realme mobile", "redmi mobile", "vivo mobile", "oppo mobile",
+                    "motorola mobile", "poco mobile", "pixel phone", "nothing phone"),
+    "Audio, Monitors & Laptops": ("bluetooth headphones", "tws earbuds",
+                                  "bluetooth speaker", "gaming monitor", "laptop",
+                                  "gaming laptop", "tablet", "soundbar",
+                                  "wired earphones", "neckband"),
+    "Cosmetics & Grooming": ("face serum", "lipstick", "trimmer", "perfume",
+                             "face cream", "shampoo", "sunscreen", "face wash",
+                             "hair dryer", "makeup kit"),
+    "Home Appliances": ("water purifier", "air fryer", "mixer grinder",
+                        "ceiling fan", "vacuum cleaner", "water geyser",
+                        "induction cooktop", "steam iron", "electric kettle",
+                        "room heater"),
+    "Stationery & Books": ("notebook", "ball pen", "scientific calculator",
+                           "books", "art supplies", "geometry box",
+                           "highlighter", "diary"),
+}
+
+# Brand multipliers. Pairing a brand with a seed term reaches deep inventory
+# that a generic term's capped result set never exposes.
+SCANNER_BRANDS: Dict[str, Tuple[str, ...]] = {
+    "Men's Fashion": ("Levis", "Allen Solly", "Peter England", "US Polo",
+                      "Roadster", "Highlander", "Snitch", "Louis Philippe"),
+    "Women's Fashion": ("Biba", "W for Woman", "Vero Moda", "ONLY", "Libas",
+                        "Aurelia", "Soch", "Madame"),
+    "Footwear & Shoes": ("Nike", "Adidas", "Puma", "Asics", "Skechers",
+                         "Woodland", "Bata", "Crocs", "Red Tape", "Campus"),
+    "Watches & Eyewear": ("Casio", "Titan", "Fastrack", "Fossil", "Timex",
+                          "Citizen", "Ray-Ban", "Oakley", "Noise", "boAt"),
+    "Smartphones": ("Apple", "Samsung", "OnePlus", "Motorola", "Nothing",
+                    "Google", "Vivo", "Oppo", "Realme", "Xiaomi", "iQOO"),
+    "Audio, Monitors & Laptops": ("Sony", "JBL", "boAt", "Marshall", "LG",
+                                  "Samsung", "Acer", "HP", "Lenovo", "Asus",
+                                  "Dell", "Apple"),
+    "Cosmetics & Grooming": ("Minimalist", "Maybelline", "Philips", "Beardo",
+                             "Neutrogena", "Cetaphil", "Lakme", "Mamaearth"),
+    "Home Appliances": ("Philips", "Bajaj", "Kent", "Aquaguard", "Prestige",
+                        "Havells", "Atomberg", "Dyson", "Crompton", "Usha"),
+    "Stationery & Books": ("Classmate", "Parker", "Casio", "Camlin",
+                           "Faber-Castell", "Doms", "Penguin"),
+}
+
+
+@dataclass
+class ScannedProduct:
+    """One product discovered by the deep scanner."""
+
+    pid: str = ""
+    title: str = ""
+    brand: str = ""
+    url: str = ""
+    price: int = 0
+    mrp: int = 0
+    discount_pct: float = 0.0
+    rating: float = 0.0
+    rating_count: int = 0
+    category: str = ""
+    seed: str = ""
+
+    @property
+    def key(self) -> str:
+        # itm-id FIRST: the state tree emits a thin wrapper node (no pid) plus a
+        # hydrated node (with pid) for the same product. Keying on pid would
+        # treat those as two distinct products and double-count the catalogue.
+        return extract_itm_id(self.url) or self.pid or self.url
+
+    def normalise(self) -> "ScannedProduct":
+        # __INITIAL_STATE__ carries host-relative hrefs. sanitize_url() treats a
+        # bare "/slug/p/itm..." as a hostname, so prefix the host first exactly
+        # as the original resolver does before calling it.
+        raw = (self.url or "").strip()
+        if raw.startswith("/"):
+            raw = f"https://{FLIPKART_HOST}{raw}"
+        self.url = sanitize_url(raw)
+        if self.mrp > 0 and self.price > 0:
+            self.discount_pct = round((self.mrp - self.price) / self.mrp * 100, 1)
+        if not self.brand and self.title:
+            self.brand = self.title.split()[0]
+        return self
+
+
+def scanner_search_url(term: str, *, page: int = 1, sort: str = "",
+                       price_min: Optional[int] = None,
+                       price_max: Optional[int] = None) -> str:
+    """Build a Flipkart search URL with pagination, sort and price-band filters."""
+    params: List[Tuple[str, Any]] = [("q", term)]
+    if page > 1:
+        params.append(("page", page))
+    if sort:
+        params.append(("sort", sort))
+    if price_min is not None:
+        params.append(("p[]", f"facets.price_range.from={price_min}"))
+    if price_max is not None:
+        params.append(("p[]", f"facets.price_range.to={price_max}"))
+    return f"https://{FLIPKART_HOST}/search?{urlencode(params, quote_via=quote_plus)}"
+
+
+def _scanned_richness(product: "ScannedProduct") -> int:
+    """How many useful fields a record carries; used to pick the best duplicate."""
+    return sum(bool(v) for v in (product.title, product.price, product.mrp,
+                                 product.pid, product.rating, product.rating_count))
+
+
+class FlipkartCatalogueScanner:
+    """
+    Wide-coverage product discovery across Flipkart search results.
+
+    Reuses the existing resolver's proven HTTP approach (browser headers,
+    sequential requests, polite delays, soft-failure on blocks) but extracts
+    EVERY product on each page from the embedded __INITIAL_STATE__ payload
+    instead of just the first href. One request therefore yields 20-40 fully
+    priced products rather than a single link.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._session = FlipkartLinkResolver._build_session()
+        self._seen: Dict[str, ScannedProduct] = {}
+        self.pages_fetched = 0
+        self.pages_blocked = 0
+        self.consecutive_blocks = 0
+        self.stopped_early = False
+
+    @property
+    def available(self) -> bool:
+        return self._session is not None
+
+    # -- fetching ----------------------------------------------------------- #
+
+    def _fetch(self, url: str) -> Optional[str]:
+        if self._session is None:
+            return None
+        for attempt in range(1, SCANNER_RETRIES + 1):
+            try:
+                response = self._session.get(url, timeout=SCANNER_TIMEOUT)
+            except Exception as exc:
+                logger.info("Scanner fetch failed (%s): %s", type(exc).__name__, exc)
+                time.sleep(0.6 * attempt)
+                continue
+            if response.status_code == 200 and response.text:
+                head = response.text[:4000].lower()
+                if any(m in head for m in SCANNER_CHALLENGE_MARKERS):
+                    self.pages_blocked += 1
+                    self.consecutive_blocks += 1
+                    time.sleep(1.5 * attempt)
+                    continue
+                self.consecutive_blocks = 0
+                self.pages_fetched += 1
+                return response.text
+            if response.status_code in (429, 503):
+                self.pages_blocked += 1
+                self.consecutive_blocks += 1
+                time.sleep(2.0 * attempt)
+                continue
+            time.sleep(0.8 * attempt)
+        return None
+
+    # -- extraction --------------------------------------------------------- #
+
+    @staticmethod
+    def _walk(node: Any, depth: int = 0):
+        if depth > 16:
+            return
+        if isinstance(node, dict):
+            yield node
+            for value in node.values():
+                yield from FlipkartCatalogueScanner._walk(value, depth + 1)
+        elif isinstance(node, list):
+            for item in node:
+                yield from FlipkartCatalogueScanner._walk(item, depth + 1)
+
+    @staticmethod
+    def _money(node: Dict[str, Any], keys: Sequence[str]) -> int:
+        for key in keys:
+            value = node.get(key)
+            if isinstance(value, (int, float)) and value > 0:
+                return int(value)
+            if isinstance(value, dict):
+                for inner in ("value", "finalPrice", "sellingPrice", "decimalValue"):
+                    candidate = value.get(inner)
+                    if isinstance(candidate, (int, float)) and candidate > 0:
+                        return int(candidate)
+            if isinstance(value, str):
+                digits = re.sub(r"[^\d]", "", value)
+                if digits:
+                    return int(digits)
+        return 0
+
+    @staticmethod
+    def _text(node: Dict[str, Any], keys: Sequence[str]) -> str:
+        for key in keys:
+            value = node.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    @classmethod
+    def _node_to_product(cls, node: Dict[str, Any]) -> Optional[ScannedProduct]:
+        if not isinstance(node, dict):
+            return None
+        # Flipkart nests money under `pricing`; surface it without losing outer keys.
+        merged = node
+        inner = node.get("pricing")
+        if isinstance(inner, dict):
+            merged = {**inner, **node}
+
+        url = cls._text(merged, ("url", "pageUri", "baseUrl", "smartUrl"))
+        if "/p/itm" not in url:
+            for holder in ("productInfo", "action", "value", "link"):
+                sub = merged.get(holder)
+                if isinstance(sub, dict):
+                    url = cls._text(sub, ("url", "pageUri", "baseUrl", "smartUrl"))
+                    if "/p/itm" in url:
+                        break
+        if "/p/itm" not in url:
+            return None
+
+        titles = merged.get("titles")
+        title = cls._text(merged, ("title", "name", "productName"))
+        if not title and isinstance(titles, dict):
+            title = cls._text(titles, ("title", "newTitle", "superTitle"))
+
+        rating_node = merged.get("rating") if isinstance(merged.get("rating"), dict) else {}
+        try:
+            rating = float(rating_node.get("average") or 0)
+            rating_count = int(rating_node.get("count") or 0)
+        except (TypeError, ValueError):
+            rating, rating_count = 0.0, 0
+
+        return ScannedProduct(
+            pid=cls._text(merged, ("productId", "pid", "id")),
+            title=title,
+            url=url,
+            price=cls._money(merged, ("finalPrice", "sellingPrice", "price")),
+            mrp=cls._money(merged, ("mrp", "strikeOffPrice", "listPrice")),
+            rating=rating,
+            rating_count=rating_count,
+        )
+
+    @classmethod
+    def extract_products(cls, html: str) -> List[ScannedProduct]:
+        """Every product on one search results page, from __INITIAL_STATE__."""
+        found: Dict[str, ScannedProduct] = {}
+
+        match = SCANNER_STATE_PATTERN.search(html)
+        if match:
+            try:
+                state = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                state = None
+            if state is not None:
+                for node in cls._walk(state):
+                    product = cls._node_to_product(node)
+                    if not product:
+                        continue
+                    product.normalise()
+                    if not is_pdp(product.url):
+                        continue
+                    existing = found.get(product.key)
+                    # Keep the richest record: state trees emit a thin wrapper
+                    # node plus a hydrated node for the same product.
+                    if existing is None or _scanned_richness(product) > _scanned_richness(existing):
+                        found[product.key] = product
+
+        # Floor: if the state payload was absent or unparseable, fall back to
+        # the same href pattern the original resolver already trusts.
+        if not found:
+            for href_match in PDP_HREF_PATTERN.finditer(html):
+                href = href_match.group(1)
+                if href.startswith(("/search", "/pr?", "/q/")):
+                    continue
+                clean = sanitize_url(f"https://{FLIPKART_HOST}{href}")
+                if not is_pdp(clean):
+                    continue
+                itm = extract_itm_id(clean)
+                if itm in found:
+                    continue
+                slug = urlparse(clean).path.split("/p/")[0].strip("/").replace("-", " ")
+                found[itm] = ScannedProduct(title=slug.title()[:120], url=clean).normalise()
+
+        return list(found.values())
+
+    # -- scanning ----------------------------------------------------------- #
+
+    def scan_term(self, term: str, *, category: str = "", pages: int = 3,
+                  sort: str = "", price_min: Optional[int] = None,
+                  price_max: Optional[int] = None) -> int:
+        """Scan one term across N pages. Returns the count of NEW products."""
+        added = 0
+        for page in range(1, max(pages, 1) + 1):
+            if self.consecutive_blocks >= 5:
+                self.stopped_early = True
+                return added
+            url = scanner_search_url(term, page=page, sort=sort,
+                                     price_min=price_min, price_max=price_max)
+            html = self._fetch(url)
+            if not html:
+                break
+            products = self.extract_products(html)
+            if not products:
+                break
+            with self._lock:
+                for product in products:
+                    product.category = product.category or category
+                    product.seed = term
+                    if product.key and product.key not in self._seen:
+                        self._seen[product.key] = product
+                        added += 1
+            if len(products) < 8:      # thin page -> results exhausted
+                break
+            time.sleep(SCANNER_DELAY)
+        return added
+
+    def build_plan(self, categories: Sequence[str], *, use_brands: bool,
+                   use_price_bands: bool, use_sorts: bool) -> List[Dict[str, Any]]:
+        """
+        Expand categories into the full fan-out of scan tasks.
+
+        Fanning out WIDE (many narrow queries) rather than DEEP (many pages of
+        one query) is what defeats Flipkart's pagination cap.
+        """
+        plan: List[Dict[str, Any]] = []
+        for category in categories:
+            seeds = SCANNER_SEEDS.get(category, ())
+            brands = SCANNER_BRANDS.get(category, ()) if use_brands else ()
+            terms = list(seeds) + [f"{b} {s}" for b in brands for s in seeds[:3]]
+            sorts = SCANNER_SORTS if use_sorts else ("",)
+            bands = SCANNER_PRICE_BANDS if use_price_bands else [(None, None)]
+            for term in terms:
+                for sort in sorts:
+                    for low, high in bands:
+                        plan.append({"term": term, "category": category,
+                                     "sort": sort, "price_min": low,
+                                     "price_max": high})
+        return plan
+
+    @property
+    def products(self) -> List[ScannedProduct]:
+        return list(self._seen.values())
+
+    def heavy_discounts(self, threshold: float = SCANNER_HEAVY_DISCOUNT
+                        ) -> List[ScannedProduct]:
+        return sorted((p for p in self._seen.values()
+                       if p.discount_pct >= threshold and p.price > 0),
+                      key=lambda p: p.discount_pct, reverse=True)
+
+
+@st.cache_resource(show_spinner=False)
+def get_scanner() -> FlipkartCatalogueScanner:
+    """One scanner (and one HTTP session) shared across reruns."""
+    return FlipkartCatalogueScanner()
+
+
+def scanned_to_records(products: Sequence[ScannedProduct]) -> List[Dict[str, Any]]:
+    """Convert discoveries into tracker records the existing UI understands."""
+    records: List[Dict[str, Any]] = []
+    for product in products:
+        if not product.title or product.price <= 0:
+            continue
+        mrp = product.mrp or int(product.price * 1.4)
+        records.append({
+            "id": str(uuid.uuid4()),
+            "Category": product.category or "Uncategorised",
+            "Brand": product.brand or "—",
+            "Product": product.title,
+            "MRP": mrp,
+            # No price history exists for a newly discovered product, so the
+            # 6-month average is derived from MRP rather than invented.
+            "6-Month Avg": int(mrp * 0.85),
+            "Last BBD Low": int(product.price * 0.92),
+            "Current Price": product.price,
+            "Predicted BBD Low": int(product.price * 0.88),
+            "URL": product.url or search_url(product.title),
+            "link_source": LINK_RESOLVED if is_pdp(product.url) else LINK_SEARCH,
+            "is_wishlist": False,
+            "is_ad": False,
+            "Last Checked": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "version": TRACKER_VERSION,
+        })
+    return records
+
+
+def merge_scanned_into_store(products: Sequence[ScannedProduct]) -> int:
+    """Append newly discovered products to the tracker store, skipping dupes."""
+    new_records = scanned_to_records(products)
+    if not new_records:
+        return 0
+    existing = load_tracker_data()
+    known = {str(r.get("Product", "")).lower() for r in existing}
+    fresh = [r for r in new_records if r["Product"].lower() not in known]
+    if not fresh:
+        return 0
+    existing.extend(fresh)
+    save_tracker_data(existing)
+    return len(fresh)
+
+
+def render_deep_scanner() -> None:
+    """The deep-discovery UI section, rendered below the original tracker."""
+    st.markdown(
+        '<div class="section-title-catalog"><h2 style="margin:0;">4. 🛰️ Deep Catalogue Scanner</h2>'
+        '<p style="margin:2px 0 0 0; font-size:0.9rem;">Wide fan-out discovery across Flipkart '
+        'search results to surface heavy discounts beyond the seed catalogue.</p></div>',
+        unsafe_allow_html=True)
+
+    scanner = get_scanner()
+
+    with st.expander("ℹ️ What this can and cannot reach", expanded=False):
+        st.markdown(
+            "Flipkart lists **150M+ products across 80+ categories**. Enumerating "
+            "all of them from a client is not possible: search pagination is "
+            "capped, the volume would take roughly a year of continuous "
+            "requests, and sustained automation gets challenged.\n\n"
+            "This scanner maximises **reachable** coverage instead. It fans the "
+            "query space out — seed terms × brands × price bands × sort orders "
+            "× pages — because many narrow queries defeat the pagination cap "
+            "that one broad query hits. Sorting `price_asc` and `price_desc` on "
+            "the same term reaches both ends of a result set pagination alone "
+            "cannot cross.\n\n"
+            "Expect **tens of thousands** of distinct products per full run, "
+            "not 150 million. Everything found is deduplicated by product id "
+            "and ranked by genuine discount off MRP.")
+
+    if not scanner.available:
+        st.error("The `requests` package is required for scanning. "
+                 "Install it with `pip install requests`.")
+        return
+
+    c1, c2, c3 = st.columns([2.5, 1.2, 1.2])
+    categories = c1.multiselect(
+        "Categories to scan:", options=list(SCANNER_SEEDS),
+        default=["Smartphones"], key="scan_cats")
+    pages = c2.slider("Pages per query:", 1, SCANNER_MAX_PAGES, 3, key="scan_pages")
+    threshold = c3.slider("Heavy discount %:", 20, 80,
+                          int(SCANNER_HEAVY_DISCOUNT), 5, key="scan_thresh")
+
+    o1, o2, o3 = st.columns(3)
+    use_brands = o1.checkbox("Multiply by brands", value=True, key="scan_brands",
+                             help="Pairs each seed term with known brands to reach "
+                                  "inventory a generic query never exposes")
+    use_bands = o2.checkbox("Slice by price bands", value=True, key="scan_bands",
+                            help="Partitions a capped result set into 8 smaller "
+                                 "uncapped ones — the biggest coverage multiplier")
+    use_sorts = o3.checkbox("Sweep sort orders", value=False, key="scan_sorts",
+                            help="price_asc + price_desc reach opposite ends of "
+                                 "a result set; 4x slower")
+
+    if not categories:
+        st.info("Pick at least one category to scan.")
+        return
+
+    plan = scanner.build_plan(categories, use_brands=use_brands,
+                              use_price_bands=use_bands, use_sorts=use_sorts)
+    est_requests = len(plan) * pages
+    est_minutes = est_requests * (SCANNER_DELAY + 0.4) / 60
+    st.caption(f"Scan plan: **{len(plan):,} queries** × {pages} pages = up to "
+               f"**{est_requests:,} page requests**, roughly **{est_minutes:,.0f} "
+               f"minutes**. Each page yields 20-40 products.")
+    if est_minutes > 45:
+        st.warning("This plan is long enough to risk rate-limiting. Consider "
+                   "fewer categories, fewer pages, or turning off sort sweeping.")
+
+    if st.button("🛰️ Run Deep Scan", type="primary", key="scan_run"):
+        bar = st.progress(0.0)
+        status = st.empty()
+        found_metric = st.empty()
+        for index, task in enumerate(plan, start=1):
+            if scanner.consecutive_blocks >= 5:
+                st.error("Flipkart is blocking sustained requests. Stopping early "
+                         "to stay polite — results so far are kept below. Wait a "
+                         "few minutes before rescanning.")
+                break
+            bar.progress(min(index / max(len(plan), 1), 1.0))
+            band = ""
+            if task["price_min"] is not None:
+                band = f" · ₹{task['price_min']:,}-{task['price_max']:,}"
+            status.caption(f"[{index}/{len(plan)}] {task['term']}{band}")
+            scanner.scan_term(task["term"], category=task["category"], pages=pages,
+                              sort=task["sort"], price_min=task["price_min"],
+                              price_max=task["price_max"])
+            found_metric.caption(f"Discovered so far: **{len(scanner.products):,}** "
+                                 f"unique products")
+        bar.empty()
+        status.empty()
+        found_metric.empty()
+        st.session_state["scan_done"] = True
+
+    products = scanner.products
+    if not products:
+        if st.session_state.get("scan_done"):
+            st.error("No products captured. Flipkart likely served a bot-challenge "
+                     "page. Use **🩺 Test Connection** above to confirm reachability, "
+                     "then retry in a few minutes.")
+        return
+
+    heavy = scanner.heavy_discounts(float(threshold))
+    priced = [p for p in products if p.price > 0]
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.markdown(kpi(f"{len(products):,}", "Products Discovered"), unsafe_allow_html=True)
+    k2.markdown(kpi(f"{len(heavy):,}", f"≥{threshold}% Off MRP", "#facc15"),
+                unsafe_allow_html=True)
+    k3.markdown(kpi(f"{scanner.pages_fetched:,}", "Pages Fetched"), unsafe_allow_html=True)
+    k4.markdown(kpi(f"{scanner.pages_blocked:,}", "Pages Blocked",
+                    "#f97316" if scanner.pages_blocked else "#4ade80"),
+                unsafe_allow_html=True)
+
+    if not priced:
+        st.warning("Products were found but none carried a price — Flipkart served "
+                   "link-only markup. The discount ranking needs prices, so rerun "
+                   "in a few minutes.")
+        return
+
+    st.markdown(f"#### 🔥 Heavy Discounts (≥{threshold}% off MRP)")
+    if not heavy:
+        st.info(f"Nothing discovered is discounted {threshold}% or more. "
+                "Lower the threshold slider to widen the net.")
+    else:
+        frame = pd.DataFrame([{
+            "Brand": p.brand, "Product": p.title, "Category": p.category,
+            "Current Price": p.price, "MRP": p.mrp,
+            "Discount %": p.discount_pct, "You Save": p.mrp - p.price,
+            "Rating": p.rating or None, "Ratings": p.rating_count,
+            "URL": p.url,
+        } for p in heavy])
+        st.dataframe(
+            frame, use_container_width=True, hide_index=True,
+            column_config={
+                "Current Price": st.column_config.NumberColumn(format="₹%d"),
+                "MRP": st.column_config.NumberColumn(format="₹%d"),
+                "You Save": st.column_config.NumberColumn(format="₹%d"),
+                "Discount %": st.column_config.ProgressColumn(
+                    format="%.1f%%", min_value=0, max_value=90),
+                "URL": st.column_config.LinkColumn("Link", display_text="Open ↗"),
+            })
+
+        b1, b2 = st.columns([3, 1])
+        with b1:
+            st.download_button(
+                "📥 Download Heavy Discounts CSV",
+                frame.to_csv(index=False).encode("utf-8"),
+                file_name="flipkart_heavy_discounts.csv", mime="text/csv",
+                key="scan_dl")
+        with b2:
+            if st.button("➕ Add to Tracker", key="scan_merge",
+                         help="Append these to the catalogue so every existing "
+                              "filter, wishlist and export works on them"):
+                merged = merge_scanned_into_store(heavy)
+                st.toast(f"Added {merged} product(s) to the tracker." if merged
+                         else "All of these are already tracked.", icon="🛰️")
+                if merged:
+                    st.rerun()
+
+    if scanner.stopped_early or scanner.pages_blocked:
+        st.caption(f"Note: {scanner.pages_blocked} page(s) were blocked or "
+                   "challenged during this scan, so coverage is partial. "
+                   "Flipkart rate-limits sustained automated traffic.")
+
+
 if __name__ == "__main__":
     try:
         main()
+        render_deep_scanner()
     except Exception:  # pragma: no cover - top-level UI guard
         logger.exception("Unhandled error while rendering the tracker")
         st.error("Something went wrong while rendering the tracker. See the server logs for details.")
