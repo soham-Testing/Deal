@@ -147,7 +147,7 @@ CAT_DATA_MATRIX = {
 
 # --- GENERATE MASSIVE COMBINATORIAL DATASET (1,500+ PRODUCTS) ---
 @st.cache_data
-def generate_massive_catalog(multiplier=10):
+def generate_massive_catalog():
     catalog = []
     random.seed(42)  # Consistent pricing across runs
 
@@ -157,13 +157,11 @@ def generate_massive_catalog(multiplier=10):
 
         for b_idx, brand in enumerate(brands):
             for i_idx, (item_name, base_mrp, base_avg, base_bbd, base_curr) in enumerate(items):
-                # Apply brand tier adjustments
                 brand_factor = 1.0 + (b_idx % 5) * 0.05
                 mrp = int(base_mrp * brand_factor)
                 avg_6m = int(base_avg * brand_factor)
                 last_bbd = int(base_bbd * brand_factor)
                 
-                # Small realistic variance for pricing
                 delta = random.choice([-50, 0, 50, 100, -100, 150, -150])
                 curr = max(last_bbd - 100, int(base_curr * brand_factor) + delta)
                 bbd_pred = int(last_bbd * 0.94)
@@ -356,17 +354,28 @@ with m4:
 
 st.divider()
 
-# --- CATEGORY-WISE INDEPENDENT TABS (EACH HAS 120-200+ ITEMS) ---
+# Pre-calculate category counts cleanly to avoid f-string syntax errors
+count_men = len(master_df[master_df['Category'] == "Men's Fashion"])
+count_women = len(master_df[master_df['Category'] == "Women's Fashion"])
+count_footwear = len(master_df[master_df['Category'] == "Footwear & Shoes"])
+count_watches = len(master_df[master_df['Category'] == "Watches & Eyewear"])
+count_phones = len(master_df[master_df['Category'] == "Smartphones"])
+count_audio = len(master_df[master_df['Category'] == "Audio, Monitors & Laptops"])
+count_cosmetics = len(master_df[master_df['Category'] == "Cosmetics & Grooming"])
+count_appliances = len(master_df[master_df['Category'] == "Home Appliances"])
+count_total = len(master_df)
+
+# --- CATEGORY-WISE INDEPENDENT TABS ---
 tab_men, tab_women, tab_footwear, tab_watches, tab_phones, tab_audio, tab_cosmetics, tab_appliances, tab_all, tab_charts, tab_cheaper_bbd = st.tabs([
-    f"👔 Men's ({len(master_df[master_df['Category'] == \"Men's Fashion\"])})",
-    f"👗 Women's ({len(master_df[master_df['Category'] == \"Women's Fashion\"])})",
-    f"👟 Footwear ({len(master_df[master_df['Category'] == 'Footwear & Shoes'])})",
-    f"⌚ Watches ({len(master_df[master_df['Category'] == 'Watches & Eyewear'])})",
-    f"📱 Smartphones ({len(master_df[master_df['Category'] == 'Smartphones'])})",
-    f"💻 Audio/Tech ({len(master_df[master_df['Category'] == 'Audio, Monitors & Laptops'])})",
-    f"💄 Cosmetics ({len(master_df[master_df['Category'] == 'Cosmetics & Grooming'])})",
-    f"🔌 Appliances ({len(master_df[master_df['Category'] == 'Home Appliances'])})",
-    f"📋 All ({len(master_df):,})",
+    f"👔 Men's ({count_men})",
+    f"👗 Women's ({count_women})",
+    f"👟 Footwear ({count_footwear})",
+    f"⌚ Watches ({count_watches})",
+    f"📱 Smartphones ({count_phones})",
+    f"💻 Audio/Tech ({count_audio})",
+    f"💄 Cosmetics ({count_cosmetics})",
+    f"🔌 Appliances ({count_appliances})",
+    f"📋 All ({count_total:,})",
     "📊 Benchmark Charts",
     "🔥 Cheaper Than Last BBD"
 ])
@@ -396,7 +405,7 @@ with tab_appliances:
     render_category_section(master_df[master_df["Category"] == "Home Appliances"], "Home Appliances", "appliances")
 
 with tab_all:
-    render_category_section(master_df, f"All Categories ({len(master_df):,} Products)", "all_categories")
+    render_category_section(master_df, f"All Categories ({count_total:,} Products)", "all_categories")
 
 with tab_charts:
     st.subheader("Visual Benchmark: 6-Month Baseline vs. Last BBD vs. Current Price")
