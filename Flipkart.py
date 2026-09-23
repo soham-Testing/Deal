@@ -237,6 +237,9 @@ def process_analytics(catalog, card_selection):
             else:
                 card_title, net_price = "Flipkart Axis (5%)", curr - cashback_5
 
+        # Key-safe URL assignment prevents KeyError crashes
+        item_url = d.get("URL") or d.get("url") or "https://www.flipkart.com"
+
         records.append({
             "Category": d["Category"],
             "Brand": d["Brand"],
@@ -252,7 +255,7 @@ def process_analytics(catalog, card_selection):
             "Optimal Card": card_title,
             "Net Price": net_price,
             "MRP": mrp,
-            "URL": d["url"]
+            "URL": item_url
         })
     return pd.DataFrame(records)
 
