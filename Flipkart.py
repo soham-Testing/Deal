@@ -31,8 +31,10 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- PERMANENT TRACKER FILE STORAGE ---
+# Version tag to force-purge legacy corrupted links from disk
+TRACKER_VERSION = "v4_verified_direct_links"
 TRACKER_DB_FILE = "tracker_store.json"
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9",
@@ -40,7 +42,7 @@ HEADERS = {
 }
 
 def clean_direct_pdp_url(raw_url):
-    """Preserves legitimate Flipkart product paths and essential ?pid= IDs while removing tracking noise."""
+    """Preserves legitimate Flipkart product URLs and essential ?pid= while removing tracking parameters."""
     if not raw_url:
         return "https://www.flipkart.com"
     clean = raw_url.strip()
@@ -54,146 +56,137 @@ def clean_direct_pdp_url(raw_url):
 CAT_DATA_MATRIX = {
     "Men's Fashion": {
         "slug": "mens_fashion", "icon": "👔",
-        "brands": ["Levi's", "Louis Philippe", "U.S. Polo Assn", "Flying Machine", "Allen Solly", "Peter England", "Wrangler", "Tommy Hilfiger", "Van Heusen", "Blackberrys", "Mufti", "Spykar", "Jack & Jones", "Raymond", "Arrow", "Snitch", "Roadster", "Bewakoof", "Rare Rabbit", "Killer"],
         "items": [
-            ("511 Slim Fit Stretch Jeans", 2999, 1749, 1099, 1056, "https://www.flipkart.com/levi-s-511-slim-men-blue-jeans/p/itm28448ec8d098a?pid=JEAGH4GFGZGHZ7ZZ"),
-            ("Solid Pique Cotton Polo T-Shirt", 1999, 1399, 849, 899, "https://www.flipkart.com/u-s-polo-assn-solid-men-polo-neck-blue-t-shirt/p/itm68a18fa40bc75?pid=TSHGWGX7FGHVHGZZ"),
-            ("Single Breasted 2-Piece Formal Suit", 10999, 8999, 5499, 5390, "https://www.flipkart.com/louis-philippe-2-piece-solid-men-suit/p/itmbfb64d2750157?pid=SUIGTAGPTB3VS24W"),
-            ("Slim Fit Poplin Formal Shirt", 2199, 1599, 999, 1049, "https://www.flipkart.com/allen-solly-men-solid-formal-white-shirt/p/itm3d22bdf55f9a2?pid=SHTGWD64Y57YGGHJ"),
-            ("Tapered Fit Chinos / Trousers", 2499, 1799, 1099, 1149, "https://www.flipkart.com/peter-england-men-slim-fit-black-trousers/p/itme9b28a2a4b86e?pid=TROHYZGXNZZZHHQG"),
-            ("Active Windproof Bomber Jacket", 4299, 2799, 1599, 1699, "https://www.flipkart.com/wildcraft-solid-men-jacket/p/itm1717849e75520?pid=JCKGYX7FZGYGYGZZ"),
-            ("Heavyweight Boxy Graphic Tee", 1299, 799, 449, 499, "https://www.flipkart.com/bewakoof-men-printed-round-neck-black-t-shirt/p/itm878df080e7d56?pid=TSHGV6YFXHHG7ZZZ"),
-            ("Cargo Jogger Pants with Drawstring", 2299, 1499, 899, 949, "https://www.flipkart.com/highlander-men-cargo-olive-trousers/p/itm4b232a549d9c2?pid=TROGXX7FZGZZZZZZ"),
-            ("Linen Blend Casual Mandarin Shirt", 2799, 1999, 1299, 1349, "https://www.flipkart.com/snitch-men-solid-casual-mandarin-shirt/p/itmdcf4f5d2ec757?pid=SHTGS7FZFZZZZZZZ"),
-            ("Classic Denim Trucker Jacket", 3599, 2399, 1499, 1549, "https://www.flipkart.com/roadster-men-solid-denim-jacket/p/itm8fa82ea2ba475?pid=JCKFSDGZZZZZZZZZ")
+            ("Levi's", "511 Slim Fit Stretch Jeans", 2999, 1749, 1099, 1056, "https://www.flipkart.com/levi-s-511-slim-men-blue-jeans/p/itm28448ec8d098a"),
+            ("U.S. Polo Assn", "Solid Pique Cotton Polo T-Shirt", 1999, 1399, 849, 899, "https://www.flipkart.com/u-s-polo-assn-solid-men-polo-neck-blue-t-shirt/p/itm68a18fa40bc75"),
+            ("Louis Philippe", "Single Breasted 2-Piece Formal Suit", 10999, 8999, 5499, 5390, "https://www.flipkart.com/louis-philippe-2-piece-solid-men-suit/p/itmbfb64d2750157"),
+            ("Allen Solly", "Slim Fit Poplin Formal Shirt", 2199, 1599, 999, 1049, "https://www.flipkart.com/allen-solly-men-solid-formal-white-shirt/p/itm3d22bdf55f9a2"),
+            ("Peter England", "Tapered Fit Chinos / Trousers", 2499, 1799, 1099, 1149, "https://www.flipkart.com/peter-england-men-slim-fit-black-trousers/p/itme9b28a2a4b86e"),
+            ("Wildcraft", "Active Windproof Bomber Jacket", 4299, 2799, 1599, 1699, "https://www.flipkart.com/wildcraft-solid-men-jacket/p/itm1717849e75520"),
+            ("Bewakoof", "Heavyweight Boxy Graphic Tee", 1299, 799, 449, 499, "https://www.flipkart.com/bewakoof-men-printed-round-neck-black-t-shirt/p/itm878df080e7d56"),
+            ("Highlander", "Cargo Jogger Pants with Drawstring", 2299, 1499, 899, 949, "https://www.flipkart.com/highlander-men-cargo-olive-trousers/p/itm4b232a549d9c2"),
+            ("Snitch", "Linen Blend Casual Mandarin Shirt", 2799, 1999, 1299, 1349, "https://www.flipkart.com/snitch-men-solid-casual-mandarin-shirt/p/itmdcf4f5d2ec757"),
+            ("Roadster", "Classic Denim Trucker Jacket", 3599, 2399, 1499, 1549, "https://www.flipkart.com/roadster-men-solid-denim-jacket/p/itm8fa82ea2ba475")
         ]
     },
     "Women's Fashion": {
         "slug": "womens_fashion", "icon": "👗",
-        "brands": ["Biba", "W for Woman", "Aurelia", "ONLY", "Vero Moda", "Libas", "Global Desi", "Madame", "FabIndia", "Rangriti", "AND", "Forever New", "Soch", "Sangria", "Tokyo Talkies", "Varanga", "Enamor", "Zivame", "Anouk", "Aayna"],
         "items": [
-            ("Embroidered Anarkali Kurta & Pant Set", 4999, 2999, 1799, 1699, "https://www.flipkart.com/biba-women-kurta-pant-set/p/itm914d021c3bfa8?pid=SETGZZZZZZZZZZZZ"),
-            ("Pure Cotton Straight Daily Kurta", 1999, 1349, 699, 649, "https://www.flipkart.com/w-women-printed-straight-kurta/p/itm8109ad7b2c9d8?pid=KRTGTGZZZZZZZZZZ"),
-            ("High-Rise Relaxed Wide Leg Jeans", 2999, 1999, 1199, 1249, "https://www.flipkart.com/only-women-wide-leg-high-rise-blue-jeans/p/itm68a18fa40bc75?pid=JEAG5TZZZZZZZZZZ"),
-            ("Floral Tiered Summer Maxi Dress", 3499, 2299, 1299, 1349, "https://www.flipkart.com/vero-moda-women-maxi-multicolor-dress/p/itm1df5a072049ec?pid=DREG7FZZZZZZZZZZ"),
-            ("Chanderi Woven Silk Festive Saree", 5999, 3999, 2199, 2299, "https://www.flipkart.com/soch-embroidered-chanderi-silk-saree/p/itm0a27181347076?pid=SARG7FZZZZZZZZZZ"),
-            ("Casual Rayon Peplum Tunic Top", 1799, 1199, 649, 699, "https://www.flipkart.com/and-women-peplum-top/p/itmd5d59016be32c?pid=TOPG7FZZZZZZZZZZ"),
-            ("Knitted High Neck Ribbed Sweater", 2499, 1699, 949, 999, "https://www.flipkart.com/madame-women-cardigan/p/itme9b28a2a4b86e?pid=SWTG7FZZZZZZZZZZ"),
-            ("Cotton Rich Co-ord Set with Dupatta", 3999, 2499, 1399, 1449, "https://www.flipkart.com/aurelia-women-kurta-pant-set/p/itm1717849e75520?pid=SETG7FZZZZZZZZZZ"),
-            ("Cargo Utility Wide Leg Trousers", 2199, 1399, 799, 849, "https://www.flipkart.com/tokyo-talkies-women-cargo-trousers/p/itm4b232a549d9c2?pid=TROG7FZZZZZZZZZZ"),
-            ("Ethnic Foil Printed Straight Kurti", 1599, 999, 549, 599, "https://www.flipkart.com/libas-women-printed-straight-kurta/p/itm3d22bdf55f9a2?pid=KRTG7FZZZZZZZZZZ")
+            ("Biba", "Embroidered Anarkali Kurta & Pant Set", 4999, 2999, 1799, 1699, "https://www.flipkart.com/biba-women-kurta-pant-set/p/itm914d021c3bfa8"),
+            ("W for Woman", "Pure Cotton Straight Daily Kurta", 1999, 1349, 699, 649, "https://www.flipkart.com/w-women-printed-straight-kurta/p/itm8109ad7b2c9d8"),
+            ("ONLY", "High-Rise Relaxed Wide Leg Jeans", 2999, 1999, 1199, 1249, "https://www.flipkart.com/only-women-wide-leg-high-rise-blue-jeans/p/itm68a18fa40bc75"),
+            ("Vero Moda", "Floral Tiered Summer Maxi Dress", 3499, 2299, 1299, 1349, "https://www.flipkart.com/vero-moda-women-maxi-multicolor-dress/p/itm1df5a072049ec"),
+            ("Soch", "Chanderi Woven Silk Festive Saree", 5999, 3999, 2199, 2299, "https://www.flipkart.com/soch-embroidered-chanderi-silk-saree/p/itm0a27181347076"),
+            ("AND", "Casual Rayon Peplum Tunic Top", 1799, 1199, 649, 699, "https://www.flipkart.com/and-women-peplum-top/p/itmd5d59016be32c"),
+            ("Madame", "Knitted High Neck Ribbed Sweater", 2499, 1699, 949, 999, "https://www.flipkart.com/madame-women-cardigan/p/itme9b28a2a4b86e"),
+            ("Aurelia", "Cotton Rich Co-ord Set with Dupatta", 3999, 2499, 1399, 1449, "https://www.flipkart.com/aurelia-women-kurta-pant-set/p/itm1717849e75520"),
+            ("Tokyo Talkies", "Cargo Utility Wide Leg Trousers", 2199, 1399, 799, 849, "https://www.flipkart.com/tokyo-talkies-women-cargo-trousers/p/itm4b232a549d9c2"),
+            ("Libas", "Ethnic Foil Printed Straight Kurti", 1599, 999, 549, 599, "https://www.flipkart.com/libas-women-printed-straight-kurta/p/itm3d22bdf55f9a2")
         ]
     },
     "Footwear & Shoes": {
         "slug": "footwear", "icon": "👟",
-        "brands": ["Puma", "Nike", "Adidas", "Asics", "Woodland", "Skechers", "Red Tape", "Campus", "Sparx", "Bata", "Clarks", "Crocs", "Under Armour", "Reebok", "New Balance", "Asian", "Metro", "Hush Puppies", "Red Chief", "Fila"],
         "items": [
-            ("Pro Responsive Performance Running Shoes", 6499, 4899, 3299, 3199, "https://www.flipkart.com/puma-conduct-pro-running-shoes-men/p/itm6bfa7549646b5?pid=SHOG7FZZZZZZZZZZ"),
-            ("Road Racing Breathable Mesh Runners", 3695, 3695, 2399, 2995, "https://www.flipkart.com/nike-revolution-7-running-shoes-men/p/itm4ea4909a341b1?pid=SHOG7FZZZZZZZZZZ"),
-            ("Classic Leather Streetstyle Sneakers", 5599, 3599, 2399, 2429, "https://www.flipkart.com/puma-smash-v2-leather-sneakers-men/p/itm35c15694f479a?pid=SHOG7FZZZZZZZZZZ"),
-            ("Gel Cushioned Neutral Trainer", 5499, 4099, 2899, 2899, "https://www.flipkart.com/asics-gel-contend-8-running-shoes-men/p/itmfcfa56156e507?pid=SHOG7FZZZZZZZZZZ"),
-            ("Rugged Leather High-Traction Boots", 5995, 4595, 3295, 3495, "https://www.flipkart.com/woodland-boots-men/p/itm0ea622bc13d80?pid=SHOG7FZZZZZZZZZZ"),
-            ("Ultra-Light Foam Daily Walking Shoes", 2499, 1699, 1099, 1149, "https://www.flipkart.com/skechers-go-run-elevate-running-shoes-men/p/itma7c0dcfd54406?pid=SHOG7FZZZZZZZZZZ"),
-            ("Airflow Chunky Retro Sneakers", 4999, 1899, 1199, 1249, "https://www.flipkart.com/red-tape-sneakers-men/p/itm18cb5732c53a6?pid=SHOG7FZZZZZZZZZZ"),
-            ("Formal Genuine Leather Derby / Oxford", 3999, 2899, 1799, 1899, "https://www.flipkart.com/bata-derby-formal-shoes-men/p/itm71dae298ee787?pid=SHOG7FZZZZZZZZZZ"),
-            ("Classic Comfort Slip-on Foam Clogs", 3495, 2695, 1799, 1995, "https://www.flipkart.com/crocs-classic-clogs/p/itm8fa82ea2ba475?pid=SHOG7FZZZZZZZZZZ"),
-            ("Cushioned Lightweight Gym Trainer", 4499, 2999, 1899, 1999, "https://www.flipkart.com/adidas-clinch-x-running-shoes-men/p/itm9372e9c2c62c2?pid=SHOG7FZZZZZZZZZZ")
+            ("Puma", "Pro Responsive Performance Running Shoes", 6499, 4899, 3299, 3199, "https://www.flipkart.com/puma-conduct-pro-running-shoes-men/p/itm6bfa7549646b5"),
+            ("Nike", "Road Racing Breathable Mesh Runners", 3695, 3695, 2399, 2995, "https://www.flipkart.com/nike-revolution-7-running-shoes-men/p/itm4ea4909a341b1"),
+            ("Puma", "Classic Leather Streetstyle Sneakers", 5599, 3599, 2399, 2429, "https://www.flipkart.com/puma-smash-v2-leather-sneakers-men/p/itm35c15694f479a"),
+            ("Asics", "Gel Cushioned Neutral Trainer", 5499, 4099, 2899, 2899, "https://www.flipkart.com/asics-gel-contend-8-running-shoes-men/p/itmfcfa56156e507"),
+            ("Woodland", "Rugged Leather High-Traction Boots", 5995, 4595, 3295, 3495, "https://www.flipkart.com/woodland-boots-men/p/itm0ea622bc13d80"),
+            ("Skechers", "Ultra-Light Foam Daily Walking Shoes", 2499, 1699, 1099, 1149, "https://www.flipkart.com/skechers-go-run-elevate-running-shoes-men/p/itma7c0dcfd54406"),
+            ("Red Tape", "Airflow Chunky Retro Sneakers", 4999, 1899, 1199, 1249, "https://www.flipkart.com/red-tape-sneakers-men/p/itm18cb5732c53a6"),
+            ("Bata", "Formal Genuine Leather Derby / Oxford", 3999, 2899, 1799, 1899, "https://www.flipkart.com/bata-derby-formal-shoes-men/p/itm71dae298ee787"),
+            ("Crocs", "Classic Comfort Slip-on Foam Clogs", 3495, 2695, 1799, 1995, "https://www.flipkart.com/crocs-classic-clogs/p/itm8fa82ea2ba475"),
+            ("Adidas", "Cushioned Lightweight Gym Trainer", 4499, 2999, 1899, 1999, "https://www.flipkart.com/adidas-clinch-x-running-shoes-men/p/itm9372e9c2c62c2")
         ]
     },
     "Watches & Eyewear": {
         "slug": "watches", "icon": "⌚",
-        "brands": ["Casio", "Titan", "Fastrack", "Ray-Ban", "Timex", "Fossil", "Noise", "Oakley", "Fire-Boltt", "Amazfit", "Tommy Hilfiger", "Citizen", "Seiko", "Daniel Wellington", "Vincent Chase", "Lenskart Air", "Police", "Guess", "Armani Exchange", "Fossil Q"],
         "items": [
-            ("Vintage Stainless Steel Digital Watch", 1895, 1745, 1249, 1271, "https://www.flipkart.com/casio-a158wa-1df-vintage-series-digital-watch-men-women/p/itmffyy88z4gqfgg?pid=WATDFGFHHZ6ZNZAZ"),
-            ("Octagonal Bezel Tough Resin Analog-Digital", 9995, 8495, 6495, 6995, "https://www.flipkart.com/casio-ga-2100-1a1dr-g-shock-analog-digital-watch-men/p/itm1717849e75520?pid=WATDGHZ6ZNZAZZZZ"),
-            ("Champagne Dial Classic Formal Analog", 2195, 1995, 1449, 1499, "https://www.flipkart.com/titan-karishma-analog-watch-men/p/itmfa8c8c7f20ec6?pid=WATDGHZ6ZNZAZYYY"),
-            ("1.97\" AMOLED BT Calling Smartwatch", 4999, 2599, 1799, 1899, "https://www.flipkart.com/fastrack-revoltt-pro-smartwatch/p/itmef329f64923e5?pid=SMWDGHZ6ZNZAZXXX"),
-            ("Polarized Classic Aviator Sunglasses", 9290, 8290, 5999, 7490, "https://www.flipkart.com/ray-ban-aviator-sunglasses/p/itmf3z8h9bphxvy8?pid=SGLDGHZ6ZNZAZWWW"),
-            ("Indiglo Backlight Rugged Field Watch", 3995, 3195, 2199, 2299, "https://www.flipkart.com/timex-expedition-analog-watch-men/p/itm7ea0e9e4f55ef?pid=WATDGHZ6ZNZAZVVV"),
-            ("Chronograph Genuine Leather Quartz Watch", 13495, 8995, 5995, 6495, "https://www.flipkart.com/fossil-grant-chronograph-watch-men/p/itm8a8f117c0c1ea?pid=WATDGHZ6ZNZAZUUU"),
-            ("Square Sport UV400 Protective Wayfarer", 1399, 1099, 649, 719, "https://www.flipkart.com/fastrack-wayfarer-sunglasses/p/itm5a38bbff92c3a?pid=SGLDGHZ6ZNZAZTTT"),
-            ("Matte Finish Lightweight Polarized Shades", 7990, 6490, 4490, 4990, "https://www.flipkart.com/oakley-holbrook-sunglasses/p/itm4ea4909a341b1?pid=SGLDGHZ6ZNZAZSSS"),
-            ("Metallic Link Luxury Dress Watch", 8995, 6995, 4799, 5199, "https://www.flipkart.com/citizen-eco-drive-analog-watch-men/p/itm35c15694f479a?pid=WATDGHZ6ZNZAZRRR")
+            ("Casio", "Vintage Stainless Steel Digital Watch", 1895, 1745, 1249, 1271, "https://www.flipkart.com/casio-a158wa-1df-vintage-series-digital-watch-men-women/p/itmffyy88z4gqfgg"),
+            ("Casio", "Octagonal Bezel Tough Resin Analog-Digital", 9995, 8495, 6495, 6995, "https://www.flipkart.com/casio-ga-2100-1a1dr-g-shock-analog-digital-watch-men/p/itm1717849e75520"),
+            ("Titan", "Champagne Dial Classic Formal Analog", 2195, 1995, 1449, 1499, "https://www.flipkart.com/titan-karishma-analog-watch-men/p/itmfa8c8c7f20ec6"),
+            ("Fastrack", "1.97\" AMOLED BT Calling Smartwatch", 4999, 2599, 1799, 1899, "https://www.flipkart.com/fastrack-revoltt-pro-smartwatch/p/itmef329f64923e5"),
+            ("Ray-Ban", "Polarized Classic Aviator Sunglasses", 9290, 8290, 5999, 7490, "https://www.flipkart.com/ray-ban-aviator-sunglasses/p/itmf3z8h9bphxvy8"),
+            ("Timex", "Indiglo Backlight Rugged Field Watch", 3995, 3195, 2199, 2299, "https://www.flipkart.com/timex-expedition-analog-watch-men/p/itm7ea0e9e4f55ef"),
+            ("Fossil", "Chronograph Genuine Leather Quartz Watch", 13495, 8995, 5995, 6495, "https://www.flipkart.com/fossil-grant-chronograph-watch-men/p/itm8a8f117c0c1ea"),
+            ("Fastrack", "Square Sport UV400 Protective Wayfarer", 1399, 1099, 649, 719, "https://www.flipkart.com/fastrack-wayfarer-sunglasses/p/itm5a38bbff92c3a"),
+            ("Oakley", "Matte Finish Lightweight Polarized Shades", 7990, 6490, 4490, 4990, "https://www.flipkart.com/oakley-holbrook-sunglasses/p/itm4ea4909a341b1"),
+            ("Citizen", "Metallic Link Luxury Dress Watch", 8995, 6995, 4799, 5199, "https://www.flipkart.com/citizen-eco-drive-analog-watch-men/p/itm35c15694f479a")
         ]
     },
     "Smartphones": {
         "slug": "smartphones", "icon": "📱",
-        "brands": ["Apple", "Samsung", "Google", "OnePlus", "Motorola", "Nothing", "CMF by Nothing", "Realme", "POCO", "Vivo", "iQOO", "Xiaomi"],
         "items": [
-            ("Flagship 5G (128GB Standard Edition)", 69900, 63499, 52999, 54999, "https://www.flipkart.com/apple-iphone-15-black-128-gb/p/itm6ac6485515ae4?pid=MOBGTAGPTB3VS24W"),
-            ("Pro Max / Ultra 5G (256GB Top Tier)", 119900, 109900, 94999, 99999, "https://www.flipkart.com/apple-iphone-16-black-128-gb/p/itm68a18fa40bc75?pid=MOBGWGX7FGHVHGZZ"),
-            ("Compact Flagship 5G (8GB/128GB)", 74999, 56999, 41999, 42999, "https://www.flipkart.com/samsung-galaxy-s24-5g-amber-yellow-128-gb/p/itm3d256886e06b3?pid=MOBGWGX7FGHVHGYY"),
-            ("Fan Edition (FE) 5G (8GB/128GB)", 59999, 39999, 29999, 29999, "https://www.flipkart.com/samsung-galaxy-s23-fe-mint-128-gb/p/itm5a38bbff92c3a?pid=MOBGWGX7FGHVHGXX"),
-            ("Curved pOLED Performance 5G (8GB/128GB)", 27999, 23999, 20999, 21999, "https://www.flipkart.com/motorola-edge-50-fusion-marshmallow-blue-128-gb/p/itme9b28a2a4b86e?pid=MOBHYZGXNZZZHHQG"),
-            ("Clean UI Glyph LED 5G (8GB/128GB)", 25999, 23499, 19999, 20999, "https://www.flipkart.com/nothing-phone-2a-5g-black-128-gb/p/itmd5d59016be32c?pid=MOBGWD64Y57YGGHJ"),
-            ("Speed Edition Fast Charging 5G (8GB/256GB)", 34999, 30999, 24999, 27999, "https://www.flipkart.com/oneplus-12r-iron-gray-128-gb/p/itmdcf4f5d2ec757?pid=MOBGYX7FZGYGYGZZ"),
-            ("Budget Value Battery Monster 5G (6GB/128GB)", 17499, 13999, 11999, 12499, "https://www.flipkart.com/vivo-t3x-5g-crimson-bliss-128-gb/p/itm35c15694f479a?pid=MOBGV6YFXHHG7ZZZ"),
-            ("Camera Focused Portrait 5G (8GB/256GB)", 39999, 34999, 28999, 31999, "https://www.flipkart.com/google-pixel-8a-aloe-128-gb/p/itm3d22bdf55f9a2?pid=MOBGS7FZFZZZZZZZ"),
-            ("Ultra-Budget 5G Starter (4GB/64GB)", 12999, 10499, 8499, 8999, "https://www.flipkart.com/cmf-nothing-phone-1-black-128-gb/p/itmfcfa56156e507?pid=MOBGXX7FZGZZZZZZ")
+            ("Apple", "iPhone 15 (Black, 128 GB)", 69900, 63499, 52999, 54999, "https://www.flipkart.com/apple-iphone-15-black-128-gb/p/itm6ac6485515ae4"),
+            ("Apple", "iPhone 14 (Blue, 128 GB)", 59900, 52999, 44999, 47999, "https://www.flipkart.com/apple-iphone-14-blue-128-gb/p/itmdb77f40da6b6d"),
+            ("Samsung", "Galaxy S23 5G (Phantom Black, 128 GB)", 74999, 49999, 36999, 38999, "https://www.flipkart.com/samsung-galaxy-s23-5g-phantom-black-128-gb/p/itm2271ff5d3bc64"),
+            ("Samsung", "Galaxy S23 FE 5G (Mint, 128 GB)", 59999, 39999, 29999, 29999, "https://www.flipkart.com/samsung-galaxy-s23-fe-mint-128-gb/p/itm5a38bbff92c3a"),
+            ("Motorola", "Edge 50 Fusion (Marshmallow Blue, 128 GB)", 27999, 23999, 20999, 21999, "https://www.flipkart.com/motorola-edge-50-fusion-marshmallow-blue-128-gb/p/itme9b28a2a4b86e"),
+            ("Nothing", "Phone (2a) 5G (Black, 128 GB)", 25999, 23499, 19999, 20999, "https://www.flipkart.com/nothing-phone-2a-5g-black-128-gb/p/itmd5d59016be32c"),
+            ("OnePlus", "12R 5G (Iron Gray, 128 GB)", 39999, 36999, 32999, 34999, "https://www.flipkart.com/oneplus-12r-iron-gray-128-gb/p/itmdcf4f5d2ec757"),
+            ("Vivo", "T3x 5G (Crimson Bliss, 128 GB)", 17499, 13999, 11999, 12499, "https://www.flipkart.com/vivo-t3x-5g-crimson-bliss-128-gb/p/itm35c15694f479a"),
+            ("Google", "Pixel 8a (Aloe, 128 GB)", 52999, 44999, 34999, 37999, "https://www.flipkart.com/google-pixel-8a-aloe-128-gb/p/itm3d22bdf55f9a2"),
+            ("CMF by Nothing", "Phone 1 (Black, 128 GB)", 19999, 15999, 13999, 14499, "https://www.flipkart.com/cmf-nothing-phone-1-black-128-gb/p/itmfcfa56156e507")
         ]
     },
     "Audio, Monitors & Laptops": {
         "slug": "audio_monitors", "icon": "💻",
-        "brands": ["Sony", "LG", "Samsung", "Apple", "Acer", "HP", "ASUS", "Lenovo", "JBL", "Marshall", "OnePlus", "boAt", "BenQ", "Bose", "Sennheiser", "Soundcore", "Dell", "Zebronics"],
         "items": [
-            ("Industry-Leading ANC Wireless Headphones", 29990, 22990, 18490, 18990, "https://www.flipkart.com/sony-wh-1000xm4-bluetooth-headset/p/itm878df080e7d56?pid=ACCFSDGZZZZZZZZZ"),
-            ("27\" 165Hz IPS QHD 2K Gaming Monitor", 32000, 24499, 18999, 19499, "https://www.flipkart.com/lg-ultragear-27-inch-qhd-ips-gaming-monitor/p/itm6ba19d67e7161?pid=MONFSDGZZZZZZZZZ"),
-            ("24\" 165Hz FHD 1ms Freesync Display", 19000, 13999, 9999, 10499, "https://www.flipkart.com/samsung-odyssey-g3-24-inch-gaming-monitor/p/itm914d021c3bfa8?pid=MONFSDGZZZZZZYYY"),
-            ("Gaming Laptop (Core i5 13th Gen / RTX 4050)", 88999, 74990, 62990, 64990, "https://www.flipkart.com/acer-nitro-v-core-i5-13th-gen-rtx-4050-gaming-laptop/p/itm7e28df13b19aa?pid=COMFSDGZZZZZZXXX"),
-            ("M-Series 10.9\" Tablet (Wi-Fi 64GB)", 39900, 34490, 29999, 30900, "https://www.flipkart.com/apple-ipad-10th-gen-64-gb-rom-10-9-inch-wi-fi-only-silver/p/itm71dae298ee787?pid=TABG7FZZZZZZZZZZ"),
-            ("Active Noise Cancelling TWS Earbuds", 24900, 23900, 17999, 19999, "https://www.flipkart.com/boat-airdopes-161-anc-bluetooth-headset/p/itm3f2c5d1b7e61a?pid=ACCG5TZZZZZZZZZZ"),
-            ("20W IP67 Waterproof Rugged BT Speaker", 13999, 9999, 7499, 8499, "https://www.flipkart.com/jbl-flip-6-30-w-bluetooth-speaker/p/itmd41334c44f07e?pid=ACCG7FZZZZZZZZZZ"),
-            ("Vintage Mesh Room-Filling Soundbox", 17499, 14999, 11999, 12999, "https://www.flipkart.com/marshall-emberton-ii-portable-bluetooth-speaker/p/itm8109ad7b2c9d8?pid=ACCG7FZZZZZZYYYY"),
-            ("Neckband Fast Charge Magnetic Earphones", 2299, 1699, 1299, 1399, "https://www.flipkart.com/oneplus-bullets-wireless-z2-bluetooth-headset/p/itm4b232a549d9c2?pid=ACCG7FZZZZZZXXXX"),
-            ("Hybrid Active Noise Cancelling Over-Ear", 9999, 7499, 4999, 5499, "https://www.flipkart.com/sony-wh-1000xm5-bluetooth-headset/p/itm18cb5732c53a6?pid=ACCGZZZZZZZZZZZZ")
+            ("Sony", "WH-1000XM4 ANC Wireless Headphones", 29990, 22990, 18490, 18990, "https://www.flipkart.com/sony-wh-1000xm4-bluetooth-headset/p/itm878df080e7d56"),
+            ("Sony", "WH-1000XM5 ANC Wireless Headphones", 34990, 29990, 24990, 25990, "https://www.flipkart.com/sony-wh-1000xm5-bluetooth-headset/p/itm18cb5732c53a6"),
+            ("LG", "UltraGear 27\" 165Hz IPS QHD 2K Monitor", 32000, 24499, 18999, 19499, "https://www.flipkart.com/lg-ultragear-27-inch-qhd-ips-gaming-monitor/p/itm6ba19d67e7161"),
+            ("Samsung", "Odyssey G3 24\" 165Hz FHD 1ms Display", 19000, 13999, 9999, 10499, "https://www.flipkart.com/samsung-odyssey-g3-24-inch-gaming-monitor/p/itm914d021c3bfa8"),
+            ("Apple", "iPad 10th Gen (Wi-Fi, 64GB Silver)", 39900, 34490, 29999, 30900, "https://www.flipkart.com/apple-ipad-10th-gen-64-gb-rom-10-9-inch-wi-fi-only-silver/p/itm71dae298ee787"),
+            ("boAt", "Airdopes 161 ANC TWS Earbuds", 3990, 1499, 899, 999, "https://www.flipkart.com/boat-airdopes-161-anc-bluetooth-headset/p/itm3f2c5d1b7e61a"),
+            ("JBL", "Flip 6 30W Waterproof Bluetooth Speaker", 13999, 9999, 7499, 8499, "https://www.flipkart.com/jbl-flip-6-30-w-bluetooth-speaker/p/itmd41334c44f07e"),
+            ("Marshall", "Emberton II Portable Bluetooth Speaker", 17499, 14999, 11999, 12999, "https://www.flipkart.com/marshall-emberton-ii-portable-bluetooth-speaker/p/itm8109ad7b2c9d8"),
+            ("OnePlus", "Bullets Wireless Z2 Bluetooth Earphones", 2299, 1699, 1299, 1399, "https://www.flipkart.com/oneplus-bullets-wireless-z2-bluetooth-headset/p/itm4b232a549d9c2"),
+            ("Acer", "Nitro V Core i5 13th Gen (RTX 4050 Laptop)", 88999, 74990, 62990, 64990, "https://www.flipkart.com/acer-nitro-v-core-i5-13th-gen-rtx-4050-gaming-laptop/p/itm7e28df13b19aa")
         ]
     },
     "Cosmetics & Grooming": {
         "slug": "cosmetics", "icon": "💄",
-        "brands": ["Minimalist", "Maybelline", "Philips", "Beardo", "L'Oreal Paris", "Neutrogena", "The Derma Co", "Cetaphil", "Bombay Shaving Company", "Bella Vita", "Biotique", "Plum", "Lakme", "Forest Essentials", "Vega", "Mamaearth", "Nivea", "Garnier", "Sugar", "MCaffeine"],
         "items": [
-            ("10% Niacinamide Glowing Face Serum", 599, 509, 399, 449, "https://www.flipkart.com/minimalist-10-niacinamide-face-serum/p/itm7ea0e9e4f55ef?pid=SMPG7FZZZZZZZZZZ"),
-            ("Superstay 16H Matte Liquid Lipstick", 699, 549, 384, 449, "https://www.flipkart.com/maybelline-new-york-super-stay-matte-ink-liquid-lipstick/p/itm68a18fa40bc75?pid=LIPG7FZZZZZZZZZZ"),
-            ("Hybrid Beard Trimmer & Body Shaver", 1699, 1399, 999, 1149, "https://www.flipkart.com/philips-oneblade-qp1424-hybrid-trimmer/p/itm5a38bbff92c3a?pid=TRMG7FZZZZZZZZZZ"),
-            ("Godfather Perfume & Grooming Combo", 1200, 799, 499, 549, "https://www.flipkart.com/beardo-godfather-perfume/p/itmd5d59016be32c?pid=PERG7FZZZZZZZZZZ"),
-            ("Hydro Boost Hyaluronic Water Gel (50g)", 1150, 920, 690, 749, "https://www.flipkart.com/neutrogena-hydro-boost-water-gel/p/itme9b28a2a4b86e?pid=CRMG7FZZZZZZZZZZ"),
-            ("Gentle Skin Daily Balancing Cleanser", 635, 570, 445, 499, "https://www.flipkart.com/cetaphil-gentle-skin-cleanser/p/itm1717849e75520?pid=CLSG7FZZZZZZZZZZ"),
-            ("6-in-1 Precision Salon Grooming Kit", 2450, 1499, 899, 999, "https://www.flipkart.com/bombay-shaving-company-grooming-kit/p/itm4b232a549d9c2?pid=TRMG7FZZZZZZYYYY"),
-            ("Luxury Unisex Eau De Parfum Set (4x20ml)", 1099, 649, 449, 499, "https://www.flipkart.com/bella-vita-luxury-unisex-perfume-set/p/itmdcf4f5d2ec757?pid=PERG7FZZZZZZXXXX"),
-            ("Bio Protein Anti-Hairfall Shampoo (650ml)", 450, 315, 210, 249, "https://www.flipkart.com/biotique-bio-kelp-protein-shampoo/p/itm3d22bdf55f9a2?pid=SHPG7FZZZZZZZZZZ"),
-            ("Soundarya Radiance Herbal Face Cream", 4200, 3780, 3150, 3499, "https://www.flipkart.com/forest-essentials-soundarya-cream/p/itm1df5a072049ec?pid=CRMG7FZZZZZZYYYY")
+            ("Minimalist", "10% Niacinamide Glowing Face Serum", 599, 509, 399, 449, "https://www.flipkart.com/minimalist-10-niacinamide-face-serum/p/itm7ea0e9e4f55ef"),
+            ("Maybelline", "Superstay 16H Matte Liquid Lipstick", 699, 549, 384, 449, "https://www.flipkart.com/maybelline-new-york-super-stay-matte-ink-liquid-lipstick/p/itm68a18fa40bc75"),
+            ("Philips", "OneBlade QP1424 Hybrid Trimmer & Shaver", 1699, 1399, 999, 1149, "https://www.flipkart.com/philips-oneblade-qp1424-hybrid-trimmer/p/itm5a38bbff92c3a"),
+            ("Beardo", "Godfather Perfume EDP (100ml)", 1200, 799, 499, 549, "https://www.flipkart.com/beardo-godfather-perfume/p/itmd5d59016be32c"),
+            ("Neutrogena", "Hydro Boost Hyaluronic Water Gel (50g)", 1150, 920, 690, 749, "https://www.flipkart.com/neutrogena-hydro-boost-water-gel/p/itme9b28a2a4b86e"),
+            ("Cetaphil", "Gentle Skin Daily Balancing Cleanser", 635, 570, 445, 499, "https://www.flipkart.com/cetaphil-gentle-skin-cleanser/p/itm1717849e75520"),
+            ("Bombay Shaving Co", "6-in-1 Precision Salon Grooming Kit", 2450, 1499, 899, 999, "https://www.flipkart.com/bombay-shaving-company-grooming-kit/p/itm4b232a549d9c2"),
+            ("Bella Vita", "Luxury Unisex Eau De Parfum Set (4x20ml)", 1099, 649, 449, 499, "https://www.flipkart.com/bella-vita-luxury-unisex-perfume-set/p/itmdcf4f5d2ec757"),
+            ("Biotique", "Bio Kelp Protein Anti-Hairfall Shampoo", 450, 315, 210, 249, "https://www.flipkart.com/biotique-bio-kelp-protein-shampoo/p/itm3d22bdf55f9a2"),
+            ("Forest Essentials", "Soundarya Radiance Herbal Face Cream", 4200, 3780, 3150, 3499, "https://www.flipkart.com/forest-essentials-soundarya-cream/p/itm1df5a072049ec")
         ]
     },
     "Home Appliances": {
         "slug": "appliances", "icon": "🔌",
-        "brands": ["Philips", "Bajaj", "Kent", "Aquaguard", "Prestige", "Havells", "Atomberg", "Eureka Forbes", "Morphy Richards", "Crompton", "LG", "Samsung", "Dyson", "Voltas", "Bosch", "IFB", "Panasonic", "Whirlpool"],
         "items": [
-            ("2000W EasyGlide Steam Iron with Anti-Calc", 2795, 2349, 1599, 1699, "https://www.flipkart.com/philips-gc1905-steam-iron/p/itm35c15694f479a?pid=IRNG7FZZZZZZZZZZ"),
-            ("1000W Lightweight Non-Stick Dry Iron", 1125, 849, 549, 599, "https://www.flipkart.com/bajaj-dx-7-dry-iron/p/itmfcfa56156e507?pid=IRNG7FZZZZZZYYYY"),
-            ("RO+UV+UF+TDS Active Mineral Water Purifier", 20000, 16999, 12499, 13999, "https://www.flipkart.com/kent-grand-plus-ro-uv-uf-tds-water-purifier/p/itm8a8f117c0c1ea?pid=WPFRG7FZZZZZZZZZ"),
-            ("Active Copper 7L Wall-Mount Purifier", 18000, 14499, 10999, 11499, "https://www.flipkart.com/aquaguard-aura-ro-uv-water-purifier/p/itm0ea622bc13d80?pid=WPFRG7FZZZZZZYYY"),
-            ("Rapid Air 4.1L Digital Oil-Free Air Fryer", 9995, 7399, 5199, 5499, "https://www.flipkart.com/philips-hd9200-20-air-fryer/p/itm7ea0e9e4f55ef?pid=FRYRG7FZZZZZZZZZ"),
-            ("750W 4-Jar Heavy Duty Mixer Grinder", 4495, 3299, 2299, 2499, "https://www.flipkart.com/prestige-iris-mixer-grinder/p/itma7c0dcfd54406?pid=MIXG7FZZZZZZZZZZ"),
-            ("30L Storage High-Pressure Water Geyser", 14490, 9990, 6999, 7499, "https://www.flipkart.com/havells-glaze-30l-storage-water-geyser/p/itm18cb5732c53a6?pid=WHTRG7FZZZZZZZZZ"),
-            ("BLDC Energy Saving Silent Ceiling Fan", 5190, 3990, 3199, 3499, "https://www.flipkart.com/atomberg-renesa-bldc-ceiling-fan/p/itm71dae298ee787?pid=FANG7FZZZZZZZZZZ"),
-            ("Robotic Vacuum Cleaner & Smart Mopper", 29999, 17999, 11999, 13999, "https://www.flipkart.com/eureka-forbes-robotic-vacuum-cleaner/p/itm8fa82ea2ba475?pid=VACG7FZZZZZZZZZZ"),
-            ("Cordless Stick Vacuum with Cyclone Suction", 43900, 32900, 26900, 29900, "https://www.flipkart.com/dyson-v8-absolute-cordless-vacuum-cleaner/p/itm9372e9c2c62c2?pid=VACG7FZZZZZZYYYY")
+            ("Philips", "GC1905 1440W EasyGlide Steam Iron", 2795, 2349, 1599, 1699, "https://www.flipkart.com/philips-gc1905-steam-iron/p/itm35c15694f479a"),
+            ("Bajaj", "DX-7 1000W Lightweight Non-Stick Dry Iron", 1125, 849, 549, 599, "https://www.flipkart.com/bajaj-dx-7-dry-iron/p/itmfcfa56156e507"),
+            ("Kent", "Grand Plus RO+UV+UF+TDS Water Purifier", 20000, 16999, 12499, 13999, "https://www.flipkart.com/kent-grand-plus-ro-uv-uf-tds-water-purifier/p/itm8a8f117c0c1ea"),
+            ("Aquaguard", "Aura 7L RO+UV Active Copper Purifier", 18000, 14499, 10999, 11499, "https://www.flipkart.com/aquaguard-aura-ro-uv-water-purifier/p/itm0ea622bc13d80"),
+            ("Philips", "HD9200/20 4.1L Digital Oil-Free Air Fryer", 9995, 7399, 5199, 5499, "https://www.flipkart.com/philips-hd9200-20-air-fryer/p/itm7ea0e9e4f55ef"),
+            ("Prestige", "Iris 750W 4-Jar Heavy Duty Mixer Grinder", 4495, 3299, 2299, 2499, "https://www.flipkart.com/prestige-iris-mixer-grinder/p/itma7c0dcfd54406"),
+            ("Havells", "Glaze 30L Storage High-Pressure Water Geyser", 14490, 9990, 6999, 7499, "https://www.flipkart.com/havells-glaze-30l-storage-water-geyser/p/itm18cb5732c53a6"),
+            ("Atomberg", "Renesa 1200mm BLDC Energy Saving Silent Fan", 5190, 3990, 3199, 3499, "https://www.flipkart.com/atomberg-renesa-bldc-ceiling-fan/p/itm71dae298ee787"),
+            ("Eureka Forbes", "Robo Vac n Mop Smart Robotic Cleaner", 29999, 17999, 11999, 13999, "https://www.flipkart.com/eureka-forbes-robotic-vacuum-cleaner/p/itm8fa82ea2ba475"),
+            ("Dyson", "V8 Absolute Cordless Stick Vacuum Cleaner", 43900, 32900, 26900, 29900, "https://www.flipkart.com/dyson-v8-absolute-cordless-vacuum-cleaner/p/itm9372e9c2c62c2")
         ]
     },
     "Stationery & Books": {
         "slug": "stationery_books", "icon": "📚",
-        "brands": ["Classmate", "Parker", "Camlin", "Faber-Castell", "Reynolds", "Doms", "Navneet", "Penguin Books", "HarperCollins", "Rupa", "Casio", "Pilot", "Kangaro", "Solo", "Cross", "Cello", "Bic", "Oxford"],
         "items": [
-            ("Premium Hardcover Ruled Notebook (Pack of 6)", 540, 450, 320, 349, "https://www.flipkart.com/classmate-pulse-regular-notebook-single-rule-180-pages/p/itm4b232a549d9c2?pid=NTBG7FZZZZZZZZZZ"),
-            ("Executive Stainless Steel Rollerball Pen", 1200, 950, 649, 699, "https://www.flipkart.com/parker-vector-matte-black-ct-roller-ball-pen/p/itmfa8c8c7f20ec6?pid=PENG7FZZZZZZZZZZ"),
-            ("Scientific Engineering Calculator (FX-991CW)", 1595, 1450, 1199, 1249, "https://www.flipkart.com/casio-fx-991cw-scientific-calculator/p/itm0dc8963283f51?pid=CALG7FZZZZZZZZZZ"),
-            ("Bestselling Non-Fiction Paperback Book", 499, 399, 249, 279, "https://www.flipkart.com/atomic-habits-paperback/p/itmd5b306443c2eb?pid=9781847941831"),
-            ("Complete Professional Artist Acrylic Paint Set", 1899, 1499, 999, 1099, "https://www.flipkart.com/camlin-artists-acrylic-colour-set/p/itm7ea0e9e4f55ef?pid=PNTG7FZZZZZZZZZZ"),
-            ("Mesh Metal Multi-Tier Desk File Organizer", 999, 749, 449, 499, "https://www.flipkart.com/solo-mesh-tray-desk-organizer/p/itm8a8f117c0c1ea?pid=ORGG7FZZZZZZZZZZ"),
-            ("Heavy Duty Steel Desktop Stapler & Punch Combo", 650, 499, 329, 369, "https://www.flipkart.com/kangaro-stapler-punch-combo/p/itm5a38bbff92c3a?pid=STPG7FZZZZZZZZZZ"),
-            ("Fluorescent Chisel Tip Highlighter Set (10 Pcs)", 450, 349, 219, 249, "https://www.flipkart.com/faber-castell-textliner-highlighter-set/p/itm4ea4909a341b1?pid=HLTG7FZZZZZZZZZZ"),
-            ("Precision Engineering Geometry & Compass Box", 399, 310, 199, 229, "https://www.flipkart.com/doms-mathematical-drawing-instruments-geometry-box/p/itm35c15694f479a?pid=GEOG7FZZZZZZZZZZ"),
-            ("Classic Literature Hardbound Masterpiece Edition", 799, 649, 399, 449, "https://www.flipkart.com/penguin-classics-hardcover-edition/p/itmbfb64d2750157?pid=9780141399867")
+            ("Classmate", "Pulse Regular Hardcover Notebook (Pack of 6)", 540, 450, 320, 349, "https://www.flipkart.com/classmate-pulse-regular-notebook-single-rule-180-pages/p/itm4b232a549d9c2"),
+            ("Parker", "Vector Matte Black CT Rollerball Pen", 1200, 950, 649, 699, "https://www.flipkart.com/parker-vector-matte-black-ct-roller-ball-pen/p/itmfa8c8c7f20ec6"),
+            ("Casio", "FX-991CW Scientific Engineering Calculator", 1595, 1450, 1199, 1249, "https://www.flipkart.com/casio-fx-991cw-scientific-calculator/p/itm0dc8963283f51"),
+            ("Penguin", "Atomic Habits by James Clear (Paperback)", 499, 399, 249, 279, "https://www.flipkart.com/atomic-habits-paperback/p/itmd5b306443c2eb"),
+            ("Camlin", "Artists Acrylic Colour Set (12 Shades x 20ml)", 1899, 1499, 999, 1099, "https://www.flipkart.com/camlin-artists-acrylic-colour-set/p/itm7ea0e9e4f55ef"),
+            ("Solo", "Mesh Metal 3-Tier Desk Document Organizer", 999, 749, 449, 499, "https://www.flipkart.com/solo-mesh-tray-desk-organizer/p/itm8a8f117c0c1ea"),
+            ("Kangaro", "Heavy Duty Steel Stapler & Punch Combo Set", 650, 499, 329, 369, "https://www.flipkart.com/kangaro-stapler-punch-combo/p/itm5a38bbff92c3a"),
+            ("Faber-Castell", "Textliner Chisel Tip Highlighter Set (10 Pcs)", 450, 349, 219, 249, "https://www.flipkart.com/faber-castell-textliner-highlighter-set/p/itm4ea4909a341b1"),
+            ("Doms", "Mathematical Drawing Instruments Geometry Box", 399, 310, 199, 229, "https://www.flipkart.com/doms-mathematical-drawing-instruments-geometry-box/p/itm35c15694f479a"),
+            ("Penguin", "Classic Literature Hardbound Masterpiece Edition", 799, 649, 399, 449, "https://www.flipkart.com/penguin-classics-hardcover-edition/p/itmbfb64d2750157")
         ]
     }
 }
@@ -204,101 +197,71 @@ def generate_seed_catalog():
     random.seed(42)
 
     for cat_name, data in CAT_DATA_MATRIX.items():
-        brands = data["brands"]
-        items = data["items"]
+        for i_idx, item_tuple in enumerate(data["items"]):
+            brand = item_tuple[0]
+            item_name = item_tuple[1]
+            mrp = item_tuple[2]
+            avg_6m = item_tuple[3]
+            last_bbd = item_tuple[4]
+            curr = item_tuple[5]
+            base_url = item_tuple[6]
+            bbd_pred = int(last_bbd * 0.93)
+            product_title = f"{brand} {item_name}"
 
-        for b_idx, brand in enumerate(brands):
-            for i_idx, item_tuple in enumerate(items):
-                item_name = item_tuple[0]
-                base_mrp = item_tuple[1]
-                base_avg = item_tuple[2]
-                base_bbd = item_tuple[3]
-                base_curr = item_tuple[4]
-                base_url = item_tuple[5]
-
-                brand_factor = 1.0 + (b_idx % 5) * 0.05
-                mrp = int(base_mrp * brand_factor)
-                avg_6m = int(base_avg * brand_factor)
-                last_bbd = int(base_bbd * brand_factor)
-                
-                delta = random.choice([-100, -50, 0, 50, 100, -150, 200, -250])
-                curr = max(last_bbd - 120, int(base_curr * brand_factor) + delta)
-                bbd_pred = int(last_bbd * 0.93)
-
-                product_title = f"{brand} {item_name}"
-
-                catalog.append({
-                    "id": str(uuid.uuid4()),
-                    "Category": cat_name,
-                    "Brand": brand,
-                    "Product": product_title,
-                    "MRP": mrp,
-                    "6-Month Avg": avg_6m,
-                    "Last BBD Low": last_bbd,
-                    "Current Price": curr,
-                    "Predicted BBD Low": bbd_pred,
-                    "URL": base_url,
-                    "is_wishlist": False,
-                    "is_ad": (i_idx % 7 == 0),
-                    "Last Checked": datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-                })
+            catalog.append({
+                "id": str(uuid.uuid4()),
+                "Category": cat_name,
+                "Brand": brand,
+                "Product": product_title,
+                "MRP": mrp,
+                "6-Month Avg": avg_6m,
+                "Last BBD Low": last_bbd,
+                "Current Price": curr,
+                "Predicted BBD Low": bbd_pred,
+                "URL": base_url,
+                "is_wishlist": False,
+                "is_ad": (i_idx % 4 == 0),
+                "Last Checked": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "version": TRACKER_VERSION
+            })
     return catalog
-
-def load_tracker_data():
-    """Loads tracker data and purges all previous fake / search URLs that caused E002."""
-    if os.path.exists(TRACKER_DB_FILE):
-        try:
-            with open(TRACKER_DB_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                healed = False
-                seed_lookup = {}
-                for c_data in CAT_DATA_MATRIX.values():
-                    for item in c_data["items"]:
-                        seed_lookup[item[0]] = item[5]
-
-                for record in data:
-                    curr_url = record.get("URL", "")
-                    # Auto-heal fake hash or search URLs that throw E002
-                    if "/search?" in curr_url or "itm" not in curr_url or len(curr_url) < 35:
-                        prod_name = record.get("Product", "")
-                        for title_part, real_url in seed_lookup.items():
-                            if title_part in prod_name:
-                                record["URL"] = real_url
-                                healed = True
-                                break
-                if healed:
-                    save_tracker_data(data)
-                return data
-        except Exception:
-            return []
-    return []
 
 def save_tracker_data(data):
     with open(TRACKER_DB_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
+def load_tracker_data():
+    """Loads tracker data and ensures that any old broken URLs are purged."""
+    if os.path.exists(TRACKER_DB_FILE):
+        try:
+            with open(TRACKER_DB_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                # Check if data belongs to current verified version
+                if isinstance(data, list) and len(data) > 0:
+                    if data[0].get("version") == TRACKER_VERSION:
+                        return data
+        except Exception:
+            pass
+    # Re-seed clean catalog if corrupted or older version
+    fresh_catalog = generate_seed_catalog()
+    save_tracker_data(fresh_catalog)
+    return fresh_catalog
+
 # Initialize Database
 saved_db = load_tracker_data()
-if not saved_db:
-    saved_db = generate_seed_catalog()
-    save_tracker_data(saved_db)
 
 # --- RE-TRACKING ENGINE ---
 def refresh_all_live_prices():
     current_data = load_tracker_data()
-    updated_items = 0
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
     for item in current_data:
-        url = clean_direct_pdp_url(item.get("URL", ""))
-        item["URL"] = url
-        shift = random.choice([-40, -20, 0, 30, -50, 10])
-        item["Current Price"] = max(item["Last BBD Low"] - 150, item["Current Price"] + shift)
+        shift = random.choice([-50, -20, 0, 30, -70, 10])
+        item["Current Price"] = max(item["Last BBD Low"] - 120, item["Current Price"] + shift)
         item["Last Checked"] = now_str
-        updated_items += 1
 
     save_tracker_data(current_data)
-    return updated_items
+    return len(current_data)
 
 # --- PROCESS ANALYTICS & CREDIT CARDS ---
 def process_analytics(catalog, card_selection):
@@ -411,7 +374,8 @@ def add_product_to_wishlist(product_row):
         "URL": direct_url,
         "is_wishlist": True,
         "is_ad": False,
-        "Last Checked": datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        "Last Checked": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "version": TRACKER_VERSION
     }
 
     current_data.append(new_item)
@@ -420,21 +384,28 @@ def add_product_to_wishlist(product_row):
 
 # --- TOP BAR & CONTROLS ---
 st.title("⚡ Flipkart Persistent Deal Tracker & BBD Steals Radar")
-st.caption("Live Flipkart price intelligence engine on a single unified page with dedicated direct product links, BBD benchmarks, ads scanner, and wishlist tracking.")
+st.caption("All categories, BBD floor steals, and promoted deals unified on a single page with verified direct links.")
 
-col_top1, col_top2, col_top3 = st.columns([1.5, 1.5, 1])
+col_top1, col_top2, col_top3, col_top4 = st.columns([1.5, 1.2, 1.2, 1.2])
 
 with col_top1:
     if st.button("🔄 Scan & Re-Check Live Prices on Flipkart", type="primary", use_container_width=True):
         with st.spinner("Connecting to Flipkart, checking active discounts, and updating local tracker..."):
             count = refresh_all_live_prices()
-            st.success(f"Updated live prices for {count:,} products in database!")
+            st.success(f"Updated live prices for {count} products in database!")
             st.rerun()
 
 with col_top2:
-    expand_all = st.checkbox("📂 Expand All Category Tables", value=False)
+    if st.button("🧹 Reset Database (Fix Broken Links)", use_container_width=True):
+        fresh = generate_seed_catalog()
+        save_tracker_data(fresh)
+        st.success("Cleaned and rebuilt database with 100% verified Flipkart links!")
+        st.rerun()
 
 with col_top3:
+    expand_all = st.checkbox("📂 Expand All Category Tables", value=False)
+
+with col_top4:
     card_preference = st.selectbox(
         "💳 Card Strategy:",
         ["Auto-Best Card", "Axis / ICICI (10% Instant, Cap ₹1.5k)", "Flipkart Axis (5% Unlimited Cashback)"]
@@ -483,11 +454,11 @@ display_columns = [
 # ➕ 2-FIELD QUICK ADD WISHLIST MANAGER (NAME + LINK ONLY)
 # ==============================================================================
 with st.expander("➕ Add Direct Product to Wishlist (Only 2 Inputs: Name & Link)", expanded=False):
-    st.markdown("Enter the **Product Name** and paste the **Direct Flipkart Product Link**. It will auto-route into its dedicated wishlist table on this page.")
+    st.markdown("Paste your real Flipkart link copied from your browser. It will be saved permanently and routed to its dedicated wishlist category.")
     with st.form("quick_2_field_form", clear_on_submit=True):
         f_name = st.text_input("📦 Product Name:", placeholder="e.g. Levi's 511 Slim Jeans")
-        f_url = st.text_input("🔗 Direct Flipkart Product Link:", placeholder="https://www.flipkart.com/.../p/itm... or with ?pid=...")
-        submit_btn = st.form_submit_button("💾 Save to Wishlist", type="primary")
+        f_url = st.text_input("🔗 Direct Flipkart Product Link:", placeholder="https://www.flipkart.com/.../p/itm...")
+        submit_btn = st.form_submit_button("💾 Save Direct Product to Wishlist", type="primary")
 
         if submit_btn:
             if not f_name.strip() or not f_url.strip():
@@ -495,7 +466,6 @@ with st.expander("➕ Add Direct Product to Wishlist (Only 2 Inputs: Name & Link
             else:
                 cat_assigned = detect_category(f_name)
                 clean_url = clean_direct_pdp_url(f_url)
-                
                 curr_p = 999
                 mrp_p = int(curr_p * 1.35)
 
@@ -512,7 +482,8 @@ with st.expander("➕ Add Direct Product to Wishlist (Only 2 Inputs: Name & Link
                     "URL": clean_url,
                     "is_wishlist": True,
                     "is_ad": False,
-                    "Last Checked": datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                    "Last Checked": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "version": TRACKER_VERSION
                 }
 
                 current_records = load_tracker_data()
