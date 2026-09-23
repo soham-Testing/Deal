@@ -136,26 +136,45 @@ AFFILIATE_BASE = "https://affiliate-api.flipkart.net/affiliate/api"
 LINK_CURATED, LINK_RESOLVED, LINK_SEARCH = "curated", "resolved", "search"
 SORT_MODES = ("relevance", "price_asc", "price_desc", "recency_desc", "popularity")
 
+# Ordered category series. Each renders as its own collapsible section, in this
+# exact order: Clothing -> Watches -> Wearables -> Shoes -> everything else.
 CATEGORY_SEEDS: Dict[str, Tuple[str, ...]] = {
-    "Men's Fashion": ("mens jeans", "mens casual shirt", "mens formal shirt",
-                      "mens t-shirt", "mens trousers", "mens jacket", "mens suit"),
-    "Women's Fashion": ("womens kurta set", "womens jeans", "womens dress",
-                        "saree", "womens top", "womens cardigan"),
-    "Footwear & Shoes": ("running shoes men", "sneakers men", "womens sandals",
-                         "formal shoes men", "sports shoes", "clogs"),
-    "Watches & Eyewear": ("analog watch men", "smartwatch", "sunglasses men",
-                          "chronograph watch", "digital watch"),
+    "Clothing — Men": ("mens jeans", "mens casual shirt", "mens formal shirt",
+                       "mens t-shirt", "mens trousers", "mens jacket", "mens suit"),
+    "Clothing — Women": ("womens kurta set", "womens jeans", "womens dress",
+                         "saree", "womens top", "womens cardigan"),
+    "Watches": ("analog watch men", "chronograph watch", "digital watch",
+                "womens watch", "luxury watch"),
+    "Wearables": ("smartwatch", "fitness band", "smart ring", "tws earbuds",
+                  "smart glasses"),
+    "Shoes": ("running shoes men", "sneakers men", "womens sandals",
+              "formal shoes men", "sports shoes", "clogs"),
+    "Bags & Luggage": ("backpack", "laptop bag", "trolley suitcase",
+                       "womens handbag"),
+    "Eyewear": ("sunglasses men", "sunglasses women", "blue cut spectacles"),
     "Smartphones": ("mobile phones 5g", "iphone", "samsung galaxy phone",
                     "motorola phone", "oneplus phone", "pixel phone"),
-    "Audio, Monitors & Laptops": ("bluetooth headphones", "tws earbuds",
-                                  "bluetooth speaker", "gaming monitor",
-                                  "gaming laptop", "tablet"),
+    "Audio": ("bluetooth headphones", "bluetooth speaker", "soundbar",
+              "wired earphones"),
+    "Laptops & Monitors": ("gaming laptop", "thin and light laptop",
+                           "gaming monitor", "tablet"),
     "Cosmetics & Grooming": ("face serum", "lipstick", "beard trimmer",
                              "perfume", "face cream", "shampoo"),
     "Home Appliances": ("water purifier", "air fryer", "mixer grinder",
                         "ceiling fan", "vacuum cleaner", "water geyser"),
+    "Large Appliances & TV": ("smart tv 55 inch", "washing machine",
+                              "refrigerator", "air conditioner"),
     "Stationery & Books": ("notebook", "ball pen", "scientific calculator",
                            "books bestsellers", "art supplies"),
+}
+
+# Icon per category, used in the collapsible section headers.
+CATEGORY_ICONS: Dict[str, str] = {
+    "Clothing — Men": "👔", "Clothing — Women": "👗", "Watches": "⌚",
+    "Wearables": "⌚", "Shoes": "👟", "Bags & Luggage": "🎒", "Eyewear": "🕶️",
+    "Smartphones": "📱", "Audio": "🎧", "Laptops & Monitors": "💻",
+    "Cosmetics & Grooming": "💄", "Home Appliances": "🔌",
+    "Large Appliances & TV": "📺", "Stationery & Books": "📚",
 }
 
 # --------------------------------------------------------------------------- #
@@ -218,9 +237,133 @@ OFFER_MATRIX: Tuple[Offer, ...] = (
           "instant", 0.0, None, "Payment availability, not a headline discount."),
 )
 
-RIVAL_NOTE = ("Amazon's Great Indian Festival 2026 starts 8 October with an "
-              "SBI-led bank offer. If SBI is your primary card, cross-check the "
-              "same SKU there before buying.")
+RIVAL_NOTE = ("Amazon's Great Indian Festival 2026 starts 8 October. If SBI is "
+              "your primary card, cross-check the same SKU there before buying.")
+
+# --------------------------------------------------------------------------- #
+# BBD 2025 — WHAT ACTUALLY HAPPENED (the benchmark for judging 2026 claims)
+# --------------------------------------------------------------------------- #
+
+BBD_2025 = {
+    "sale_name": "Big Billion Days 2025",
+    "public_start": "2025-09-23",
+    "early_access_from": "2025-09-22",   # Plus members
+    "headline": "606 million visits in the first 48 hours.",
+}
+
+# Verified reporting on BBD 2025 performance. Every figure below was published;
+# none is estimated. Use these to sanity-check 2026 marketing claims.
+BBD_2025_STATS: Tuple[Dict[str, str], ...] = (
+    {"Metric": "Visits, first 48 hours", "Value": "606 million",
+     "Detail": "Unique visitors up 28% YoY over the same window."},
+    {"Metric": "Gen-Z share of traffic", "Value": "201 million visits",
+     "Detail": "About a third of all traffic; growing at 2x platform pace."},
+    {"Metric": "Overall visit growth", "Value": "+21% vs BBD 2024",
+     "Detail": "Attributed to GST 2.0 reforms and premium demand."},
+    {"Metric": "Premium product demand", "Value": "+26% YoY",
+     "Detail": "Across mobiles, televisions and refrigerators."},
+    {"Metric": "Metro traffic growth", "Value": "+23% YoY",
+     "Detail": "Non-metro demand rose sharply alongside it."},
+    {"Metric": "Fastest-growing category", "Value": "Appliances",
+     "Detail": "GST 2.0 reform was the direct driver."},
+    {"Metric": "Quick commerce", "Value": "4.5M visitors to Flipkart Minutes",
+     "Detail": "Order volumes doubled vs regular days; fastest iPhone "
+               "delivery recorded under 3 minutes."},
+    {"Metric": "Exchange participation", "Value": "1 in 5 smartphone shoppers",
+     "Detail": "Doorstep assessment in roughly 30 minutes."},
+)
+
+# BBD 2025 smartphone floors, as revealed in the published 56-model list. These
+# are the single most useful anchor for 2026: if a 2026 "deal" is not clearly
+# below the comparable 2025 floor, it is not a real discount.
+BBD_2025_PRICE_FLOORS: Tuple[Dict[str, Any], ...] = (
+    {"Brand": "Apple", "Model": "iPhone 16", "MRP": 79900, "BBD 2025 Floor": 51999},
+    {"Brand": "Apple", "Model": "iPhone 16 Pro", "MRP": 119900, "BBD 2025 Floor": 69900},
+    {"Brand": "Apple", "Model": "iPhone 16 Pro Max", "MRP": 144900, "BBD 2025 Floor": 89900},
+    {"Brand": "Samsung", "Model": "Galaxy S24", "MRP": 74999, "BBD 2025 Floor": 39999},
+    {"Brand": "Samsung", "Model": "Galaxy S24 FE", "MRP": 59999, "BBD 2025 Floor": 29999},
+    {"Brand": "Samsung", "Model": "Galaxy A35", "MRP": 33999, "BBD 2025 Floor": 17999},
+    {"Brand": "Samsung", "Model": "Galaxy F06", "MRP": 12499, "BBD 2025 Floor": 7499},
+    {"Brand": "Google", "Model": "Pixel 9", "MRP": 79999, "BBD 2025 Floor": 34999},
+    {"Brand": "Google", "Model": "Pixel 9 Pro XL", "MRP": 124999, "BBD 2025 Floor": 69999},
+    {"Brand": "Nothing", "Model": "Phone (3)", "MRP": 84999, "BBD 2025 Floor": 34999},
+    {"Brand": "Nothing", "Model": "CMF Phone 2 Pro", "MRP": 22999, "BBD 2025 Floor": 14999},
+    {"Brand": "Motorola", "Model": "Razr 60", "MRP": 54999, "BBD 2025 Floor": 39999},
+    {"Brand": "Motorola", "Model": "Edge 60 Fusion", "MRP": 25999, "BBD 2025 Floor": 19999},
+    {"Brand": "Motorola", "Model": "G45 5G", "MRP": 19999, "BBD 2025 Floor": 12999},
+    {"Brand": "POCO", "Model": "X7 Pro", "MRP": 24999, "BBD 2025 Floor": 14999},
+    {"Brand": "POCO", "Model": "F7", "MRP": 35999, "BBD 2025 Floor": 28999},
+    {"Brand": "realme", "Model": "P4 Pro", "MRP": 28999, "BBD 2025 Floor": 19999},
+    {"Brand": "realme", "Model": "P3x", "MRP": 16999, "BBD 2025 Floor": 10999},
+    {"Brand": "vivo", "Model": "T4", "MRP": 25999, "BBD 2025 Floor": 18999},
+    {"Brand": "OPPO", "Model": "K13", "MRP": 19999, "BBD 2025 Floor": 14999},
+)
+
+# BBD 2026: only what Flipkart or credible reporting has actually stated.
+# `Status` distinguishes confirmed fact from teaser from inference — never let
+# a teased banner price be read as a confirmed deal.
+BBD_2026_EXPECTED: Tuple[Dict[str, str], ...] = (
+    {"Category": "Smartphones (Apple)",
+     "What to expect": "iPhone 17 teased under ₹80,000 on Flipkart's own "
+                       "mobile-category banner, against roughly ₹1 lakh today. "
+                       "iPhone 15, 16, Air and 17 Pro also expected to drop.",
+     "Status": "Teased by Flipkart — exact price not published",
+     "Reveal date": "26 Sep 2026 (per Flipkart's microsite)"},
+    {"Category": "Smartphones (Android)",
+     "What to expect": "Early Bird lineup names iPhone 17, Galaxy S25, "
+                       "Vivo T5x 5G, Realme P4 5G, Realme P4 Lite 5G, "
+                       "Motorola Signature, Moto G06 Power, Lava Virat V1 5G.",
+     "Status": "Line-up confirmed, prices mostly unrevealed",
+     "Reveal date": "From 24 Sep 2026"},
+    {"Category": "Laptops & PCs",
+     "What to expect": "Intel Core Ultra is a title sponsor, so Intel-powered "
+                       "laptops should carry the deepest cuts, concentrated in "
+                       "the opening 48 hours. Samsung Book4 i5 teased.",
+     "Status": "Inferred from sponsorship + teaser",
+     "Reveal date": "9 Oct 2026"},
+    {"Category": "Televisions",
+     "What to expect": "65-inch 4K televisions shown from ₹39,999.",
+     "Status": "Teased starting price",
+     "Reveal date": "From 24 Sep 2026"},
+    {"Category": "Wearables",
+     "What to expect": "Goboult watches listed from ₹1,799.",
+     "Status": "Teased starting price",
+     "Reveal date": "From 24 Sep 2026"},
+    {"Category": "Large Appliances",
+     "What to expect": "Washing machines, refrigerators and ACs typically "
+                       "combine a direct cut with exchange bonus and bank "
+                       "discount. Appliances were the fastest-growing category "
+                       "in 2025 on GST reform.",
+     "Status": "Inferred from 2025 pattern",
+     "Reveal date": "9 Oct 2026"},
+    {"Category": "Fashion & Footwear",
+     "What to expect": "Historically the highest percentage discounts of the "
+                       "sale, though smaller absolute rupee savings than "
+                       "electronics.",
+     "Status": "Inferred from prior editions",
+     "Reveal date": "9 Oct 2026"},
+    {"Category": "Samsung (title sponsor)",
+     "What to expect": "Samsung Galaxy is a confirmed title sponsor. In past "
+                       "editions the sponsor's category carried the sharpest, "
+                       "most heavily promoted price cuts.",
+     "Status": "Sponsorship confirmed, pricing not",
+     "Reveal date": "9 Oct 2026"},
+)
+
+BBD_BUYER_RULES: Tuple[str, ...] = (
+    "Compare the **final checkout price**, not the advertised discount. "
+    "Exchange value, no-cost EMI and bank offers change the real cost sharply.",
+    "A teased banner price usually already assumes the bank discount. Do not "
+    "count that 10% twice.",
+    "Treat any specific rupee figure circulating before the sale goes live as "
+    "speculation — Flipkart has not published category pricing yet.",
+    "Check the 2025 floor in the table above first. If a 2026 'deal' is not "
+    "clearly below it, wait.",
+    "Offer stacking is not guaranteed. What actually combines is shown on the "
+    "product and payment pages at checkout.",
+    "Early access on 8 Oct matters most for limited-stock items — popular "
+    "phones and large appliances often sell out on day one.",
+)
 
 
 class OfferEngine:
@@ -1207,6 +1350,80 @@ def install_into_tracker(tracker_module) -> bool:
 # --------------------------------------------------------------------------- #
 
 
+def _days_until(date_str: str) -> Optional[int]:
+    try:
+        target = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+    return max((target - dt.date.today()).days, 0)
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", (text or "").lower()).strip("_") or "cat"
+
+
+def _product_table(st, frame, key_prefix: str) -> None:
+    """Shared product grid rendering with consistent column formatting."""
+    st.dataframe(
+        frame[["Brand", "Product", "Current Price", "MRP", "Real Disc % (vs Avg)",
+               "Best Offer", "Net Price", "Deal Score", "Rating", "Ratings Count",
+               "Availability", "URL"]],
+        use_container_width=True, hide_index=True, key=f"{key_prefix}_grid",
+        column_config={
+            "URL": st.column_config.LinkColumn("Link", display_text="Open ↗"),
+            "Current Price": st.column_config.NumberColumn(format="₹%d"),
+            "MRP": st.column_config.NumberColumn(format="₹%d"),
+            "Net Price": st.column_config.NumberColumn(
+                format="₹%d", help="After the best offer you are eligible for"),
+            "Real Disc % (vs Avg)": st.column_config.NumberColumn(format="%.1f%%"),
+            "Deal Score": st.column_config.ProgressColumn(
+                format="%.1f", min_value=0, max_value=100),
+            "Ratings Count": st.column_config.NumberColumn(format="%d"),
+        },
+    )
+
+
+def _render_category_section(st, subset, category: str) -> None:
+    """One collapsible section per category, with its own filters and export."""
+    icon = CATEGORY_ICONS.get(category, "📦")
+    slug = _slug(category)
+    sponsored = int(subset["Sponsored"].sum())
+    badge = f" · {sponsored} sponsored" if sponsored else ""
+
+    with st.expander(f"{icon} {category} — {len(subset)} products{badge}",
+                     expanded=False):
+        c1, c2, c3 = st.columns([2, 1.5, 1.5])
+        brands = sorted(b for b in subset["Brand"].dropna().unique() if b)
+        picked = c1.multiselect("Brand:", brands, default=[],
+                                placeholder="All brands", key=f"{slug}_brand")
+
+        priced = subset[subset["Current Price"] > 0]
+        if priced.empty:
+            lo = hi = 0
+        else:
+            lo, hi = int(priced["Current Price"].min()), int(priced["Current Price"].max())
+        if lo >= hi:
+            hi = lo + 100
+        price_range = c2.slider("Price (₹):", lo, hi, (lo, hi), key=f"{slug}_price")
+        min_score = c3.slider("Min deal score:", 0, 100, 0, 5, key=f"{slug}_score")
+
+        filtered = subset.copy()
+        if picked:
+            filtered = filtered[filtered["Brand"].isin(picked)]
+        filtered = filtered[filtered["Current Price"].between(*price_range)]
+        filtered = filtered[filtered["Deal Score"] >= min_score]
+
+        if filtered.empty:
+            st.warning("No products match these filters.")
+            return
+
+        _product_table(st, filtered, slug)
+        st.download_button(
+            f"📥 Download {category} CSV",
+            filtered.to_csv(index=False).encode("utf-8"),
+            file_name=f"flipkart_{slug}.csv", mime="text/csv", key=f"{slug}_dl")
+
+
 def _under_streamlit() -> bool:
     """
     True when executed via `streamlit run`. This is the guard that prevents the
@@ -1270,24 +1487,26 @@ def render_app() -> None:
         st.warning("Cache is disabled (read-only filesystem). Scans still work, "
                    "but price history will not accumulate between runs.")
 
-    tab_scan, tab_offers, tab_diag = st.tabs(["🔍 Scan", "💳 Offers", "🩺 Diagnostics"])
+    tab_scan, tab_bbd, tab_offers, tab_diag = st.tabs(
+        ["🔍 Scan by Category", "🔥 BBD Sale", "💳 Offers", "🩺 Diagnostics"])
 
-    # -- Scan ---------------------------------------------------------------- #
+    # -- Scan by Category ---------------------------------------------------- #
     with tab_scan:
-        mode = st.radio("Scan mode", ["Specific queries", "Full catalogue sweep"],
-                        horizontal=True)
-        if mode == "Specific queries":
-            raw = st.text_area("One search term per line:",
-                               value="bluetooth headphones\nrunning shoes men\n"
-                                     "mobile phones 5g",
-                               height=110)
-            queries = [line.strip() for line in raw.splitlines() if line.strip()]
-        else:
-            chosen = st.multiselect("Categories:", list(CATEGORY_SEEDS),
-                                    default=list(CATEGORY_SEEDS)[:3])
-            queries = [t for c in chosen for t in CATEGORY_SEEDS[c]]
-            st.caption(f"{len(queries)} seed queries × {pages} pages = "
-                       f"{len(queries) * pages} page fetches.")
+        st.markdown("#### Choose what to scan")
+        chosen = st.multiselect(
+            "Categories (each gets its own collapsible section below):",
+            list(CATEGORY_SEEDS),
+            default=["Clothing — Men", "Watches", "Wearables", "Shoes"],
+        )
+        extra_raw = st.text_area(
+            "Extra search terms (optional, one per line):", value="", height=68,
+            placeholder="e.g. noise cancelling headphones")
+        extra = [q.strip() for q in extra_raw.splitlines() if q.strip()]
+
+        queries = [t for c in chosen for t in CATEGORY_SEEDS[c]] + extra
+        if queries:
+            st.caption(f"{len(chosen)} categories · {len(queries)} search terms · "
+                       f"{pages} pages each = up to {len(queries) * pages} page fetches.")
 
         if st.button("🚀 Run scan", type="primary", disabled=not queries):
             bar = st.progress(0.0)
@@ -1306,41 +1525,133 @@ def render_app() -> None:
                 engine.cache.append_ledger(records)
             bar.empty()
             status.empty()
+            # Persist so the collapsible sections survive Streamlit reruns
+            # triggered by the filter widgets inside each expander.
+            st.session_state["records"] = records
+            st.session_state["stats"] = engine.stats.as_dict()
 
-            if not records:
-                st.error("No products captured.")
-                st.markdown(
-                    "Likely causes, in order:\n"
-                    "1. **Bot challenge** — Flipkart served a CAPTCHA page. "
-                    "Lower the QPS slider and retry in a few minutes.\n"
-                    "2. **Network blocked** — proxy, VPN or firewall. Use "
-                    "**🩺 Test Flipkart connection** in the sidebar.\n"
-                    "3. **Circuit breaker open** — see the Diagnostics tab."
-                )
+        records = st.session_state.get("records")
+
+        if records is None:
+            st.info("Pick your categories above and hit **Run scan**.")
+        elif not records:
+            st.error("No products captured.")
+            st.markdown(
+                "Likely causes, in order:\n"
+                "1. **Bot challenge** — Flipkart served a CAPTCHA page. Lower the "
+                "QPS slider and retry in a few minutes.\n"
+                "2. **Network blocked** — proxy, VPN or firewall. Use "
+                "**🩺 Test Flipkart connection** in the sidebar.\n"
+                "3. **Circuit breaker open** — see the Diagnostics tab."
+            )
+        else:
+            stats = st.session_state.get("stats", {})
+            frame = to_dataframe(records, engine.cache)
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Products", len(frame))
+            c2.metric("Categories", frame["Category"].replace("", "Other").nunique())
+            c3.metric("Pages fetched", stats.get("pages_fetched", 0))
+            c4.metric("Products/sec", stats.get("products_per_sec", 0))
+
+            st.download_button("📥 Download everything (CSV)",
+                               frame.to_csv(index=False).encode("utf-8"),
+                               file_name="flipkart_all_categories.csv",
+                               mime="text/csv")
+            st.divider()
+
+            # One collapsible section per category, in CATEGORY_SEEDS order.
+            ordered = [c for c in CATEGORY_SEEDS if c in set(frame["Category"])]
+            leftovers = sorted(set(frame["Category"]) - set(CATEGORY_SEEDS))
+            for category in ordered + leftovers:
+                subset = frame[frame["Category"] == category]
+                if subset.empty:
+                    continue
+                _render_category_section(st, subset, category or "Other Results")
+
+            # ---- Bottom section: ongoing sponsored / promoted deals -------- #
+            st.divider()
+            st.markdown("### 📢 Ongoing Ad & Sponsored Deals")
+            st.caption("Products Flipkart is actively promoting in search "
+                       "results right now, scored against the same benchmarks "
+                       "as everything else — a paid placement is not evidence "
+                       "of a good price.")
+            ads = frame[frame["Sponsored"]].sort_values("Deal Score", ascending=False)
+            if ads.empty:
+                st.info("No sponsored placements were flagged in this scan. "
+                        "Flipkart only marks a subset of listings as ads, and "
+                        "the href-only fallback strategy cannot detect them.")
             else:
-                st.success(f"Captured {len(records)} unique products.")
-                stats = engine.stats.as_dict()
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Products", stats["products_unique"])
-                c2.metric("Pages fetched", stats["pages_fetched"])
-                c3.metric("From cache", stats["pages_from_cache"])
-                c4.metric("Products/sec", stats["products_per_sec"])
+                a1, a2, a3 = st.columns(3)
+                a1.metric("Sponsored products", len(ads))
+                worth = int((ads["Deal Score"] >= 50).sum())
+                a2.metric("Scoring 50+", worth)
+                a3.metric("Median deal score", f"{ads['Deal Score'].median():.1f}")
+                if worth == 0:
+                    st.warning("None of the promoted products clears a deal "
+                               "score of 50 — these placements are advertising, "
+                               "not savings.")
+                _product_table(st, ads, "ads")
+                st.download_button("📥 Download sponsored deals CSV",
+                                   ads.to_csv(index=False).encode("utf-8"),
+                                   file_name="flipkart_sponsored_deals.csv",
+                                   mime="text/csv", key="ads_dl")
 
-                frame = to_dataframe(records, engine.cache)
-                st.dataframe(
-                    frame, use_container_width=True, hide_index=True,
-                    column_config={
-                        "URL": st.column_config.LinkColumn("Link", display_text="Open ↗"),
-                        "Current Price": st.column_config.NumberColumn(format="₹%d"),
-                        "Net Price": st.column_config.NumberColumn(format="₹%d"),
-                        "MRP": st.column_config.NumberColumn(format="₹%d"),
-                        "Deal Score": st.column_config.ProgressColumn(
-                            format="%.1f", min_value=0, max_value=100),
-                    },
-                )
-                st.download_button("📥 Download CSV",
-                                   frame.to_csv(index=False).encode("utf-8"),
-                                   file_name="flipkart_deep_scan.csv", mime="text/csv")
+    # -- BBD Sale ------------------------------------------------------------ #
+    with tab_bbd:
+        st.markdown(f"### 🔥 {BBD_2026['sale_name']}")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Early Bird deals", BBD_2026["early_bird_deals_from"])
+        c2.metric("Early access", BBD_2026["early_access_from"])
+        c3.metric("Public start", BBD_2026["public_start"])
+        days_left = _days_until(BBD_2026["public_start"])
+        c4.metric("Days to sale", days_left if days_left is not None else "—")
+        st.caption(f"Title sponsors: {', '.join(BBD_2026['title_sponsors'])} · "
+                   f"End date {BBD_2026['end_date'] or 'not announced'} · "
+                   f"Deal formats: {', '.join(BBD_2026['deal_formats'])}")
+
+        st.divider()
+
+        with st.expander("📊 Last year — what BBD 2025 actually delivered", expanded=True):
+            st.caption(f"{BBD_2025['sale_name']} opened {BBD_2025['public_start']} "
+                       f"(early access {BBD_2025['early_access_from']}). "
+                       f"{BBD_2025['headline']}")
+            st.dataframe(pd.DataFrame(list(BBD_2025_STATS)),
+                         use_container_width=True, hide_index=True)
+
+        with st.expander("💰 BBD 2025 price floors — your benchmark", expanded=True):
+            st.caption("Published sale prices from last year's 56-model list. "
+                       "If a 2026 'deal' is not clearly below the comparable "
+                       "2025 floor, it is not a real discount.")
+            floors = pd.DataFrame(list(BBD_2025_PRICE_FLOORS))
+            floors["Cut vs MRP"] = (
+                (floors["MRP"] - floors["BBD 2025 Floor"]) / floors["MRP"] * 100
+            ).round(1)
+            st.dataframe(
+                floors.sort_values("Cut vs MRP", ascending=False),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "MRP": st.column_config.NumberColumn(format="₹%d"),
+                    "BBD 2025 Floor": st.column_config.NumberColumn(format="₹%d"),
+                    "Cut vs MRP": st.column_config.ProgressColumn(
+                        format="%.1f%%", min_value=0, max_value=60),
+                })
+
+        with st.expander("🔮 This year — expected BBD 2026 deals", expanded=True):
+            st.caption("Only what Flipkart or credible reporting has actually "
+                       "stated. The Status column separates confirmed fact from "
+                       "teaser from inference.")
+            st.dataframe(pd.DataFrame(list(BBD_2026_EXPECTED)),
+                         use_container_width=True, hide_index=True)
+            st.warning("Flipkart has **not** published category pricing or offer "
+                       "caps for 2026. Treat every specific rupee figure "
+                       "circulating now as speculation until the sale goes live.")
+
+        with st.expander("🧠 How to tell a real discount from an inflated one"):
+            for rule in BBD_BUYER_RULES:
+                st.markdown(f"- {rule}")
+            st.info(RIVAL_NOTE)
+
 
     # -- Offers -------------------------------------------------------------- #
     with tab_offers:
