@@ -11,21 +11,12 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom Styling
-st.markdown("""
-<style>
-    .kpi-metric { background-color: #1e293b; padding: 15px; border-radius: 10px; border-left: 5px solid #38bdf8; }
-    .badge-buy { background-color: #14532d; color: #4ade80; padding: 4px 8px; border-radius: 6px; font-weight: bold; }
-    .badge-wait { background-color: #78350f; color: #fde047; padding: 4px 8px; border-radius: 6px; font-weight: bold; }
-</style>
-""", unsafe_allow_html=True)
-
-# --- EXPANDED 75+ DEEP RESEARCH DEALS DATABASE ---
+# --- EXPANDED 50+ DEEP RESEARCH DEALS DATABASE ---
 RAW_DEALS = [
     # MEN'S FASHION
     {"cat": "Men's Fashion", "product": "Levi's 511 Slim Fit Stretch Jeans", "mrp": 2999, "avg": 1699, "curr": 1056, "atl": 999, "bbd": 949, "vol": "Low", "url": "https://www.flipkart.com/search?q=levis+511+jeans"},
     {"cat": "Men's Fashion", "product": "Louis Philippe 2-Piece Formal Slim Suit", "mrp": 10999, "avg": 8499, "curr": 5390, "atl": 5390, "bbd": 4999, "vol": "Low", "url": "https://www.flipkart.com/search?q=louis+philippe+suits"},
-    {"cat": "Men's Fashion", "product": "U.S. Polo Assn Solid Cotton Polo", "mrp": 1999, "avg: 1399, "curr": 849, "atl": 799, "bbd": 749, "vol": "Medium", "url": "https://www.flipkart.com/search?q=uspa+polo+t+shirt"},
+    {"cat": "Men's Fashion", "product": "U.S. Polo Assn Solid Cotton Polo", "mrp": 1999, "avg": 1399, "curr": 849, "atl": 799, "bbd": 749, "vol": "Medium", "url": "https://www.flipkart.com/search?q=uspa+polo+t+shirt"},
     {"cat": "Men's Fashion", "product": "Flying Machine Slim Tapered Jeans", "mrp": 2599, "avg": 1599, "curr": 899, "atl": 799, "bbd": 749, "vol": "Medium", "url": "https://www.flipkart.com/search?q=flying+machine+jeans"},
     {"cat": "Men's Fashion", "product": "Allen Solly Formal Poplin Shirt", "mrp": 2199, "avg": 1599, "curr": 999, "atl": 899, "bbd": 849, "vol": "Low", "url": "https://www.flipkart.com/search?q=allen+solly+shirt"},
     {"cat": "Men's Fashion", "product": "Peter England Slim Fit Formal Trousers", "mrp": 1799, "avg": 1299, "curr": 749, "atl": 699, "bbd": 649, "vol": "Low", "url": "https://www.flipkart.com/search?q=peter+england+trousers"},
@@ -108,7 +99,7 @@ def process_data(deals, card_mode):
         else:
             verdict = "WAIT"
 
-        # Card math
+        # Card calculations
         inst_10 = min(int(curr * 0.10), 1500)
         cb_5 = int(curr * 0.05)
 
@@ -193,7 +184,6 @@ with tab_visuals:
     col_chart1, col_chart2 = st.columns(2)
 
     with col_chart1:
-        # Chart 1: Real vs Fake MRP Discount by Category
         cat_grp = f_df.groupby("Category")[["Real Discount %", "Fake MRP Disc %"]].mean().reset_index()
         fig1 = go.Figure(data=[
             go.Bar(name='Real Discount % (vs 90d Avg)', x=cat_grp['Category'], y=cat_grp['Real Discount %'], marker_color='#38bdf8'),
@@ -203,7 +193,6 @@ with tab_visuals:
         st.plotly_chart(fig1, use_container_width=True)
 
     with col_chart2:
-        # Chart 2: Average Real Rupee Savings by Category
         fig2 = px.box(
             f_df, x="Category", y="Real Savings", color="Category",
             title="Savings Distribution (₹)", template="plotly_dark", height=400
