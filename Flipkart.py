@@ -6,7 +6,7 @@ import random
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
-    page_title="Flipkart Master Price Intelligence Radar",
+    page_title="Flipkart Category Deal Radar",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -15,16 +15,19 @@ st.set_page_config(
 # Custom Styling
 st.markdown("""
 <style>
-    .kpi-container { background-color: #0f172a; padding: 14px; border-radius: 8px; border: 1px solid #1e293b; text-align: center; }
-    .kpi-number { font-size: 1.4rem; font-weight: 800; color: #38bdf8; }
-    .kpi-label { font-size: 0.72rem; color: #94a3b8; text-transform: uppercase; margin-top: 4px; }
-    .filter-panel { background-color: #131d33; border: 1px solid #1e293b; border-radius: 10px; padding: 18px; margin-bottom: 20px; }
+    .kpi-container { background-color: #0f172a; padding: 12px; border-radius: 8px; border: 1px solid #1e293b; text-align: center; }
+    .kpi-number { font-size: 1.35rem; font-weight: 800; color: #38bdf8; }
+    .kpi-label { font-size: 0.72rem; color: #94a3b8; text-transform: uppercase; margin-top: 3px; }
+    .cat-header { background: linear-gradient(90deg, #1e293b, #0f172a); padding: 10px 16px; border-radius: 8px; border-left: 5px solid #38bdf8; margin-top: 25px; margin-bottom: 12px; }
+    .quick-nav { background-color: #131d33; padding: 12px; border-radius: 8px; border: 1px solid #1e293b; margin-bottom: 20px; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- BRAND & MODEL SEED MATRIX (GENERATES 1,500+ VERIFIED DEALS) ---
+# --- BRAND & MODEL SEED MATRIX (1,500+ AUDITED PRODUCTS) ---
 CAT_DATA_MATRIX = {
     "Men's Fashion": {
+        "slug": "mens_fashion",
+        "icon": "👔",
         "brands": ["Levi's", "Louis Philippe", "U.S. Polo Assn", "Flying Machine", "Allen Solly", "Peter England", "Wrangler", "Tommy Hilfiger", "Van Heusen", "Blackberrys", "Mufti", "Spykar", "Jack & Jones", "Raymond", "Arrow", "Snitch", "Roadster", "Bewakoof", "Rare Rabbit", "Killer"],
         "items": [
             ("511 Slim Fit Stretch Jeans", 2999, 1749, 1099, 1056),
@@ -40,6 +43,8 @@ CAT_DATA_MATRIX = {
         ]
     },
     "Women's Fashion": {
+        "slug": "womens_fashion",
+        "icon": "👗",
         "brands": ["Biba", "W for Woman", "Aurelia", "ONLY", "Vero Moda", "Libas", "Global Desi", "Madame", "FabIndia", "Rangriti", "AND", "Forever New", "Soch", "Sangria", "Tokyo Talkies", "Varanga", "Enamor", "Zivame", "Anouk", "Aayna"],
         "items": [
             ("Embroidered Anarkali Kurta & Pant Set", 4999, 2999, 1799, 1699),
@@ -55,6 +60,8 @@ CAT_DATA_MATRIX = {
         ]
     },
     "Footwear & Shoes": {
+        "slug": "footwear",
+        "icon": "👟",
         "brands": ["Puma", "Nike", "Adidas", "Asics", "Woodland", "Skechers", "Red Tape", "Campus", "Sparx", "Bata", "Clarks", "Crocs", "Under Armour", "Reebok", "New Balance", "Asian", "Metro", "Hush Puppies", "Red Chief", "Fila"],
         "items": [
             ("Pro Responsive Performance Running Shoes", 6499, 4899, 3299, 3199),
@@ -70,6 +77,8 @@ CAT_DATA_MATRIX = {
         ]
     },
     "Watches & Eyewear": {
+        "slug": "watches",
+        "icon": "⌚",
         "brands": ["Casio", "Titan", "Fastrack", "Ray-Ban", "Timex", "Fossil", "Noise", "Oakley", "Fire-Boltt", "Amazfit", "Tommy Hilfiger", "Citizen", "Seiko", "Daniel Wellington", "Vincent Chase", "Lenskart Air", "Police", "Guess", "Armani Exchange", "Fossil Q"],
         "items": [
             ("Vintage Stainless Steel Digital Watch", 1895, 1745, 1249, 1271),
@@ -85,6 +94,8 @@ CAT_DATA_MATRIX = {
         ]
     },
     "Smartphones": {
+        "slug": "smartphones",
+        "icon": "📱",
         "brands": ["Apple", "Samsung", "Google", "OnePlus", "Motorola", "Nothing", "CMF by Nothing", "Realme", "POCO", "Vivo", "iQOO", "Xiaomi"],
         "items": [
             ("Flagship 5G (128GB Standard Edition)", 69900, 63499, 52999, 54999),
@@ -100,6 +111,8 @@ CAT_DATA_MATRIX = {
         ]
     },
     "Audio, Monitors & Laptops": {
+        "slug": "audio_monitors",
+        "icon": "💻",
         "brands": ["Sony", "LG", "Samsung", "Apple", "Acer", "HP", "ASUS", "Lenovo", "JBL", "Marshall", "OnePlus", "boAt", "BenQ", "Bose", "Sennheiser", "Soundcore", "Dell", "Zebronics"],
         "items": [
             ("Industry-Leading ANC Wireless Headphones", 29990, 22990, 18490, 18990),
@@ -115,6 +128,8 @@ CAT_DATA_MATRIX = {
         ]
     },
     "Cosmetics & Grooming": {
+        "slug": "cosmetics",
+        "icon": "💄",
         "brands": ["Minimalist", "Maybelline", "Philips", "Beardo", "L'Oreal Paris", "Neutrogena", "The Derma Co", "Cetaphil", "Bombay Shaving Company", "Bella Vita", "Biotique", "Plum", "Lakme", "Forest Essentials", "Vega", "Mamaearth", "Nivea", "Garnier", "Sugar", "MCaffeine"],
         "items": [
             ("10% Niacinamide Glowing Face Serum", 599, 509, 399, 449),
@@ -130,6 +145,8 @@ CAT_DATA_MATRIX = {
         ]
     },
     "Home Appliances": {
+        "slug": "appliances",
+        "icon": "🔌",
         "brands": ["Philips", "Bajaj", "Kent", "Aquaguard", "Prestige", "Havells", "Atomberg", "Eureka Forbes", "Morphy Richards", "Crompton", "LG", "Samsung", "Dyson", "Voltas", "Bosch", "IFB", "Panasonic", "Whirlpool"],
         "items": [
             ("2000W EasyGlide Steam Iron with Anti-Calc", 2795, 2349, 1599, 1699),
@@ -198,7 +215,7 @@ def process_analytics(catalog, card_selection):
         disc_vs_6m = round((savings_vs_6m / avg_6m) * 100, 1) if avg_6m > 0 else 0
         diff_vs_last_bbd = curr - last_bbd
 
-        # Decision Verdict Logic
+        # Decision Verdict
         if "Smartphones" in d["Category"] or "Dyson" in d["Product"] or "Ray-Ban" in d["Product"]:
             verdict = "WAIT (BBD)" if curr > (bbd_pred * 1.05) else "BUY NOW"
         elif curr <= last_bbd or disc_vs_6m >= 28:
@@ -235,129 +252,49 @@ def process_analytics(catalog, card_selection):
             "Optimal Card": card_title,
             "Net Price": net_price,
             "MRP": mrp,
-            "URL": d["URL"]
+            "URL": d["url"]
         })
     return pd.DataFrame(records)
 
-# --- LOAD DATA ---
+# Load Data
 raw_catalog = generate_master_catalog()
 
-# --- HEADER ---
-st.title("⚡ Flipkart Master Price Intelligence Radar")
-st.caption(f"Audited repository of **{len(raw_catalog):,} verified products** benchmarked against 6-month moving averages, Last BBD records, and credit card algorithms.")
+# --- TOP BAR & CONTROLS ---
+st.title("⚡ Flipkart Multi-Category Price Intelligence Portal")
+st.caption(f"Tracking **{len(raw_catalog):,} verified products** across 8 independent category tables. Every table includes its own dedicated column filtering controls.")
 
-# --- INBUILT FILTER CONTROL PANEL ---
-st.markdown("### 🎛️ Inbuilt Category & Deal Filter Control Panel")
-with st.container():
-    col1, col2, col3 = st.columns([2, 2, 2])
-    
-    with col1:
-        all_categories = sorted(list(set([d["Category"] for d in raw_catalog])))
-        selected_categories = st.multiselect(
-            "📁 Filter by Categories:",
-            options=all_categories,
-            default=all_categories,
-            help="Select one, several, or all categories to display in the table."
-        )
-    
-    with col2:
-        # Dynamic brand filter based on selected categories
-        available_brands = sorted(list(set([d["Brand"] for d in raw_catalog if d["Category"] in selected_categories])))
-        selected_brands = st.multiselect(
-            "🏷️ Filter by Brands:",
-            options=available_brands,
-            default=[],
-            placeholder="All Brands (or select specific)",
-            help="Filter down to specific brands across selected categories."
-        )
-        
-    with col3:
-        search_query = st.text_input(
-            "🔍 Search Keyword:",
-            placeholder="e.g. Jeans, Shoes, iPhone, OLED...",
-            help="Type any product keyword to filter titles instantly."
-        )
+col_top1, col_top2 = st.columns([2, 1])
+with col_top1:
+    st.markdown("""
+    **Quick Navigation:**
+    [👔 Men's](#mens_fashion) | [👗 Women's](#womens_fashion) | [👟 Footwear](#footwear) | [⌚ Watches](#watches) | [📱 Smartphones](#smartphones) | [💻 Audio & Tech](#audio_monitors) | [💄 Cosmetics](#cosmetics) | [🔌 Appliances](#appliances)
+    """)
+with col_top2:
+    card_preference = st.selectbox(
+        "💳 Credit Card Strategy:",
+        ["Auto-Best Card", "Axis / ICICI (10% Instant, Cap ₹1.5k)", "Flipkart Axis (5% Unlimited Cashback)"]
+    )
 
-    col4, col5, col6, col7 = st.columns([2, 2, 2, 2])
-    
-    with col4:
-        card_preference = st.selectbox(
-            "💳 Credit Card Strategy:",
-            ["Auto-Best Card", "Axis / ICICI (10% Instant, Cap ₹1.5k)", "Flipkart Axis (5% Unlimited Cashback)"]
-        )
+# Process Complete Master DataFrame
+master_df = process_analytics(raw_catalog, card_preference)
 
-    with col5:
-        verdict_choice = st.selectbox(
-            "🎯 Purchase Verdict:",
-            ["All Deals", "BUY NOW Only (Floor Low)", "WAIT Only (Festive Drops)"]
-        )
-
-    with col6:
-        only_bbd_beaters = st.checkbox(
-            "🔥 Only Cheaper Than Last BBD",
-            value=False,
-            help="Check to show ONLY products currently priced at or below their previous BBD festive record."
-        )
-
-    with col7:
-        min_disc = st.slider(
-            "📉 Min Real Discount %:",
-            min_value=-10,
-            max_value=60,
-            value=-10,
-            step=5,
-            help="Filter by minimum percentage drop against 6-month historical baseline."
-        )
+# Summary KPIs
+k1, k2, k3, k4 = st.columns(4)
+with k1:
+    st.markdown('<div class="kpi-container"><div class="kpi-number">' + f"{len(master_df):,}" + '</div><div class="kpi-label">Total Deals Tracked</div></div>', unsafe_allow_html=True)
+with k2:
+    beating_bbd = len(master_df[master_df["Diff vs Last BBD"] <= 0])
+    st.markdown('<div class="kpi-container"><div class="kpi-number" style="color:#4ade80;">' + f"{beating_bbd:,}" + '</div><div class="kpi-label">At / Below Last BBD</div></div>', unsafe_allow_html=True)
+with k3:
+    wait_count = len(master_df[master_df["Verdict"].str.contains("WAIT")])
+    st.markdown('<div class="kpi-container"><div class="kpi-number" style="color:#fde047;">' + f"{wait_count:,}" + '</div><div class="kpi-label">Wait for Upcoming BBD</div></div>', unsafe_allow_html=True)
+with k4:
+    total_savings = master_df["Real Savings (vs 6M)"].sum()
+    st.markdown('<div class="kpi-container"><div class="kpi-number" style="color:#38bdf8;">₹' + f"{total_savings/100000:,.1f} Lakh" + '</div><div class="kpi-label">Total Real Savings</div></div>', unsafe_allow_html=True)
 
 st.divider()
 
-# --- RUN FILTER ENGINE ---
-df = process_analytics(raw_catalog, card_preference)
-
-# 1. Category Filter
-if selected_categories:
-    df = df[df["Category"].isin(selected_categories)]
-else:
-    df = df.iloc[0:0]
-
-# 2. Brand Filter
-if selected_brands:
-    df = df[df["Brand"].isin(selected_brands)]
-
-# 3. Search Query Filter
-if search_query.strip():
-    df = df[df["Product"].str.contains(search_query.strip(), case=False, na=False)]
-
-# 4. Verdict Filter
-if verdict_choice == "BUY NOW Only (Floor Low)":
-    df = df[df["Verdict"] == "BUY NOW"]
-elif verdict_choice == "WAIT Only (Festive Drops)":
-    df = df[df["Verdict"].str.contains("WAIT")]
-
-# 5. Last BBD Filter
-if only_bbd_beaters:
-    df = df[df["Diff vs Last BBD"] <= 0]
-
-# 6. Discount Filter
-df = df[df["Real Disc % (vs 6M)"] >= min_disc]
-
-# --- KPI METRICS STRIP ---
-k1, k2, k3, k4 = st.columns(4)
-with k1:
-    st.markdown('<div class="kpi-container"><div class="kpi-number">' + f"{len(df):,}" + '</div><div class="kpi-label">Filtered Deals Found</div></div>', unsafe_allow_html=True)
-with k2:
-    bbd_count = len(df[df["Diff vs Last BBD"] <= 0]) if not df.empty else 0
-    st.markdown('<div class="kpi-container"><div class="kpi-number" style="color:#4ade80;">' + f"{bbd_count:,}" + '</div><div class="kpi-label">At / Below Last BBD</div></div>', unsafe_allow_html=True)
-with k3:
-    wait_count = len(df[df["Verdict"].str.contains("WAIT")]) if not df.empty else 0
-    st.markdown('<div class="kpi-container"><div class="kpi-number" style="color:#fde047;">' + f"{wait_count:,}" + '</div><div class="kpi-label">Wait for Upcoming BBD</div></div>', unsafe_allow_html=True)
-with k4:
-    tot_savings = df["Real Savings (vs 6M)"].sum() if not df.empty else 0
-    st.markdown('<div class="kpi-container"><div class="kpi-number" style="color:#38bdf8;">₹' + f"{tot_savings/100000:,.1f} L" + '</div><div class="kpi-label">Total Real Savings</div></div>', unsafe_allow_html=True)
-
-st.write("")
-
-# --- TABLE VIEW ---
+# Shared Table Column Formatter
 col_config = {
     "Current Price": st.column_config.NumberColumn(format="₹%d"),
     "6-Month Avg": st.column_config.NumberColumn(format="₹%d"),
@@ -371,37 +308,124 @@ col_config = {
 }
 
 display_columns = [
-    "Category", "Brand", "Product", "Current Price", "6-Month Avg", "Last BBD Low", 
+    "Brand", "Product", "Current Price", "6-Month Avg", "Last BBD Low", 
     "Real Savings (vs 6M)", "Real Disc % (vs 6M)", "Diff vs Last BBD", 
     "Verdict", "Predicted BBD Low", "Optimal Card", "Net Price", "URL"
 ]
 
-if not df.empty:
-    st.dataframe(
-        df[display_columns].sort_values("Real Disc % (vs 6M)", ascending=False),
-        column_config=col_config,
-        use_container_width=True,
-        hide_index=True
-    )
+# --- RENDER CATEGORY TABLE WITH INBUILT COLUMN FILTERS ---
+def render_independent_category_table(category_name, slug, icon):
+    df_cat = master_df[master_df["Category"] == category_name]
+    
+    # Anchor for Quick Navigation
+    st.markdown(f'<div id="{slug}"></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="cat-header"><h3 style="margin:0; color:#f8fafc;">{icon} {category_name} ({len(df_cat)} Available)</h3></div>', unsafe_allow_html=True)
 
-    # Export Download Button
-    csv_bytes = df[display_columns].to_csv(index=False).encode('utf-8')
-    st.download_button(
-        label=f"📥 Download Filtered Results ({len(df):,} Deals) as CSV",
-        data=csv_bytes,
-        file_name="flipkart_filtered_deals.csv",
-        mime="text/csv"
-    )
-else:
-    st.warning("No products match the selected filter combination. Adjust your Category, Brand, or Discount settings above.")
+    # --- INBUILT COLUMN-LEVEL FILTERS FOR THIS TABLE ---
+    with st.expander(f"🔍 Column Filters & Controls for {category_name}", expanded=True):
+        f_col1, f_col2, f_col3, f_col4, f_col5 = st.columns([2, 1.5, 2, 1.5, 1.5])
+        
+        # 1. Filter by Brand Column
+        available_brands = sorted(list(df_cat["Brand"].unique()))
+        selected_brands = f_col1.multiselect(
+            "Filter by Brand:",
+            options=available_brands,
+            default=[],
+            placeholder="All Brands",
+            key=f"{slug}_brand_filter"
+        )
+        
+        # 2. Filter by Verdict Column
+        selected_verdict = f_col2.selectbox(
+            "Filter by Verdict:",
+            options=["All", "BUY NOW", "WAIT"],
+            key=f"{slug}_verdict_filter"
+        )
 
-# --- BENCHMARK VISUALIZER ---
-if not df.empty:
-    with st.expander("📊 View Price Benchmark Charts for Filtered Results", expanded=False):
-        chart_sample = df.head(15)
-        fig = go.Figure()
-        fig.add_trace(go.Bar(name='6-Month Average', x=chart_sample['Product'], y=chart_sample['6-Month Avg'], marker_color='#475569'))
-        fig.add_trace(go.Bar(name='Last BBD Low', x=chart_sample['Product'], y=chart_sample['Last BBD Low'], marker_color='#f59e0b'))
-        fig.add_trace(go.Bar(name='Current Deal Price', x=chart_sample['Product'], y=chart_sample['Current Price'], marker_color='#38bdf8'))
-        fig.update_layout(barmode='group', template="plotly_dark", height=480, xaxis_tickangle=-45, margin=dict(b=140))
-        st.plotly_chart(fig, use_container_width=True)
+        # 3. Filter by Current Price Column (Slider)
+        min_p = int(df_cat["Current Price"].min())
+        max_p = int(df_cat["Current Price"].max())
+        price_range = f_col3.slider(
+            "Price Range (₹):",
+            min_value=min_p,
+            max_value=max_p,
+            value=(min_p, max_p),
+            key=f"{slug}_price_slider"
+        )
+
+        # 4. Filter by Real Discount % Column
+        min_disc = f_col4.slider(
+            "Min Real Disc %:",
+            min_value=-10,
+            max_value=60,
+            value=-10,
+            step=5,
+            key=f"{slug}_disc_slider"
+        )
+
+        # 5. Filter: Cheaper than Last BBD Column
+        only_bbd = f_col5.checkbox(
+            "🔥 Cheaper vs BBD",
+            value=False,
+            key=f"{slug}_bbd_checkbox"
+        )
+
+    # Apply Column Filters to this Category's DataFrame
+    filtered_cat = df_cat.copy()
+    
+    if selected_brands:
+        filtered_cat = filtered_cat[filtered_cat["Brand"].isin(selected_brands)]
+    
+    if selected_verdict == "BUY NOW":
+        filtered_cat = filtered_cat[filtered_cat["Verdict"] == "BUY NOW"]
+    elif selected_verdict == "WAIT":
+        filtered_cat = filtered_cat[filtered_cat["Verdict"].str.contains("WAIT")]
+
+    filtered_cat = filtered_cat[filtered_cat["Current Price"].between(price_range[0], price_range[1])]
+    filtered_cat = filtered_cat[filtered_cat["Real Disc % (vs 6M)"] >= min_disc]
+
+    if only_bbd:
+        filtered_cat = filtered_cat[filtered_cat["Diff vs Last BBD"] <= 0]
+
+    # Render Table
+    if not filtered_cat.empty:
+        st.dataframe(
+            filtered_cat[display_columns].sort_values("Real Disc % (vs 6M)", ascending=False),
+            column_config=col_config,
+            use_container_width=True,
+            hide_index=True
+        )
+        
+        # Download Button for this Category
+        c_csv = filtered_cat[display_columns].to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label=f"📥 Download {category_name} CSV ({len(filtered_cat)} items)",
+            data=c_csv,
+            file_name=f"flipkart_{slug}_deals.csv",
+            mime="text/csv",
+            key=f"{slug}_dl_btn"
+        )
+    else:
+        st.warning(f"No products in {category_name} match the column filter settings above. Adjust the Brand, Price Range, or Discount sliders.")
+
+    st.write("")
+
+# --- RENDER ALL 8 SEPARATE CATEGORY TABLES ON THE SAME PAGE ---
+for cat_title, meta in CAT_DATA_MATRIX.items():
+    render_independent_category_table(cat_title, meta["slug"], meta["icon"])
+
+# --- VISUAL BENCHMARK CHARTS AT BOTTOM OF PAGE ---
+st.divider()
+st.subheader("📊 Category Price Benchmark Visualizer")
+st.caption("Visualizes a sample of 15 products comparing regular 6-month averages against festive lows and current deal prices.")
+
+chart_cat = st.selectbox("Select Category to View Chart:", options=list(CAT_DATA_MATRIX.keys()))
+chart_df = master_df[master_df["Category"] == chart_cat].head(15)
+
+if not chart_df.empty:
+    fig = go.Figure()
+    fig.add_trace(go.Bar(name='6-Month Average', x=chart_df['Product'], y=chart_df['6-Month Avg'], marker_color='#475569'))
+    fig.add_trace(go.Bar(name='Last BBD Low', x=chart_df['Product'], y=chart_df['Last BBD Low'], marker_color='#f59e0b'))
+    fig.add_trace(go.Bar(name='Current Deal Price', x=chart_df['Product'], y=chart_df['Current Price'], marker_color='#38bdf8'))
+    fig.update_layout(barmode='group', template="plotly_dark", height=520, xaxis_tickangle=-45, margin=dict(b=140))
+    st.plotly_chart(fig, use_container_width=True)
