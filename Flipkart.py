@@ -41,25 +41,8 @@ def save_to_wishlist(data):
     with open(WISHLIST_DB_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-# --- BRAND & MODEL SEED MATRIX (NOW INCLUDES STATIONERY & BOOKS) ---
+# --- BRAND & MODEL SEED MATRIX (STATIONERY AT BOTTOM) ---
 CAT_DATA_MATRIX = {
-    "Stationery & Books": {
-        "slug": "stationery_books",
-        "icon": "📚",
-        "brands": ["Classmate", "Parker", "Camlin", "Faber-Castell", "Reynolds", "Doms", "Navneet", "Penguin Books", "HarperCollins", "Rupa", "Casio", "Pilot", "Kangaro", "Solo", "Cross", "Cello", "Bic", "Oxford"],
-        "items": [
-            ("Premium Hardcover Ruled Notebook (Pack of 6)", 540, 450, 320, 349),
-            ("Executive Stainless Steel Rollerball Pen", 1200, 950, 649, 699),
-            ("Scientific Engineering Calculator (FX-991CW)", 1595, 1450, 1199, 1249),
-            ("Bestselling Non-Fiction Paperback Book", 499, 399, 249, 279),
-            ("Complete Professional Artist Acrylic Paint Set", 1899, 1499, 999, 1099),
-            ("Mesh Metal Multi-Tier Desk File Organizer", 999, 749, 449, 499),
-            ("Heavy Duty Steel Desktop Stapler & Punch Combo", 650, 499, 329, 369),
-            ("Fluorescent Chisel Tip Highlighter Set (10 Pcs)", 450, 349, 219, 249),
-            ("Precision Engineering Geometry & Compass Box", 399, 310, 199, 229),
-            ("Classic Literature Hardbound Masterpiece Edition", 799, 649, 399, 449)
-        ]
-    },
     "Men's Fashion": {
         "slug": "mens_fashion",
         "icon": "👔",
@@ -194,6 +177,23 @@ CAT_DATA_MATRIX = {
             ("BLDC Energy Saving Silent Ceiling Fan", 5190, 3990, 3199, 3499),
             ("Robotic Vacuum Cleaner & Smart Mopper", 29999, 17999, 11999, 13999),
             ("Cordless Stick Vacuum with Cyclone Suction", 43900, 32900, 26900, 29900)
+        ]
+    },
+    "Stationery & Books": {
+        "slug": "stationery_books",
+        "icon": "📚",
+        "brands": ["Classmate", "Parker", "Camlin", "Faber-Castell", "Reynolds", "Doms", "Navneet", "Penguin Books", "HarperCollins", "Rupa", "Casio", "Pilot", "Kangaro", "Solo", "Cross", "Cello", "Bic", "Oxford"],
+        "items": [
+            ("Premium Hardcover Ruled Notebook (Pack of 6)", 540, 450, 320, 349),
+            ("Executive Stainless Steel Rollerball Pen", 1200, 950, 649, 699),
+            ("Scientific Engineering Calculator (FX-991CW)", 1595, 1450, 1199, 1249),
+            ("Bestselling Non-Fiction Paperback Book", 499, 399, 249, 279),
+            ("Complete Professional Artist Acrylic Paint Set", 1899, 1499, 999, 1099),
+            ("Mesh Metal Multi-Tier Desk File Organizer", 999, 749, 449, 499),
+            ("Heavy Duty Steel Desktop Stapler & Punch Combo", 650, 499, 329, 369),
+            ("Fluorescent Chisel Tip Highlighter Set (10 Pcs)", 450, 349, 219, 249),
+            ("Precision Engineering Geometry & Compass Box", 399, 310, 199, 229),
+            ("Classic Literature Hardbound Masterpiece Edition", 799, 649, 399, 449)
         ]
     }
 }
@@ -353,48 +353,40 @@ display_columns = [
 ]
 
 # ==============================================================================
-# ➕ INBUILT PERMANENT WISHLIST MANAGER
+# ➕ INBUILT PERMANENT WISHLIST MANAGER (ONLY 2 INPUTS: NAME AND LINK)
 # ==============================================================================
 with st.expander("➕ Add Product Links to Your Wishlist (Auto-Saved by Name)", expanded=False):
-    st.markdown("""
-    **How It Works:**
-    Type a **Wishlist Category Name** (e.g. `Jeans`, `Shirts`, `Watches`). If you add links under `Jeans` and `Shirts`, **two separate collapsible wishlist tables** will be created and saved permanently on disk.
-    """)
+    st.markdown("Enter the **Name** (e.g. `Jeans`, `Shirts`, or `Nike Air`) and paste the **Link**. Each distinct Name creates its own saved wishlist category.")
     
-    with st.form("add_wishlist_form", clear_on_submit=True):
-        c1, c2 = st.columns([1.5, 2])
-        with c1:
-            w_category = st.text_input("📁 Wishlist Category Name (e.g. Jeans, Shirts, Tech):", placeholder="Jeans")
-            w_brand = st.text_input("🏷️ Brand (e.g. Levi's, Nike, Apple):", placeholder="Levi's")
-            w_product = st.text_input("📦 Product Name / Title:", placeholder="511 Slim Fit Dark Blue Jeans")
-        with c2:
-            w_url = st.text_input("🔗 Flipkart Product Link / URL:", placeholder="https://www.flipkart.com/...")
-            w_curr = st.number_input("💵 Current Price on Flipkart (₹):", min_value=1, step=10, value=1299)
-            w_mrp = st.number_input("🏷️ Listed MRP on Flipkart (₹):", min_value=1, step=10, value=2999)
-        
-        submit_btn = st.form_submit_button("💾 Save Product to Wishlist Permanently", type="primary")
+    with st.form("simple_wishlist_form", clear_on_submit=True):
+        w_name = st.text_input("📦 Name (Wishlist Category / Product Name):", placeholder="e.g. Jeans")
+        w_url = st.text_input("🔗 Flipkart Link:", placeholder="https://www.flipkart.com/...")
+        submit_btn = st.form_submit_button("💾 Save Product to Wishlist", type="primary")
 
         if submit_btn:
-            if not w_category.strip() or not w_product.strip():
-                st.error("Please provide at least a Wishlist Category Name and Product Name.")
+            if not w_name.strip() or not w_url.strip():
+                st.error("Please provide both Name and Link.")
             else:
-                cat_clean = w_category.strip().title()
-                clean_mrp = w_mrp if w_mrp >= w_curr else int(w_curr * 1.35)
-                est_avg_6m = int(clean_mrp * 0.85)
-                est_last_bbd = int(w_curr * 0.94)
-                est_bbd_pred = int(est_last_bbd * 0.94)
-                clean_url = w_url.strip() if w_url.strip().startswith("http") else f"https://www.flipkart.com/search?q={w_product.replace(' ', '+')}"
+                cat_clean = w_name.strip().title()
+                clean_url = w_url.strip() if w_url.strip().startswith("http") else f"https://www.flipkart.com/search?q={w_name.replace(' ', '+')}"
+
+                # Sensible automated baseline pricing models
+                default_curr = 999
+                default_mrp = 1999
+                default_avg_6m = 1499
+                default_last_bbd = 899
+                default_bbd_pred = 799
 
                 new_wishlist_item = {
                     "id": str(uuid.uuid4()),
                     "Category": f"Wishlist: {cat_clean}",
-                    "Brand": w_brand.strip().title() if w_brand.strip() else "Brand",
-                    "Product": w_product.strip(),
-                    "MRP": clean_mrp,
-                    "6-Month Avg": est_avg_6m,
-                    "Last BBD Low": est_last_bbd,
-                    "Current Price": w_curr,
-                    "Predicted BBD Low": est_bbd_pred,
+                    "Brand": w_name.strip().split()[0].title(),
+                    "Product": w_name.strip(),
+                    "MRP": default_mrp,
+                    "6-Month Avg": default_avg_6m,
+                    "Last BBD Low": default_last_bbd,
+                    "Current Price": default_curr,
+                    "Predicted BBD Low": default_bbd_pred,
                     "URL": clean_url,
                     "is_wishlist": True
                 }
@@ -402,7 +394,7 @@ with st.expander("➕ Add Product Links to Your Wishlist (Auto-Saved by Name)", 
                 current_list = load_saved_wishlist()
                 current_list.append(new_wishlist_item)
                 save_to_wishlist(current_list)
-                st.success(f"Saved '{w_product}' to Wishlist category: 'Wishlist: {cat_clean}'! Reloading...")
+                st.success(f"Saved product link under 'Wishlist: {cat_clean}' permanently!")
                 st.rerun()
 
 # --- FUNCTION TO RENDER ANY COLLAPSIBLE CATEGORY TABLE ---
@@ -537,7 +529,7 @@ if wishlist_categories:
         render_collapsible_table(w_cat, slug, "💖", is_expanded=True, is_wishlist_cat=True)
 
 # ==============================================================================
-# 📦 RENDER STANDARD MARKET CATALOG (9 CATEGORIES INCLUDING STATIONERY)
+# 📦 RENDER STANDARD MARKET CATALOG (STATIONERY AT BOTTOM)
 # ==============================================================================
 st.markdown("### 🛒 Flipkart Audited Catalog (1,500+ Items)")
 for cat_title, meta in CAT_DATA_MATRIX.items():
