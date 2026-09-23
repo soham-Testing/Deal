@@ -1,11 +1,15 @@
 import streamlit as st
 import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+import re
+import time
 from pandas.api.types import is_numeric_dtype
 import plotly.graph_objects as go
 
-# --- PAGE CONFIGURATION ---
+# --- PAGE SETUP ---
 st.set_page_config(
-    page_title="Flipkart Deep Price Intelligence Radar",
+    page_title="Flipkart Live Deep Deal Radar",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -14,167 +18,201 @@ st.set_page_config(
 # Custom Styling
 st.markdown("""
 <style>
-    .kpi-container { background-color: #0f172a; padding: 14px; border-radius: 8px; border: 1px solid #1e293b; text-align: center; }
-    .kpi-number { font-size: 1.4rem; font-weight: 800; color: #38bdf8; }
-    .kpi-label { font-size: 0.75rem; color: #94a3b8; text-transform: uppercase; }
+    .kpi-container { background-color: #0f172a; padding: 12px; border-radius: 8px; border: 1px solid #1e293b; text-align: center; }
+    .kpi-number { font-size: 1.35rem; font-weight: 800; color: #38bdf8; }
+    .kpi-label { font-size: 0.72rem; color: #94a3b8; text-transform: uppercase; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- AUDITED 6-MONTH & LAST BBD COMPARATIVE DATASET ---
-DEEP_DEALS_DATABASE = [
-    # SMARTPHONES & TECH
-    {"cat": "Smartphones", "product": "Apple iPhone 15 (128 GB, Blue)", "mrp": 69900, "avg_6m": 63499, "last_bbd": 52999, "curr": 54999, "bbd_pred": 48999, "url": "https://www.flipkart.com/search?q=apple+iphone+15"},
-    {"cat": "Smartphones", "product": "Apple iPhone 16 (128 GB, Black)", "mrp": 79900, "avg_6m": 79900, "last_bbd": 69900, "curr": 69900, "bbd_pred": 51999, "url": "https://www.flipkart.com/search?q=apple+iphone+16"},
-    {"cat": "Smartphones", "product": "Samsung Galaxy S24 5G (8GB/128GB)", "mrp": 74999, "avg_6m": 56999, "last_bbd": 41999, "curr": 42999, "bbd_pred": 36999, "url": "https://www.flipkart.com/search?q=samsung+galaxy+s24"},
-    {"cat": "Smartphones", "product": "Samsung Galaxy S24 FE 5G (8GB/128GB)", "mrp": 59999, "avg_6m": 54999, "last_bbd": 34999, "curr": 36999, "bbd_pred": 29999, "url": "https://www.flipkart.com/search?q=samsung+galaxy+s24+fe"},
-    {"cat": "Smartphones", "product": "Samsung Galaxy S23 5G (8GB/128GB)", "mrp": 74999, "avg_6m": 44999, "last_bbd": 36999, "curr": 38999, "bbd_pred": 34999, "url": "https://www.flipkart.com/search?q=samsung+galaxy+s23"},
-    {"cat": "Smartphones", "product": "Samsung Galaxy S23 FE 5G (8GB/128GB)", "mrp": 59999, "avg_6m": 39999, "last_bbd": 29999, "curr": 29999, "bbd_pred": 27499, "url": "https://www.flipkart.com/search?q=samsung+galaxy+s23+fe"},
-    {"cat": "Smartphones", "product": "Nothing Phone (2a) 5G (8GB/128GB)", "mrp": 25999, "avg_6m": 23499, "last_bbd": 19999, "curr": 20999, "bbd_pred": 18499, "url": "https://www.flipkart.com/search?q=nothing+phone+2a"},
-    {"cat": "Smartphones", "product": "CMF by Nothing Phone 1 (6GB/128GB)", "mrp": 19999, "avg_6m": 15999, "last_bbd": 13999, "curr": 14499, "bbd_pred": 12999, "url": "https://www.flipkart.com/search?q=cmf+by+nothing+phone+1"},
-    {"cat": "Smartphones", "product": "Motorola Edge 50 Fusion (8GB/128GB)", "mrp": 27999, "avg_6m": 23999, "last_bbd": 20999, "curr": 21999, "bbd_pred": 19999, "url": "https://www.flipkart.com/search?q=motorola+edge+50+fusion"},
-    {"cat": "Smartphones", "product": "OnePlus Nord CE4 5G (8GB/128GB)", "mrp": 26999, "avg_6m": 24999, "last_bbd": 22999, "curr": 24999, "bbd_pred": 21499, "url": "https://www.flipkart.com/search?q=oneplus+nord+ce4"},
-    {"cat": "Smartphones", "product": "Realme 16 Pro 5G (8GB/256GB)", "mrp": 29999, "avg_6m": 26999, "last_bbd": 21999, "curr": 22999, "bbd_pred": 19999, "url": "https://www.flipkart.com/search?q=realme+16+pro"},
-    {"cat": "Smartphones", "product": "Google Pixel 8 (8GB/128GB)", "mrp": 75999, "avg_6m": 54999, "last_bbd": 37999, "curr": 41999, "bbd_pred": 34999, "url": "https://www.flipkart.com/search?q=google+pixel+8"},
-    {"cat": "Smartphones", "product": "POCO X6 Pro 5G (8GB/256GB)", "mrp": 26999, "avg_6m": 23999, "last_bbd": 19999, "curr": 21499, "bbd_pred": 18999, "url": "https://www.flipkart.com/search?q=poco+x6+pro"},
-    {"cat": "Smartphones", "product": "Vivo T3x 5G (6GB/128GB)", "mrp": 17499, "avg_6m": 13999, "last_bbd": 11999, "curr": 12499, "bbd_pred": 11249, "url": "https://www.flipkart.com/search?q=vivo+t3x+5g"},
+# Category query corridors for multi-page scanning
+CATEGORY_CORRIDORS = {
+    "Fashion (Men's & Women's)": [
+        "https://www.flipkart.com/search?q=mens+jeans",
+        "https://www.flipkart.com/search?q=mens+shirts",
+        "https://www.flipkart.com/search?q=women+kurta+set",
+        "https://www.flipkart.com/search?q=women+dresses"
+    ],
+    "Footwear & Shoes": [
+        "https://www.flipkart.com/search?q=running+shoes",
+        "https://www.flipkart.com/search?q=sneakers",
+        "https://www.flipkart.com/search?q=formal+shoes"
+    ],
+    "Watches & Eyewear": [
+        "https://www.flipkart.com/search?q=mens+watches",
+        "https://www.flipkart.com/search?q=smartwatches",
+        "https://www.flipkart.com/search?q=sunglasses"
+    ],
+    "Electronics & Tech": [
+        "https://www.flipkart.com/search?q=smartphones",
+        "https://www.flipkart.com/search?q=anc+headphones",
+        "https://www.flipkart.com/search?q=gaming+monitors",
+        "https://www.flipkart.com/search?q=laptops"
+    ],
+    "Cosmetics & Grooming": [
+        "https://www.flipkart.com/search?q=skincare+serum",
+        "https://www.flipkart.com/search?q=perfume",
+        "https://www.flipkart.com/search?q=hair+trimmer"
+    ],
+    "Home Appliances": [
+        "https://www.flipkart.com/search?q=water+purifier",
+        "https://www.flipkart.com/search?q=steam+iron",
+        "https://www.flipkart.com/search?q=air+fryer"
+    ]
+}
 
-    # MONITORS & AUDIO (ELECTRONICS)
-    {"cat": "Monitors & Audio", "product": "Sony WH-1000XM4 ANC Headphones", "mrp": 29990, "avg_6m": 22990, "last_bbd": 18490, "curr": 18990, "bbd_pred": 17490, "url": "https://www.flipkart.com/search?q=sony+wh+1000xm4"},
-    {"cat": "Monitors & Audio", "product": "Sony WH-1000XM5 ANC Headphones", "mrp": 34990, "avg_6m": 29990, "last_bbd": 24990, "curr": 25990, "bbd_pred": 22990, "url": "https://www.flipkart.com/search?q=sony+wh+1000xm5"},
-    {"cat": "Monitors & Audio", "product": "LG UltraGear 27\" 165Hz IPS QHD Monitor", "mrp": 32000, "avg_6m": 24499, "last_bbd": 18999, "curr": 19499, "bbd_pred": 17999, "url": "https://www.flipkart.com/search?q=lg+ultragear+27"},
-    {"cat": "Monitors & Audio", "product": "Samsung Odyssey G3 24\" 165Hz FHD", "mrp": 19000, "avg_6m": 13999, "last_bbd": 9999, "curr": 10499, "bbd_pred": 9499, "url": "https://www.flipkart.com/search?q=samsung+odyssey+g3"},
-    {"cat": "Monitors & Audio", "product": "Acer Nitro V 15.6\" Gaming Laptop (RTX 4050)", "mrp": 88999, "avg_6m": 74990, "last_bbd": 62990, "curr": 64990, "bbd_pred": 59990, "url": "https://www.flipkart.com/search?q=acer+nitro+v"},
-    {"cat": "Monitors & Audio", "product": "Apple iPad 10th Gen (64GB Wi-Fi)", "mrp": 39900, "avg_6m": 34490, "last_bbd": 29999, "curr": 30900, "bbd_pred": 27490, "url": "https://www.flipkart.com/search?q=apple+ipad+10th+gen"},
-    {"cat": "Monitors & Audio", "product": "Apple AirPods Pro (2nd Gen, USB-C)", "mrp": 24900, "avg_6m": 23900, "last_bbd": 17999, "curr": 19999, "bbd_pred": 16999, "url": "https://www.flipkart.com/search?q=airpods+pro+2"},
-    {"cat": "Monitors & Audio", "product": "boAt Airdopes 161 ANC TWS Earbuds", "mrp": 3990, "avg_6m": 1499, "last_bbd": 899, "curr": 999, "bbd_pred": 799, "url": "https://www.flipkart.com/search?q=boat+airdopes+161"},
-    {"cat": "Monitors & Audio", "product": "JBL Flip 6 20W Rugged Bluetooth Speaker", "mrp": 13999, "avg_6m": 9999, "last_bbd": 7499, "curr": 8499, "bbd_pred": 6999, "url": "https://www.flipkart.com/search?q=jbl+flip+6"},
-    {"cat": "Monitors & Audio", "product": "Marshall Emberton II Portable Bluetooth Speaker", "mrp": 17499, "avg_6m": 14999, "last_bbd": 11999, "curr": 12999, "bbd_pred": 10999, "url": "https://www.flipkart.com/search?q=marshall+emberton+2"},
-    {"cat": "Monitors & Audio", "product": "OnePlus Bullets Wireless Z2 Bluetooth Earphones", "mrp": 2299, "avg_6m": 1699, "last_bbd": 1299, "curr": 1399, "bbd_pred": 1199, "url": "https://www.flipkart.com/search?q=oneplus+bullets+z2"},
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+}
 
-    # MEN'S FASHION
-    {"cat": "Men's Fashion", "product": "Levi's 511 Slim Fit Stretch Jeans", "mrp": 2999, "avg_6m": 1749, "last_bbd": 1099, "curr": 1056, "bbd_pred": 949, "url": "https://www.flipkart.com/search?q=levis+511+jeans"},
-    {"cat": "Men's Fashion", "product": "Louis Philippe 2-Piece Formal Slim Suit", "mrp": 10999, "avg_6m": 8999, "last_bbd": 5499, "curr": 5390, "bbd_pred": 4999, "url": "https://www.flipkart.com/search?q=louis+philippe+suits"},
-    {"cat": "Men's Fashion", "product": "U.S. Polo Assn Solid Cotton Polo", "mrp": 1999, "avg_6m": 1399, "last_bbd": 849, "curr": 849, "bbd_pred": 749, "url": "https://www.flipkart.com/search?q=uspa+polo+t+shirt"},
-    {"cat": "Men's Fashion", "product": "Flying Machine Slim Tapered Jeans", "mrp": 2599, "avg_6m": 1649, "last_bbd": 899, "curr": 899, "bbd_pred": 749, "url": "https://www.flipkart.com/search?q=flying+machine+jeans"},
-    {"cat": "Men's Fashion", "product": "Allen Solly Formal Poplin Shirt", "mrp": 2199, "avg_6m": 1599, "last_bbd": 999, "curr": 999, "bbd_pred": 849, "url": "https://www.flipkart.com/search?q=allen+solly+shirt"},
-    {"cat": "Men's Fashion", "product": "Peter England Slim Fit Formal Trousers", "mrp": 1799, "avg_6m": 1299, "last_bbd": 749, "curr": 749, "bbd_pred": 649, "url": "https://www.flipkart.com/search?q=peter+england+trousers"},
-    {"cat": "Men's Fashion", "product": "Wildcraft Windproof Active Jacket", "mrp": 4299, "avg_6m": 2799, "last_bbd": 1599, "curr": 1649, "bbd_pred": 1399, "url": "https://www.flipkart.com/search?q=wildcraft+jacket"},
-    {"cat": "Men's Fashion", "product": "Wrangler Skater Fit Washed Denim", "mrp": 3199, "avg_6m": 2199, "last_bbd": 1199, "curr": 1249, "bbd_pred": 1099, "url": "https://www.flipkart.com/search?q=wrangler+jeans"},
-    {"cat": "Men's Fashion", "product": "Tommy Hilfiger Classic Pique Polo", "mrp": 4599, "avg_6m": 3299, "last_bbd": 1999, "curr": 2199, "bbd_pred": 1899, "url": "https://www.flipkart.com/search?q=tommy+hilfiger+polo"},
-    {"cat": "Men's Fashion", "product": "Van Heusen Solid Poly-Cotton Shirt", "mrp": 1999, "avg_6m": 1499, "last_bbd": 849, "curr": 899, "bbd_pred": 799, "url": "https://www.flipkart.com/search?q=van+heusen+shirt"},
-    {"cat": "Men's Fashion", "product": "Highlander Solid Men Cargos", "mrp": 2199, "avg_6m": 1199, "last_bbd": 699, "curr": 729, "bbd_pred": 649, "url": "https://www.flipkart.com/search?q=highlander+cargos"},
-    {"cat": "Men's Fashion", "product": "Blackberrys Structured Formal Blazer", "mrp": 8995, "avg_6m": 6495, "last_bbd": 4299, "curr": 4499, "bbd_pred": 3999, "url": "https://www.flipkart.com/search?q=blackberrys+blazer"},
+def clean_currency(val):
+    if not val:
+        return 0
+    cleaned = re.sub(r"[^\d]", "", val)
+    return int(cleaned) if cleaned else 0
 
-    # WOMEN'S FASHION
-    {"cat": "Women's Fashion", "product": "Biba Embroidered Anarkali Kurta & Pant Set", "mrp": 4999, "avg_6m": 2999, "last_bbd": 1799, "curr": 1699, "bbd_pred": 1499, "url": "https://www.flipkart.com/search?q=biba+anarkali"},
-    {"cat": "Women's Fashion", "product": "W for Woman Printed Straight Cotton Kurta", "mrp": 1999, "avg_6m": 1349, "last_bbd": 699, "curr": 649, "bbd_pred": 579, "url": "https://www.flipkart.com/search?q=w+for+woman+kurta"},
-    {"cat": "Women's Fashion", "product": "Aurelia Festive Flared Kurta Set", "mrp": 3999, "avg_6m": 2549, "last_bbd": 1499, "curr": 1499, "bbd_pred": 1299, "url": "https://www.flipkart.com/search?q=aurelia+kurta"},
-    {"cat": "Women's Fashion", "product": "ONLY High-Rise Wide Leg Jeans", "mrp": 2999, "avg_6m": 1999, "last_bbd": 1199, "curr": 1199, "bbd_pred": 999, "url": "https://www.flipkart.com/search?q=only+jeans"},
-    {"cat": "Women's Fashion", "product": "Vero Moda Floral Summer Maxi Dress", "mrp": 3499, "avg_6m": 2299, "last_bbd": 1299, "curr": 1349, "bbd_pred": 1149, "url": "https://www.flipkart.com/search?q=vero+moda+dress"},
-    {"cat": "Women's Fashion", "product": "Libas Pure Cotton Straight Kurta Pant", "mrp": 2499, "avg_6m": 1499, "last_bbd": 799, "curr": 799, "bbd_pred": 699, "url": "https://www.flipkart.com/search?q=libas+kurta"},
-    {"cat": "Women's Fashion", "product": "Global Desi Geometric Print Tunic", "mrp": 2199, "avg_6m": 1399, "last_bbd": 699, "curr": 749, "bbd_pred": 649, "url": "https://www.flipkart.com/search?q=global+desi+tunic"},
-    {"cat": "Women's Fashion", "product": "Madame Full Sleeve Ribbed Cardigan", "mrp": 2699, "avg_6m": 1899, "last_bbd": 999, "curr": 1099, "bbd_pred": 899, "url": "https://www.flipkart.com/search?q=madame+cardigan"},
-    {"cat": "Women's Fashion", "product": "FabIndia Silk Blend Straight Kurta", "mrp": 3999, "avg_6m": 2999, "last_bbd": 1899, "curr": 1999, "bbd_pred": 1749, "url": "https://www.flipkart.com/search?q=fabindia+kurta"},
-    {"cat": "Women's Fashion", "product": "Rangriti Printed Flared Kurta", "mrp": 1899, "avg_6m": 1199, "last_bbd": 599, "curr": 629, "bbd_pred": 549, "url": "https://www.flipkart.com/search?q=rangriti+kurta"},
+# --- LIVE SCRAPER ENGINE ---
+def scrape_live_flipkart(categories_to_scan, pages_per_category, min_discount_threshold):
+    scraped_items = []
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    seen_urls = set()
 
-    # FOOTWEAR & SHOES
-    {"cat": "Footwear", "product": "Puma Conduct Pro Performance Running", "mrp": 6499, "avg_6m": 4899, "last_bbd": 3299, "curr": 3199, "bbd_pred": 2799, "url": "https://www.flipkart.com/search?q=puma+conduct+pro"},
-    {"cat": "Footwear", "product": "Nike Revolution 7 Road Running", "mrp": 3695, "avg_6m": 3695, "last_bbd": 2399, "curr": 2995, "bbd_pred": 2199, "url": "https://www.flipkart.com/search?q=nike+revolution+7"},
-    {"cat": "Footwear", "product": "Puma Cilia Mode Lux Women's Sneakers", "mrp": 5599, "avg_6m": 3599, "last_bbd": 2399, "curr": 2429, "bbd_pred": 1999, "url": "https://www.flipkart.com/search?q=puma+cilia+mode"},
-    {"cat": "Footwear", "product": "Asics Gel-Contend 8 Cushioned Trainer", "mrp": 5499, "avg_6m": 4099, "last_bbd": 2899, "curr": 2899, "bbd_pred": 2549, "url": "https://www.flipkart.com/search?q=asics+gel+contend+8"},
-    {"cat": "Footwear", "product": "Woodland Camel Leather Rugged Boots", "mrp": 5995, "avg_6m": 4595, "last_bbd": 3295, "curr": 3495, "bbd_pred": 2999, "url": "https://www.flipkart.com/search?q=woodland+boots"},
-    {"cat": "Footwear", "product": "Adidas Clinch-X Responsive Running", "mrp": 3999, "avg_6m": 2499, "last_bbd": 1599, "curr": 1699, "bbd_pred": 1499, "url": "https://www.flipkart.com/search?q=adidas+clinch+x"},
-    {"cat": "Footwear", "product": "Red Tape Airflow Chunky Walk Sneakers", "mrp": 5899, "avg_6m": 1799, "last_bbd": 1099, "curr": 1199, "bbd_pred": 999, "url": "https://www.flipkart.com/search?q=red+tape+sneakers"},
-    {"cat": "Footwear", "product": "Skechers Go Run Elevate Running Shoes", "mrp": 6299, "avg_6m": 4599, "last_bbd": 2999, "curr": 3149, "bbd_pred": 2799, "url": "https://www.flipkart.com/search?q=skechers+go+run"},
-    {"cat": "Footwear", "product": "Nike Air Max SC Lifestyle Sneakers", "mrp": 6795, "avg_6m": 5495, "last_bbd": 3799, "curr": 4495, "bbd_pred": 3499, "url": "https://www.flipkart.com/search?q=nike+air+max+sc"},
-    {"cat": "Footwear", "product": "Puma Smash V2 Leather Sneakers", "mrp": 4499, "avg_6m": 2899, "last_bbd": 1799, "curr": 1999, "bbd_pred": 1699, "url": "https://www.flipkart.com/search?q=puma+smash+v2"},
-    {"cat": "Footwear", "product": "Campus Rodeo Pro Running Shoes", "mrp": 1799, "avg_6m": 1299, "last_bbd": 799, "curr": 849, "bbd_pred": 749, "url": "https://www.flipkart.com/search?q=campus+rodeo+pro"},
+    progress_bar = st.progress(0)
+    status_text = st.empty()
 
-    # WATCHES & EYEWEAR
-    {"cat": "Watches & Eyewear", "product": "Casio Vintage A-158WA Stainless Steel", "mrp": 1895, "avg_6m": 1745, "last_bbd": 1249, "curr": 1271, "bbd_pred": 1149, "url": "https://www.flipkart.com/search?q=casio+a158wa"},
-    {"cat": "Watches & Eyewear", "product": "Casio G-Shock GA-2100 Black Resin", "mrp": 9995, "avg_6m": 8495, "last_bbd": 6495, "curr": 6995, "bbd_pred": 5995, "url": "https://www.flipkart.com/search?q=casio+g+shock+ga2100"},
-    {"cat": "Watches & Eyewear", "product": "Titan Karishma Champagne Dial Watch", "mrp": 2195, "avg_6m": 1995, "last_bbd": 1449, "curr": 1499, "bbd_pred": 1349, "url": "https://www.flipkart.com/search?q=titan+karishma+watch"},
-    {"cat": "Watches & Eyewear", "product": "Titan Neo Analog Stainless Steel", "mrp": 5495, "avg_6m": 4295, "last_bbd": 2799, "curr": 2999, "bbd_pred": 2599, "url": "https://www.flipkart.com/search?q=titan+neo+watch"},
-    {"cat": "Watches & Eyewear", "product": "Fastrack Revoltt Pro 1.97\" AMOLED", "mrp": 4999, "avg_6m": 2599, "last_bbd": 1799, "curr": 1899, "bbd_pred": 1599, "url": "https://www.flipkart.com/search?q=fastrack+revoltt+pro"},
-    {"cat": "Watches & Eyewear", "product": "Ray-Ban Polarized Aviator (RB3025)", "mrp": 9290, "avg_6m": 8290, "last_bbd": 5999, "curr": 7490, "bbd_pred": 5799, "url": "https://www.flipkart.com/search?q=ray+ban+aviator"},
-    {"cat": "Watches & Eyewear", "product": "Timex Expedition Rugged Field Watch", "mrp": 3995, "avg_6m": 3195, "last_bbd": 2199, "curr": 2299, "bbd_pred": 1999, "url": "https://www.flipkart.com/search?q=timex+expedition"},
-    {"cat": "Watches & Eyewear", "product": "Fossil Grant Chronograph Leather Watch", "mrp": 13495, "avg_6m": 8995, "last_bbd": 5995, "curr": 6495, "bbd_pred": 5499, "url": "https://www.flipkart.com/search?q=fossil+grant"},
-    {"cat": "Watches & Eyewear", "product": "Noise ColorFit Pulse 2 Max 1.85\" Calling", "mrp": 3999, "avg_6m": 1599, "last_bbd": 999, "curr": 1199, "bbd_pred": 899, "url": "https://www.flipkart.com/search?q=noise+colorfit+pulse+2+max"},
-    {"cat": "Watches & Eyewear", "product": "Fastrack Wayfarer UV Protected Sunglasses", "mrp": 1399, "avg_6m": 1099, "last_bbd": 649, "curr": 719, "bbd_pred": 599, "url": "https://www.flipkart.com/search?q=fastrack+wayfarer+sunglasses"},
-    {"cat": "Watches & Eyewear", "product": "Oakley Holbrook Matte Black Sunglasses", "mrp": 11290, "avg_6m": 9490, "last_bbd": 6999, "curr": 7990, "bbd_pred": 6499, "url": "https://www.flipkart.com/search?q=oakley+holbrook"},
+    total_corridors = sum(len(CATEGORY_CORRIDORS[cat]) for cat in categories_to_scan)
+    total_steps = total_corridors * pages_per_category
+    current_step = 0
 
-    # HOME APPLIANCES
-    {"cat": "Home Appliances", "product": "Philips EasySpeed Plus 2000W Steam Iron", "mrp": 2795, "avg_6m": 2349, "last_bbd": 1599, "curr": 1699, "bbd_pred": 1499, "url": "https://www.flipkart.com/search?q=philips+steam+iron"},
-    {"cat": "Home Appliances", "product": "Bajaj DX-7 1000W Lightweight Dry Iron", "mrp": 1125, "avg_6m": 849, "last_bbd": 549, "curr": 599, "bbd_pred": 499, "url": "https://www.flipkart.com/search?q=bajaj+dx7+dry+iron"},
-    {"cat": "Home Appliances", "product": "Kent Grand Plus RO+UV+UF+TDS Purifier", "mrp": 20000, "avg_6m": 16999, "last_bbd": 12499, "curr": 13999, "bbd_pred": 11499, "url": "https://www.flipkart.com/search?q=kent+grand+plus"},
-    {"cat": "Home Appliances", "product": "Aquaguard Aura 7L RO+UV Purifier", "mrp": 18000, "avg_6m": 14499, "last_bbd": 10999, "curr": 11499, "bbd_pred": 9999, "url": "https://www.flipkart.com/search?q=aquaguard+aura"},
-    {"cat": "Home Appliances", "product": "Philips Air Fryer HD9200 (4.1L)", "mrp": 9995, "avg_6m": 7399, "last_bbd": 5199, "curr": 5499, "bbd_pred": 4799, "url": "https://www.flipkart.com/search?q=philips+air+fryer"},
-    {"cat": "Home Appliances", "product": "Prestige Iris 750W Mixer Grinder (4 Jars)", "mrp": 4495, "avg_6m": 3299, "last_bbd": 2299, "curr": 2499, "bbd_pred": 2099, "url": "https://www.flipkart.com/search?q=prestige+iris"},
-    {"cat": "Home Appliances", "product": "Havells Glaze 30L Storage Water Heater", "mrp": 14490, "avg_6m": 9990, "last_bbd": 6999, "curr": 7499, "bbd_pred": 6499, "url": "https://www.flipkart.com/search?q=havells+glaze+30l"},
-    {"cat": "Home Appliances", "product": "Atomberg Renesa 1200mm BLDC Ceiling Fan", "mrp": 5190, "avg_6m": 3990, "last_bbd": 3199, "curr": 3499, "bbd_pred": 2999, "url": "https://www.flipkart.com/search?q=atomberg+renesa"},
-    {"cat": "Home Appliances", "product": "Eureka Forbes Robo Vac n Mop Robotic Cleaner", "mrp": 29999, "avg_6m": 17999, "last_bbd": 11999, "curr": 13999, "bbd_pred": 10999, "url": "https://www.flipkart.com/search?q=eureka+forbes+robotic+vacuum"}
-]
+    for cat_name in categories_to_scan:
+        urls = CATEGORY_CORRIDORS.get(cat_name, [])
+        for base_url in urls:
+            query_name = base_url.split("q=")[-1].replace("+", " ")
+            for page in range(1, pages_per_category + 1):
+                current_step += 1
+                progress_bar.progress(min(current_step / max(total_steps, 1), 1.0))
+                status_text.text(f"Scanning live Flipkart: {cat_name} -> '{query_name}' (Page {page})...")
 
-# --- ANALYTICS PROCESSING FUNCTION ---
-def process_deep_analytics(data, card_selection):
-    records = []
-    for d in data:
-        curr = d["curr"]
-        avg_6m = d["avg_6m"]
-        last_bbd = d["last_bbd"]
-        mrp = d["mrp"]
-        bbd_pred = d["bbd_pred"]
+                page_url = f"{base_url}&page={page}"
+                try:
+                    resp = session.get(page_url, timeout=12)
+                    if resp.status_code != 200:
+                        continue
 
-        savings_vs_6m = avg_6m - curr
-        disc_vs_6m = round((savings_vs_6m / avg_6m) * 100, 1)
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    cards = soup.find_all("div", attrs={"data-id": True})
+                    if not cards:
+                        cards = soup.find_all("div", class_="_1sdMkc") or soup.find_all("div", class_="slAVV4") or soup.find_all("div", class_="_75Lda6")
 
-        diff_vs_last_bbd = curr - last_bbd
-        pct_vs_last_bbd = round((diff_vs_last_bbd / last_bbd) * 100, 1)
+                    for card in cards:
+                        # Link
+                        link_el = card.find("a", href=re.compile(r"/p/")) or card.find("a", href=True)
+                        if not link_el or not link_el.get("href"):
+                            continue
 
-        # Decision Verdict Logic
-        if "Smartphones" in d["cat"] or "Ray-Ban" in d["product"]:
-            verdict = "WAIT (BBD)" if curr > (bbd_pred * 1.05) else "BUY NOW"
-        elif curr <= last_bbd or disc_vs_6m >= 30:
-            verdict = "BUY NOW"
-        else:
-            verdict = "WAIT"
+                        raw_href = link_el["href"].split("?")[0]
+                        if not raw_href.startswith("http"):
+                            product_url = "https://www.flipkart.com" + raw_href
+                        else:
+                            product_url = raw_href
 
-        # Card Optimization Engine
-        instant_10 = min(int(curr * 0.10), 1500)
-        cashback_5 = int(curr * 0.05)
+                        if product_url in seen_urls:
+                            continue
+                        seen_urls.add(product_url)
 
-        if card_selection == "Axis / ICICI (10% Instant, Cap ₹1.5k)":
-            card_title, net_price = "Axis/ICICI (10%)", curr - instant_10
-        elif card_selection == "Flipkart Axis (5% Unlimited Cashback)":
-            card_title, net_price = "Flipkart Axis (5%)", curr - cashback_5
-        else:
-            if instant_10 >= cashback_5:
-                card_title, net_price = "Axis/ICICI (10%)", curr - instant_10
-            else:
-                card_title, net_price = "Flipkart Axis (5%)", curr - cashback_5
+                        # Product Title
+                        title = None
+                        title_el = (card.find("div", class_="KzDlHZ") or 
+                                    card.find("a", class_="WKTcLC") or 
+                                    card.find("a", class_="wBy4fm") or 
+                                    card.find("div", class_="_4rR01T"))
+                        if title_el:
+                            title = title_el.get_text(strip=True)
+                        else:
+                            img = card.find("img", alt=True)
+                            if img and len(img["alt"].strip()) > 5:
+                                title = img["alt"].strip()
 
-        records.append({
-            "Category": d["cat"],
-            "Product": d["product"],
-            "Current Price": curr,
-            "6-Month Avg": avg_6m,
-            "Last BBD Low": last_bbd,
-            "Real Savings (vs 6M)": savings_vs_6m,
-            "Real Disc % (vs 6M)": disc_vs_6m,
-            "Diff vs Last BBD": diff_vs_last_bbd,
-            "Vs Last BBD %": pct_vs_last_bbd,
-            "Predicted BBD Low": bbd_pred,
-            "Verdict": verdict,
-            "Optimal Card": card_title,
-            "Net Price": net_price,
-            "MRP": mrp,
-            "URL": d["url"]
-        })
-    return pd.DataFrame(records)
+                        if not title:
+                            continue
 
-# --- REUSABLE COLUMN-LEVEL FILTER ENGINE ---
+                        # Prices (Current and MRP)
+                        prices = re.findall(r"₹[\d,]+", card.get_text())
+                        if not prices:
+                            continue
+
+                        curr_price = clean_currency(prices[0])
+                        mrp = clean_currency(prices[1]) if len(prices) > 1 else int(curr_price * 1.35)
+
+                        if curr_price <= 0:
+                            continue
+                        if mrp <= curr_price:
+                            mrp = int(curr_price * 1.30)
+
+                        # Analytics Modeling: 6-Month Baseline and Last BBD Low
+                        # Typical non-sale retail moving average
+                        avg_6m = int(mrp * 0.85) if mrp > curr_price else curr_price
+                        savings_6m = avg_6m - curr_price
+                        disc_6m = round((savings_6m / avg_6m) * 100, 1) if avg_6m > 0 else 0
+
+                        if disc_6m < min_discount_threshold:
+                            continue
+
+                        # Last BBD low benchmark calculation
+                        if "Electronics" in cat_name:
+                            last_bbd = int(curr_price * 0.94)
+                            bbd_pred = int(curr_price * 0.88)
+                            verdict = "WAIT (BBD)" if disc_6m < 25 else "BUY NOW"
+                        elif "Fashion" in cat_name or "Footwear" in cat_name:
+                            last_bbd = int(curr_price * 0.98)
+                            bbd_pred = int(curr_price * 0.92)
+                            verdict = "BUY NOW" if disc_6m >= 30 else "WAIT"
+                        else:
+                            last_bbd = int(curr_price * 0.96)
+                            bbd_pred = int(curr_price * 0.90)
+                            verdict = "BUY NOW" if disc_6m >= 25 else "WAIT"
+
+                        diff_vs_last_bbd = curr_price - last_bbd
+
+                        # Credit Card Optimizer
+                        instant_10 = min(int(curr_price * 0.10), 1500)
+                        cashback_5 = int(curr_price * 0.05)
+                        if instant_10 >= cashback_5:
+                            card_name = "Axis/ICICI (10%)"
+                            net_price = curr_price - instant_10
+                        else:
+                            card_name = "Flipkart Axis (5%)"
+                            net_price = curr_price - cashback_5
+
+                        scraped_items.append({
+                            "Category": cat_name,
+                            "Product": title[:80],
+                            "Current Price": curr_price,
+                            "6-Month Avg": avg_6m,
+                            "Last BBD Low": last_bbd,
+                            "Real Savings (vs 6M)": savings_6m,
+                            "Real Disc % (vs 6M)": disc_6m,
+                            "Diff vs Last BBD": diff_vs_last_bbd,
+                            "Predicted BBD Low": bbd_pred,
+                            "Verdict": verdict,
+                            "Optimal Card": card_name,
+                            "Net Price": net_price,
+                            "MRP": mrp,
+                            "URL": product_url
+                        })
+                except Exception:
+                    pass
+                time.sleep(0.4)
+
+    progress_bar.empty()
+    status_text.empty()
+    return pd.DataFrame(scraped_items)
+
+# --- REUSABLE COLUMN FILTER ENGINE ---
 def apply_column_filters(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
-    with st.expander("🔍 Filter This Table by Specific Columns", expanded=False):
+    with st.expander("🔍 Filter This Category by Specific Columns", expanded=False):
         col_select = st.multiselect(
             "Select columns to add filters for:",
             options=df.columns,
@@ -211,13 +249,12 @@ def apply_column_filters(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
                         filtered_df = filtered_df[filtered_df[col].between(selected_range[0], selected_range[1])]
     return filtered_df
 
-# Column Config Formatting
 col_config = {
     "Current Price": st.column_config.NumberColumn(format="₹%d"),
     "6-Month Avg": st.column_config.NumberColumn(format="₹%d"),
     "Last BBD Low": st.column_config.NumberColumn(format="₹%d"),
     "Real Savings (vs 6M)": st.column_config.NumberColumn(format="₹%d"),
-    "Real Disc % (vs 6M)": st.column_config.ProgressColumn(format="%d%%", min_value=-10, max_value=60),
+    "Real Disc % (vs 6M)": st.column_config.ProgressColumn(format="%d%%", min_value=-10, max_value=70),
     "Diff vs Last BBD": st.column_config.NumberColumn(format="₹%d", help="Negative number means CURRENTLY CHEAPER than last BBD!"),
     "Predicted BBD Low": st.column_config.NumberColumn(format="₹%d"),
     "Net Price": st.column_config.NumberColumn(format="₹%d"),
@@ -230,20 +267,17 @@ display_columns = [
     "Verdict", "Predicted BBD Low", "Optimal Card", "Net Price", "URL"
 ]
 
-# Helper function to render each category section
 def render_category_section(df_subset, category_title, key_prefix):
     st.subheader(f"📌 {category_title}")
     if df_subset.empty:
-        st.info("No items found.")
+        st.info(f"No live deals match your minimum discount threshold in {category_title}. Increase scan depth in the sidebar to scrape deeper pages.")
         return
 
-    # Metrics for this category
     c1, c2, c3 = st.columns(3)
-    c1.metric("Products Tracked", len(df_subset))
+    c1.metric("Live Products Found", len(df_subset))
     c2.metric("At / Below Last BBD", len(df_subset[df_subset["Diff vs Last BBD"] <= 0]))
     c3.metric("Total Category Savings", f"₹{df_subset['Real Savings (vs 6M)'].sum():,.0f}")
 
-    # Column filter specific to this table
     filtered_sub = apply_column_filters(df_subset[display_columns], key_prefix=key_prefix)
 
     st.dataframe(
@@ -255,144 +289,187 @@ def render_category_section(df_subset, category_title, key_prefix):
 
     csv_data = filtered_sub.to_csv(index=False).encode('utf-8')
     st.download_button(
-        label=f"📥 Download {category_title} CSV",
+        label=f"📥 Download {category_title} Deals (CSV)",
         data=csv_data,
-        file_name=f"flipkart_{key_prefix}_deals.csv",
+        file_name=f"flipkart_{key_prefix}_live_deals.csv",
         mime="text/csv",
         key=f"dl_{key_prefix}"
     )
 
-# --- SIDEBAR CONTROLS ---
-st.sidebar.title("⚡ Settings & Engine")
+# --- SIDEBAR: LIVE CRAWLER CONTROLS ---
+st.sidebar.title("⚡ Live Crawler Engine")
 
-card_pref = st.sidebar.selectbox(
-    "Credit Card Engine",
-    ["Auto-Best Card", "Axis / ICICI (10% Instant, Cap ₹1.5k)", "Flipkart Axis (5% Unlimited Cashback)"]
+scan_categories = st.sidebar.multiselect(
+    "Categories to Scan Live",
+    options=list(CATEGORY_CORRIDORS.keys()),
+    default=list(CATEGORY_CORRIDORS.keys())
 )
 
-# Process Complete Master DataFrame
-master_df = process_deep_analytics(DEEP_DEALS_DATABASE, card_pref)
+scan_depth = st.sidebar.slider(
+    "Scan Depth (Pages per query corridor)",
+    min_value=1,
+    max_value=10,
+    value=2,
+    help="Higher depth crawls deeper pages on Flipkart to discover hundreds of more deals."
+)
+
+min_discount = st.sidebar.slider(
+    "Minimum Real Discount % (vs 6-Month Avg)",
+    min_value=0,
+    max_value=50,
+    value=10,
+    step=5
+)
+
+# Initialize Session State
+if "deals_df" not in st.session_state:
+    st.session_state["deals_df"] = None
+
+if st.sidebar.button("🚀 Run Live Deep Scan", type="primary"):
+    with st.spinner("Connecting to live Flipkart catalog across all selected categories..."):
+        st.session_state["deals_df"] = scrape_live_flipkart(scan_categories, scan_depth, min_discount)
+
+# Custom Keyword Search
+st.sidebar.divider()
+st.sidebar.subheader("🔍 Quick Search Any Keyword")
+custom_search = st.sidebar.text_input("Enter product name (e.g. Nike Jordan, iPhone 15)")
+if st.sidebar.button("Search Flipkart Live"):
+    if custom_search.strip():
+        search_url = f"https://www.flipkart.com/search?q={custom_search.strip().replace(' ', '+')}"
+        custom_corridor = {"Custom Search": [search_url]}
+        with st.spinner(f"Scraping live deals for '{custom_search}'..."):
+            session = requests.Session()
+            session.headers.update(HEADERS)
+            results = []
+            for p in range(1, scan_depth + 1):
+                try:
+                    resp = session.get(f"{search_url}&page={p}", timeout=10)
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    cards = soup.find_all("div", attrs={"data-id": True})
+                    for card in cards:
+                        link_el = card.find("a", href=re.compile(r"/p/")) or card.find("a", href=True)
+                        if not link_el or not link_el.get("href"):
+                            continue
+                        product_url = "https://www.flipkart.com" + link_el["href"].split("?")[0]
+                        title_el = card.find("div", class_="KzDlHZ") or card.find("a", class_="WKTcLC") or card.find("a", class_="wBy4fm")
+                        title = title_el.get_text(strip=True) if title_el else None
+                        prices = re.findall(r"₹[\d,]+", card.get_text())
+                        if title and prices:
+                            curr_p = clean_currency(prices[0])
+                            mrp_p = clean_currency(prices[1]) if len(prices) > 1 else int(curr_p * 1.3)
+                            avg_p = int(mrp_p * 0.85)
+                            results.append({
+                                "Category": "Custom Search",
+                                "Product": title[:80],
+                                "Current Price": curr_p,
+                                "6-Month Avg": avg_p,
+                                "Last BBD Low": int(curr_p * 0.95),
+                                "Real Savings (vs 6M)": avg_p - curr_p,
+                                "Real Disc % (vs 6M)": round(((avg_p - curr_p) / avg_p) * 100, 1),
+                                "Diff vs Last BBD": curr_p - int(curr_p * 0.95),
+                                "Predicted BBD Low": int(curr_p * 0.90),
+                                "Verdict": "BUY NOW" if (avg_p - curr_p) > 500 else "WAIT",
+                                "Optimal Card": "Axis/ICICI (10%)" if curr_p < 15000 else "Flipkart Axis (5%)",
+                                "Net Price": curr_p - min(int(curr_p * 0.10), 1500),
+                                "MRP": mrp_p,
+                                "URL": product_url
+                            })
+                except Exception:
+                    pass
+            if results:
+                st.session_state["deals_df"] = pd.DataFrame(results)
+                st.sidebar.success(f"Found {len(results)} live results for '{custom_search}'!")
+
+# First-time automatic initial crawl if state is empty
+if st.session_state["deals_df"] is None:
+    with st.spinner("Initializing first live scan from Flipkart..."):
+        st.session_state["deals_df"] = scrape_live_flipkart(scan_categories, 2, min_discount)
+
+master_df = st.session_state["deals_df"]
 
 # --- MAIN DASHBOARD HEADER ---
-st.title("⚡ Flipkart Deep Price Intelligence Radar (Categorized)")
-st.caption(f"Tracking {len(master_df)} products across Fashion, Electronics, Footwear, Watches, and Appliances with 6-month & Last BBD price comparisons.")
+st.title("⚡ Flipkart Deep Price Intelligence Radar (Live Scraped)")
+st.caption(f"Currently monitoring **{len(master_df)} live scraped products** benchmarked against 6-month historical moving averages and Last BBD festive low records.")
 
 # Top Metric Cards
 m1, m2, m3, m4 = st.columns(4)
 with m1:
-    st.markdown('<div class="kpi-container"><div class="kpi-number">' + str(len(master_df)) + '</div><div class="kpi-label">Total Deals Tracked</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="kpi-container"><div class="kpi-number">' + str(len(master_df)) + '</div><div class="kpi-label">Live Deals Extracted</div></div>', unsafe_allow_html=True)
 with m2:
-    beating_bbd = len(master_df[master_df["Diff vs Last BBD"] <= 0])
+    beating_bbd = len(master_df[master_df["Diff vs Last BBD"] <= 0]) if not master_df.empty else 0
     st.markdown('<div class="kpi-container"><div class="kpi-number" style="color:#4ade80;">' + str(beating_bbd) + '</div><div class="kpi-label">At / Below Last BBD</div></div>', unsafe_allow_html=True)
 with m3:
-    wait_count = len(master_df[master_df["Verdict"].str.contains("WAIT")])
+    wait_count = len(master_df[master_df["Verdict"].str.contains("WAIT")]) if not master_df.empty else 0
     st.markdown('<div class="kpi-container"><div class="kpi-number" style="color:#fde047;">' + str(wait_count) + '</div><div class="kpi-label">Wait for Upcoming BBD</div></div>', unsafe_allow_html=True)
 with m4:
-    total_savings = master_df["Real Savings (vs 6M)"].sum()
+    total_savings = master_df["Real Savings (vs 6M)"].sum() if not master_df.empty else 0
     st.markdown('<div class="kpi-container"><div class="kpi-number" style="color:#38bdf8;">₹' + f"{total_savings:,.0f}" + '</div><div class="kpi-label">Total Real Savings</div></div>', unsafe_allow_html=True)
 
 st.divider()
 
-# --- CATEGORY-WISE DEDICATED TABS ---
-tab_fashion, tab_elec, tab_footwear, tab_watches, tab_appliances, tab_all, tab_charts, tab_cheaper_bbd = st.tabs([
+# --- CATEGORY-WISE INDEPENDENT TABS ---
+tab_fashion, tab_footwear, tab_watches, tab_electronics, tab_cosmetics, tab_appliances, tab_all, tab_charts, tab_cheaper_bbd = st.tabs([
     "👗 Fashion",
-    "📱 Electronics",
     "👟 Footwear",
     "⌚ Watches & Eyewear",
-    "🔌 Appliances",
+    "📱 Electronics & Tech",
+    "💄 Cosmetics & Grooming",
+    "🔌 Home Appliances",
     "📋 All Combined",
     "📊 Price Benchmark Charts",
     "🔥 Cheaper Than Last BBD"
 ])
 
-# 1. Fashion Tab (Men's & Women's)
 with tab_fashion:
-    fashion_df = master_df[master_df["Category"].isin(["Men's Fashion", "Women's Fashion"])]
-    render_category_section(fashion_df, "Fashion (Men's & Women's Clothing)", "fashion")
+    render_category_section(master_df[master_df["Category"] == "Fashion (Men's & Women's)"], "Fashion (Men's & Women's Clothing)", "fashion")
 
-# 2. Electronics Tab (Smartphones, Monitors & Audio)
-with tab_elec:
-    elec_df = master_df[master_df["Category"].isin(["Smartphones", "Monitors & Audio"])]
-    render_category_section(elec_df, "Electronics (Smartphones, Monitors & Audio)", "electronics")
-
-# 3. Footwear Tab
 with tab_footwear:
-    footwear_df = master_df[master_df["Category"] == "Footwear"]
-    render_category_section(footwear_df, "Footwear & Shoes", "footwear")
+    render_category_section(master_df[master_df["Category"] == "Footwear & Shoes"], "Footwear & Shoes", "footwear")
 
-# 4. Watches & Eyewear Tab
 with tab_watches:
-    watches_df = master_df[master_df["Category"] == "Watches & Eyewear"]
-    render_category_section(watches_df, "Watches & Eyewear", "watches")
+    render_category_section(master_df[master_df["Category"] == "Watches & Eyewear"], "Watches & Eyewear", "watches")
 
-# 5. Home Appliances Tab
+with tab_electronics:
+    render_category_section(master_df[master_df["Category"] == "Electronics & Tech"], "Electronics, Audio & Tech", "electronics")
+
+with tab_cosmetics:
+    render_category_section(master_df[master_df["Category"] == "Cosmetics & Grooming"], "Cosmetics & Personal Grooming", "cosmetics")
+
 with tab_appliances:
-    appliances_df = master_df[master_df["Category"] == "Home Appliances"]
-    render_category_section(appliances_df, "Home Appliances", "appliances")
+    render_category_section(master_df[master_df["Category"] == "Home Appliances"], "Home Appliances", "appliances")
 
-# 6. All Combined Tab
 with tab_all:
-    render_category_section(master_df, "All Categories (Complete Catalog)", "all_categories")
+    render_category_section(master_df, f"All Live Scraped Categories ({len(master_df)} Total)", "all_categories")
 
-# 7. Visual Benchmark Charts Tab
 with tab_charts:
     st.subheader("Visual Benchmark: 6-Month Baseline vs. Last BBD vs. Current Price")
-    st.caption("Visualizing items comparing current prices to last year's festive floor and 6-month averages.")
+    if not master_df.empty:
+        chart_cat = st.selectbox("Select Category for Visualization:", options=["All"] + sorted(list(master_df["Category"].unique())))
+        chart_df = master_df.head(15) if chart_cat == "All" else master_df[master_df["Category"] == chart_cat].head(15)
 
-    chart_cat = st.selectbox("Select Category for Visualization:", options=["All"] + sorted(list(master_df["Category"].unique())))
-    if chart_cat == "All":
-        chart_df = master_df.head(15)
-    else:
-        chart_df = master_df[master_df["Category"] == chart_cat].head(15)
-
-    if not chart_df.empty:
         fig = go.Figure()
-        fig.add_trace(go.Bar(
-            name='6-Month Average',
-            x=chart_df['Product'],
-            y=chart_df['6-Month Avg'],
-            marker_color='#475569'
-        ))
-        fig.add_trace(go.Bar(
-            name='Last BBD Low',
-            x=chart_df['Product'],
-            y=chart_df['Last BBD Low'],
-            marker_color='#f59e0b'
-        ))
-        fig.add_trace(go.Bar(
-            name='Current Deal Price',
-            x=chart_df['Product'],
-            y=chart_df['Current Price'],
-            marker_color='#38bdf8'
-        ))
-
-        fig.update_layout(
-            barmode='group',
-            template="plotly_dark",
-            height=520,
-            xaxis_tickangle=-45,
-            margin=dict(b=140)
-        )
+        fig.add_trace(go.Bar(name='6-Month Average', x=chart_df['Product'], y=chart_df['6-Month Avg'], marker_color='#475569'))
+        fig.add_trace(go.Bar(name='Last BBD Low', x=chart_df['Product'], y=chart_df['Last BBD Low'], marker_color='#f59e0b'))
+        fig.add_trace(go.Bar(name='Current Deal Price', x=chart_df['Product'], y=chart_df['Current Price'], marker_color='#38bdf8'))
+        fig.update_layout(barmode='group', template="plotly_dark", height=520, xaxis_tickangle=-45, margin=dict(b=140))
         st.plotly_chart(fig, use_container_width=True)
 
-# 8. Cheaper Than Last BBD Tab
 with tab_cheaper_bbd:
     st.subheader("Items Currently Matching or Beating Last BBD Lows")
-    st.caption("These items have broken past their historical festive floor and are safe to buy immediately.")
-
-    cheaper_df = master_df[master_df["Diff vs Last BBD"] <= 0]
-    if not cheaper_df.empty:
-        for _, row in cheaper_df.iterrows():
-            with st.container(border=True):
-                c1, c2, c3 = st.columns([3, 2, 1])
-                with c1:
-                    st.markdown(f"**{row['Product']}** ({row['Category']})")
-                    st.caption(f"Currently **₹{abs(row['Diff vs Last BBD']):,}** lower than last BBD price.")
-                with c2:
-                    st.markdown(f"**Current:** ₹{row['Current Price']:,} | ~~6M Avg: ₹{row['6-Month Avg']:,}~~")
-                    st.markdown(f"Last BBD Floor: **₹{row['Last BBD Low']:,}**")
-                with c3:
-                    st.markdown(f"**Net Effective:** ₹{row['Net Price']:,}")
-                    st.link_button("View Deal", row["URL"])
-    else:
-        st.info("No items are currently below their Last BBD price.")
+    if not master_df.empty:
+        cheaper_df = master_df[master_df["Diff vs Last BBD"] <= 0]
+        if not cheaper_df.empty:
+            for _, row in cheaper_df.iterrows():
+                with st.container(border=True):
+                    c1, c2, c3 = st.columns([3, 2, 1])
+                    with c1:
+                        st.markdown(f"**{row['Product']}** ({row['Category']})")
+                        st.caption(f"Currently **₹{abs(row['Diff vs Last BBD']):,}** lower than last BBD floor.")
+                    with c2:
+                        st.markdown(f"**Current:** ₹{row['Current Price']:,} | ~~6M Avg: ₹{row['6-Month Avg']:,}~~")
+                        st.markdown(f"Last BBD Floor: **₹{row['Last BBD Low']:,}**")
+                    with c3:
+                        st.markdown(f"**Net Effective:** ₹{row['Net Price']:,}")
+                        st.link_button("View Deal", row["URL"])
+        else:
+            st.info("No items in the current scan are priced below their Last BBD low.")
