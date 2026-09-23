@@ -3,7 +3,7 @@ import pandas as pd
 from pandas.api.types import is_numeric_dtype
 import plotly.graph_objects as go
 
-# --- PAGE SETUP ---
+# --- PAGE CONFIGURATION ---
 st.set_page_config(
     page_title="Flipkart Deep Price Intelligence Radar",
     page_icon="⚡",
@@ -20,9 +20,9 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- AUDITED 6-MONTH & LAST BBD COMPARATIVE DATASET (65+ ITEMS) ---
+# --- AUDITED 6-MONTH & LAST BBD COMPARATIVE DATASET ---
 DEEP_DEALS_DATABASE = [
-    # SMARTPHONES
+    # SMARTPHONES & TECH
     {"cat": "Smartphones", "product": "Apple iPhone 15 (128 GB, Blue)", "mrp": 69900, "avg_6m": 63499, "last_bbd": 52999, "curr": 54999, "bbd_pred": 48999, "url": "https://www.flipkart.com/search?q=apple+iphone+15"},
     {"cat": "Smartphones", "product": "Apple iPhone 16 (128 GB, Black)", "mrp": 79900, "avg_6m": 79900, "last_bbd": 69900, "curr": 69900, "bbd_pred": 51999, "url": "https://www.flipkart.com/search?q=apple+iphone+16"},
     {"cat": "Smartphones", "product": "Samsung Galaxy S24 5G (8GB/128GB)", "mrp": 74999, "avg_6m": 56999, "last_bbd": 41999, "curr": 42999, "bbd_pred": 36999, "url": "https://www.flipkart.com/search?q=samsung+galaxy+s24"},
@@ -38,7 +38,7 @@ DEEP_DEALS_DATABASE = [
     {"cat": "Smartphones", "product": "POCO X6 Pro 5G (8GB/256GB)", "mrp": 26999, "avg_6m": 23999, "last_bbd": 19999, "curr": 21499, "bbd_pred": 18999, "url": "https://www.flipkart.com/search?q=poco+x6+pro"},
     {"cat": "Smartphones", "product": "Vivo T3x 5G (6GB/128GB)", "mrp": 17499, "avg_6m": 13999, "last_bbd": 11999, "curr": 12499, "bbd_pred": 11249, "url": "https://www.flipkart.com/search?q=vivo+t3x+5g"},
 
-    # MONITORS & AUDIO
+    # MONITORS & AUDIO (ELECTRONICS)
     {"cat": "Monitors & Audio", "product": "Sony WH-1000XM4 ANC Headphones", "mrp": 29990, "avg_6m": 22990, "last_bbd": 18490, "curr": 18990, "bbd_pred": 17490, "url": "https://www.flipkart.com/search?q=sony+wh+1000xm4"},
     {"cat": "Monitors & Audio", "product": "Sony WH-1000XM5 ANC Headphones", "mrp": 34990, "avg_6m": 29990, "last_bbd": 24990, "curr": 25990, "bbd_pred": 22990, "url": "https://www.flipkart.com/search?q=sony+wh+1000xm5"},
     {"cat": "Monitors & Audio", "product": "LG UltraGear 27\" 165Hz IPS QHD Monitor", "mrp": 32000, "avg_6m": 24499, "last_bbd": 18999, "curr": 19499, "bbd_pred": 17999, "url": "https://www.flipkart.com/search?q=lg+ultragear+27"},
@@ -139,7 +139,7 @@ def process_deep_analytics(data, card_selection):
         else:
             verdict = "WAIT"
 
-        # Card Engine
+        # Card Optimization Engine
         instant_10 = min(int(curr * 0.10), 1500)
         cashback_5 = int(curr * 0.05)
 
@@ -172,34 +172,30 @@ def process_deep_analytics(data, card_selection):
         })
     return pd.DataFrame(records)
 
-# --- DYNAMIC COLUMN-LEVEL FILTER ENGINE ---
-def apply_column_filters(df: pd.DataFrame) -> pd.DataFrame:
-    """Provides column-level multi-select and range filters for every column in the table."""
-    with st.expander("🔍 Filter Table by Specific Columns (Column Filters)", expanded=True):
+# --- REUSABLE COLUMN-LEVEL FILTER ENGINE ---
+def apply_column_filters(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
+    with st.expander("🔍 Filter This Table by Specific Columns", expanded=False):
         col_select = st.multiselect(
             "Select columns to add filters for:",
             options=df.columns,
-            default=["Category", "Verdict", "Optimal Card"]
+            default=["Verdict", "Optimal Card"] if "Verdict" in df.columns else [],
+            key=f"{key_prefix}_col_select"
         )
-        
         filtered_df = df.copy()
-        
         if col_select:
             filter_cols = st.columns(min(len(col_select), 4))
             for i, col in enumerate(col_select):
                 col_container = filter_cols[i % 4]
                 with col_container:
-                    # Categorical or low cardinality columns
                     if not is_numeric_dtype(df[col]) or df[col].nunique() < 12:
                         unique_vals = sorted(list(df[col].dropna().unique()))
                         selected_vals = st.multiselect(
                             f"{col}:",
                             options=unique_vals,
                             default=unique_vals,
-                            key=f"col_filter_{col}"
+                            key=f"{key_prefix}_{col}_cat"
                         )
                         filtered_df = filtered_df[filtered_df[col].isin(selected_vals)]
-                    # Numeric columns (range slider)
                     else:
                         min_val = float(df[col].min())
                         max_val = float(df[col].max())
@@ -210,10 +206,61 @@ def apply_column_filters(df: pd.DataFrame) -> pd.DataFrame:
                             max_value=max_val,
                             value=(min_val, max_val),
                             step=step_val,
-                            key=f"col_filter_{col}"
+                            key=f"{key_prefix}_{col}_num"
                         )
                         filtered_df = filtered_df[filtered_df[col].between(selected_range[0], selected_range[1])]
     return filtered_df
+
+# Column Config Formatting
+col_config = {
+    "Current Price": st.column_config.NumberColumn(format="₹%d"),
+    "6-Month Avg": st.column_config.NumberColumn(format="₹%d"),
+    "Last BBD Low": st.column_config.NumberColumn(format="₹%d"),
+    "Real Savings (vs 6M)": st.column_config.NumberColumn(format="₹%d"),
+    "Real Disc % (vs 6M)": st.column_config.ProgressColumn(format="%d%%", min_value=-10, max_value=60),
+    "Diff vs Last BBD": st.column_config.NumberColumn(format="₹%d", help="Negative number means CURRENTLY CHEAPER than last BBD!"),
+    "Predicted BBD Low": st.column_config.NumberColumn(format="₹%d"),
+    "Net Price": st.column_config.NumberColumn(format="₹%d"),
+    "URL": st.column_config.LinkColumn("Store Link")
+}
+
+display_columns = [
+    "Category", "Product", "Current Price", "6-Month Avg", "Last BBD Low", 
+    "Real Savings (vs 6M)", "Real Disc % (vs 6M)", "Diff vs Last BBD", 
+    "Verdict", "Predicted BBD Low", "Optimal Card", "Net Price", "URL"
+]
+
+# Helper function to render each category section
+def render_category_section(df_subset, category_title, key_prefix):
+    st.subheader(f"📌 {category_title}")
+    if df_subset.empty:
+        st.info("No items found.")
+        return
+
+    # Metrics for this category
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Products Tracked", len(df_subset))
+    c2.metric("At / Below Last BBD", len(df_subset[df_subset["Diff vs Last BBD"] <= 0]))
+    c3.metric("Total Category Savings", f"₹{df_subset['Real Savings (vs 6M)'].sum():,.0f}")
+
+    # Column filter specific to this table
+    filtered_sub = apply_column_filters(df_subset[display_columns], key_prefix=key_prefix)
+
+    st.dataframe(
+        filtered_sub.sort_values("Real Disc % (vs 6M)", ascending=False),
+        column_config=col_config,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    csv_data = filtered_sub.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label=f"📥 Download {category_title} CSV",
+        data=csv_data,
+        file_name=f"flipkart_{key_prefix}_deals.csv",
+        mime="text/csv",
+        key=f"dl_{key_prefix}"
+    )
 
 # --- SIDEBAR CONTROLS ---
 st.sidebar.title("⚡ Settings & Engine")
@@ -226,80 +273,77 @@ card_pref = st.sidebar.selectbox(
 # Process Complete Master DataFrame
 master_df = process_deep_analytics(DEEP_DEALS_DATABASE, card_pref)
 
-# Display Table Columns
-display_columns = [
-    "Category", "Product", "Current Price", "6-Month Avg", "Last BBD Low", 
-    "Real Savings (vs 6M)", "Real Disc % (vs 6M)", "Diff vs Last BBD", 
-    "Verdict", "Predicted BBD Low", "Optimal Card", "Net Price", "URL"
-]
-
 # --- MAIN DASHBOARD HEADER ---
-st.title("⚡ Flipkart Deep Price Intelligence Radar (BBD Benchmarked)")
-st.caption(f"Analyzing {len(master_df)} products against 6-month historical averages, recorded Last BBD floors, and upcoming festive forecasts.")
-
-# Apply Interactive Column Filters
-filtered_df = apply_column_filters(master_df[display_columns])
+st.title("⚡ Flipkart Deep Price Intelligence Radar (Categorized)")
+st.caption(f"Tracking {len(master_df)} products across Fashion, Electronics, Footwear, Watches, and Appliances with 6-month & Last BBD price comparisons.")
 
 # Top Metric Cards
 m1, m2, m3, m4 = st.columns(4)
 with m1:
-    st.markdown('<div class="kpi-container"><div class="kpi-number">' + str(len(filtered_df)) + '</div><div class="kpi-label">Filtered Deals</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="kpi-container"><div class="kpi-number">' + str(len(master_df)) + '</div><div class="kpi-label">Total Deals Tracked</div></div>', unsafe_allow_html=True)
 with m2:
-    beating_bbd = len(filtered_df[filtered_df["Diff vs Last BBD"] <= 0])
-    st.markdown('<div class="kpi-container"><div class="kpi-number" style="color:#4ade80;">' + str(beating_bbd) + '</div><div class="kpi-label">Matching / Cheaper than Last BBD</div></div>', unsafe_allow_html=True)
+    beating_bbd = len(master_df[master_df["Diff vs Last BBD"] <= 0])
+    st.markdown('<div class="kpi-container"><div class="kpi-number" style="color:#4ade80;">' + str(beating_bbd) + '</div><div class="kpi-label">At / Below Last BBD</div></div>', unsafe_allow_html=True)
 with m3:
-    wait_count = len(filtered_df[filtered_df["Verdict"].str.contains("WAIT")])
+    wait_count = len(master_df[master_df["Verdict"].str.contains("WAIT")])
     st.markdown('<div class="kpi-container"><div class="kpi-number" style="color:#fde047;">' + str(wait_count) + '</div><div class="kpi-label">Wait for Upcoming BBD</div></div>', unsafe_allow_html=True)
 with m4:
-    total_savings = filtered_df["Real Savings (vs 6M)"].sum()
+    total_savings = master_df["Real Savings (vs 6M)"].sum()
     st.markdown('<div class="kpi-container"><div class="kpi-number" style="color:#38bdf8;">₹' + f"{total_savings:,.0f}" + '</div><div class="kpi-label">Total Real Savings</div></div>', unsafe_allow_html=True)
 
 st.divider()
 
-# --- TABS ---
-tab_matrix, tab_charts, tab_cheaper_bbd = st.tabs([
-    "📋 Master Comparative Table",
-    "📊 3-Way Price Benchmark Visualizer",
-    "🔥 Currently Cheaper Than Last BBD"
+# --- CATEGORY-WISE DEDICATED TABS ---
+tab_fashion, tab_elec, tab_footwear, tab_watches, tab_appliances, tab_all, tab_charts, tab_cheaper_bbd = st.tabs([
+    "👗 Fashion",
+    "📱 Electronics",
+    "👟 Footwear",
+    "⌚ Watches & Eyewear",
+    "🔌 Appliances",
+    "📋 All Combined",
+    "📊 Price Benchmark Charts",
+    "🔥 Cheaper Than Last BBD"
 ])
 
-with tab_matrix:
-    st.subheader("6-Month & Last BBD Comparative Data Matrix")
-    
-    col_config = {
-        "Current Price": st.column_config.NumberColumn(format="₹%d"),
-        "6-Month Avg": st.column_config.NumberColumn(format="₹%d"),
-        "Last BBD Low": st.column_config.NumberColumn(format="₹%d"),
-        "Real Savings (vs 6M)": st.column_config.NumberColumn(format="₹%d"),
-        "Real Disc % (vs 6M)": st.column_config.ProgressColumn(format="%d%%", min_value=-10, max_value=60),
-        "Diff vs Last BBD": st.column_config.NumberColumn(format="₹%d", help="Negative number means CURRENTLY CHEAPER than last BBD!"),
-        "Predicted BBD Low": st.column_config.NumberColumn(format="₹%d"),
-        "Net Price": st.column_config.NumberColumn(format="₹%d"),
-        "URL": st.column_config.LinkColumn("Store Link")
-    }
+# 1. Fashion Tab (Men's & Women's)
+with tab_fashion:
+    fashion_df = master_df[master_df["Category"].isin(["Men's Fashion", "Women's Fashion"])]
+    render_category_section(fashion_df, "Fashion (Men's & Women's Clothing)", "fashion")
 
-    st.dataframe(
-        filtered_df.sort_values("Real Disc % (vs 6M)", ascending=False),
-        column_config=col_config,
-        use_container_width=True,
-        hide_index=True
-    )
-    
-    # Export CSV
-    csv_data = filtered_df.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        label="📥 Export Filtered Results to CSV",
-        data=csv_data,
-        file_name="flipkart_bbd_filtered_deals.csv",
-        mime="text/csv"
-    )
+# 2. Electronics Tab (Smartphones, Monitors & Audio)
+with tab_elec:
+    elec_df = master_df[master_df["Category"].isin(["Smartphones", "Monitors & Audio"])]
+    render_category_section(elec_df, "Electronics (Smartphones, Monitors & Audio)", "electronics")
 
+# 3. Footwear Tab
+with tab_footwear:
+    footwear_df = master_df[master_df["Category"] == "Footwear"]
+    render_category_section(footwear_df, "Footwear & Shoes", "footwear")
+
+# 4. Watches & Eyewear Tab
+with tab_watches:
+    watches_df = master_df[master_df["Category"] == "Watches & Eyewear"]
+    render_category_section(watches_df, "Watches & Eyewear", "watches")
+
+# 5. Home Appliances Tab
+with tab_appliances:
+    appliances_df = master_df[master_df["Category"] == "Home Appliances"]
+    render_category_section(appliances_df, "Home Appliances", "appliances")
+
+# 6. All Combined Tab
+with tab_all:
+    render_category_section(master_df, "All Categories (Complete Catalog)", "all_categories")
+
+# 7. Visual Benchmark Charts Tab
 with tab_charts:
     st.subheader("Visual Benchmark: 6-Month Baseline vs. Last BBD vs. Current Price")
-    st.caption("Visualizing the first 12 filtered items comparing current prices to last year's festive floor and 6-month averages.")
+    st.caption("Visualizing items comparing current prices to last year's festive floor and 6-month averages.")
 
-    sample_products = filtered_df["Product"].unique()[:12]
-    chart_df = filtered_df[filtered_df["Product"].isin(sample_products)]
+    chart_cat = st.selectbox("Select Category for Visualization:", options=["All"] + sorted(list(master_df["Category"].unique())))
+    if chart_cat == "All":
+        chart_df = master_df.head(15)
+    else:
+        chart_df = master_df[master_df["Category"] == chart_cat].head(15)
 
     if not chart_df.empty:
         fig = go.Figure()
@@ -325,19 +369,18 @@ with tab_charts:
         fig.update_layout(
             barmode='group',
             template="plotly_dark",
-            height=500,
+            height=520,
             xaxis_tickangle=-45,
-            margin=dict(b=120)
+            margin=dict(b=140)
         )
         st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No items match the current column filters.")
 
+# 8. Cheaper Than Last BBD Tab
 with tab_cheaper_bbd:
     st.subheader("Items Currently Matching or Beating Last BBD Lows")
-    st.caption("These items are currently priced at or below their previous festive sale record.")
+    st.caption("These items have broken past their historical festive floor and are safe to buy immediately.")
 
-    cheaper_df = filtered_df[filtered_df["Diff vs Last BBD"] <= 0]
+    cheaper_df = master_df[master_df["Diff vs Last BBD"] <= 0]
     if not cheaper_df.empty:
         for _, row in cheaper_df.iterrows():
             with st.container(border=True):
@@ -352,4 +395,4 @@ with tab_cheaper_bbd:
                     st.markdown(f"**Net Effective:** ₹{row['Net Price']:,}")
                     st.link_button("View Deal", row["URL"])
     else:
-        st.info("No items matching the selected filters are currently below their Last BBD price.")
+        st.info("No items are currently below their Last BBD price.")
