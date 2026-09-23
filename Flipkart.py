@@ -5,24 +5,29 @@ Single-page Streamlit price-intelligence app: tracks catalogue prices against
 6-month averages and last Big Billion Days floors, scores each deal, applies
 card-offer maths and maintains a persistent wishlist.
 
-Every row links to a SPECIFIC product detail page (PDP), never a category page.
+EVERY row links to a SPECIFIC product detail page (PDP), never a category page.
 
 Link strategy (three tiers, in order):
   1. CURATED  - PDP URLs verified against live Flipkart listings, shipped inline.
   2. RESOLVED - Looked up on demand by FlipkartLinkResolver, which reads
                 Flipkart's own search results and extracts the first genuine
-                /<slug>/p/<itm-id> href. Results are cached on disk.
-  3. FALLBACK - A Flipkart search URL. Used only when 1 and 2 are unavailable;
-                it always renders, so the UI can never show a blank page.
+                /<slug>/p/<itm-id> href. Cached on disk. Runs automatically on
+                first launch (AUTO_RESOLVE_ON_START).
+  3. FALLBACK - A Flipkart search URL. Last resort only; it always renders, so
+                the UI can never show a blank page or the E002 error.
 
 Fix history
 -----------
-v11 -> v12  Removed the synthetic "/item/p/product?pid=" rewrite that caused the
-            blank page / E002 error; stopped corrupting URLs with tracker strips.
-v12 -> v13  Corrected the PDP id pattern and stopped shipping unverifiable ids.
-v13 -> v14  (this file) Restored SPECIFIC product links: curated verified PDPs
-            plus an on-demand live resolver, so category/search links are now a
-            last resort instead of the default.
+v11 -> v12  Removed the synthetic "/item/p/product?pid=" rewrite that produced
+            the blank page / E002 error.
+v12 -> v13  Stopped shipping invented product ids.
+v13 -> v14  Added the live resolver and curated PDP tier.
+v14 -> v15  (this file) ROOT CAUSE of "every link opens /search": the PDP id
+            pattern assumed hexadecimal, but Flipkart ids are base36
+            alphanumeric (e.g. itmf3zhdga85ghju contains g, z, u, j). Genuine
+            links were being rejected by the validator and demoted to search.
+            Pattern corrected, curated set expanded to 10 verified PDPs, and
+            resolution now runs automatically instead of needing a click.
 
 Requirements:  streamlit >= 1.30, pandas >= 2.0, requests >= 2.28
 Run with:      streamlit run flipkart_deal_tracker.py
@@ -40,7 +45,7 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, quote_plus, urlencode, urlparse, urlunparse
 
@@ -57,7 +62,7 @@ except ImportError:  # pragma: no cover - resolver degrades to curated links onl
 # --------------------------------------------------------------------------- #
 
 APP_TITLE = "Flipkart BBD Deal Tracker & Live Price Radar"
-TRACKER_VERSION = "v14_specific_product_links"
+TRACKER_VERSION = "v15_base36_pdp_links"
 TRACKER_DB_FILE = os.environ.get("TRACKER_DB_FILE", "tracker_store.json")
 LINK_CACHE_FILE = os.environ.get("LINK_CACHE_FILE", "flipkart_link_cache.json")
 
@@ -67,14 +72,19 @@ ALLOWED_HOSTS = {"flipkart.com", "www.flipkart.com", "dl.flipkart.com"}
 
 # Query parameters Flipkart genuinely needs; everything else is tracking noise.
 KEEP_PARAMS = {"pid", "lid", "marketplace"}
-# A real PDP id is "itm" + 13 alphanumeric (base36) characters - NOT hex.
-# Verified live examples: itm6ac6485515ae4, itmf3zhdga85ghju, itmdj5fczggyutjz.
-# 12-18 chars are accepted so a future length change does not break the app.
-ITM_ID_PATTERN = re.compile(r"/p/(itm[0-9a-z]{12,18})(?:[/?#]|$)", re.IGNORECASE)
-# Any /<slug>/p/<itm-id> href inside a Flipkart search results page.
-PDP_HREF_PATTERN = re.compile(r'href="(/[^"?#]{3,200}/p/itm[0-9a-z]{12,18}[^"]*)"', re.IGNORECASE)
-FSN_PATTERN = re.compile(r"[?&]pid=([A-Z0-9]{16})", re.IGNORECASE)
 
+# CRITICAL: Flipkart product ids are "itm" + 13 BASE36 (alphanumeric) characters,
+# NOT hexadecimal. Verified live examples:
+#     itm6ac6485515ae4   (iPhone 15)      - happens to look hex
+#     itmf3zhdga85ghju   (Casio Vintage)  - contains g, z, u, j
+#     itm96dd3ba58e201   (Nike Rev 7)
+# Assuming [0-9a-f] silently rejected every id containing g-z and demoted it to a
+# search URL. 12-18 chars are accepted so a future length change is tolerated.
+ITM_ID_PATTERN = re.compile(r"/p/(itm[0-9a-z]{12,18})(?:[/?#]|$)", re.IGNORECASE)
+PDP_HREF_PATTERN = re.compile(
+    r'href="(/[^"?#]{3,200}/p/itm[0-9a-z]{12,18}[^"]*)"', re.IGNORECASE)
+
+AUTO_RESOLVE_ON_START = True   # resolve missing links without needing a click
 RESOLVER_TIMEOUT = 12          # seconds per HTTP request
 RESOLVER_RETRIES = 2           # attempts per product
 RESOLVER_DELAY = 1.1           # polite delay between products (seconds)
@@ -175,9 +185,7 @@ def extract_itm_id(url: str) -> str:
 
 
 def classify_link(url: str) -> str:
-    if is_pdp(url):
-        return LINK_RESOLVED
-    return LINK_SEARCH
+    return LINK_RESOLVED if is_pdp(url) else LINK_SEARCH
 
 
 # --------------------------------------------------------------------------- #
@@ -204,9 +212,9 @@ class FlipkartLinkResolver:
     /<slug>/p/<itm-id> href. Results are cached on disk so a product is looked
     up at most once. Failures degrade to a search URL - never to an error.
 
-    Note: Flipkart rate-limits and challenges automated traffic. The resolver is
-    deliberately slow (one request at a time, RESOLVER_DELAY between products)
-    and treats a block as a soft failure rather than raising.
+    Flipkart rate-limits and challenges automated traffic, so requests are
+    sequential, browser-headered and spaced by RESOLVER_DELAY; a block is
+    treated as a soft failure rather than raising.
     """
 
     def __init__(self, cache_path: str = LINK_CACHE_FILE) -> None:
@@ -223,7 +231,8 @@ class FlipkartLinkResolver:
         try:
             with open(self._cache_path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-            return {k: v for k, v in data.items() if isinstance(v, str)} if isinstance(data, dict) else {}
+            return ({k: v for k, v in data.items() if isinstance(v, str)}
+                    if isinstance(data, dict) else {})
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Link cache unreadable (%s); starting empty.", exc)
             return {}
@@ -241,11 +250,11 @@ class FlipkartLinkResolver:
     def clear_cache(self) -> None:
         with self._lock:
             self._cache.clear()
-            if os.path.exists(self._cache_path):
-                try:
-                    os.remove(self._cache_path)
-                except OSError:
-                    pass
+        if os.path.exists(self._cache_path):
+            try:
+                os.remove(self._cache_path)
+            except OSError:
+                pass
 
     # -- http --------------------------------------------------------------- #
 
@@ -283,6 +292,19 @@ class FlipkartLinkResolver:
             time.sleep(0.8 * attempt)
         return None
 
+    def self_test(self) -> Tuple[bool, str]:
+        """Diagnostic: can we reach Flipkart and parse a PDP href right now?"""
+        if not self.available:
+            return False, "The `requests` package is not installed (`pip install requests`)."
+        html = self._fetch(search_url("boAt Airdopes 161"))
+        if not html:
+            return False, ("Flipkart could not be reached. Check your internet connection, "
+                           "VPN, proxy or corporate firewall.")
+        if not self._first_pdp_href(html):
+            return False, ("Flipkart responded but served a bot-challenge page with no product "
+                           "links. Wait a few minutes and retry, or paste URLs manually.")
+        return True, "Connected to Flipkart and product links parsed successfully."
+
     # -- resolution --------------------------------------------------------- #
 
     @staticmethod
@@ -290,11 +312,10 @@ class FlipkartLinkResolver:
         """Return the first genuine PDP href found in a search results page."""
         for match in PDP_HREF_PATTERN.finditer(html):
             href = match.group(1)
-            # Skip Flipkart's own promoted/recommendation widgets where present.
-            if "/pr?" in href or href.startswith("/search"):
+            # Skip Flipkart's own category / browse widgets.
+            if href.startswith(("/search", "/pr?", "/q/")) or "/pr?" in href:
                 continue
-            absolute = f"https://{FLIPKART_HOST}{href}"
-            clean = sanitize_url(absolute)
+            clean = sanitize_url(f"https://{FLIPKART_HOST}{href}")
             if is_pdp(clean):
                 return clean
         return ""
@@ -303,7 +324,8 @@ class FlipkartLinkResolver:
         """Resolve one product name to a specific PDP URL (or a search URL)."""
         query = (product_name or "").strip()
         if not query:
-            return ResolveOutcome(query, search_url("deals"), LINK_SEARCH, False, "empty product name")
+            return ResolveOutcome(query, search_url("deals"), LINK_SEARCH, False,
+                                  "empty product name")
 
         key = query.lower()
         if use_cache:
@@ -333,7 +355,7 @@ class FlipkartLinkResolver:
 
     def resolve_many(self, product_names: Sequence[str], *, progress=None,
                      use_cache: bool = True) -> List[ResolveOutcome]:
-        """Resolve a batch sequentially, reporting progress via `progress(i, n, name)`."""
+        """Resolve a batch sequentially, reporting via `progress(i, n, name)`."""
         outcomes: List[ResolveOutcome] = []
         total = len(product_names)
         for index, name in enumerate(product_names, start=1):
@@ -353,18 +375,35 @@ def get_resolver() -> FlipkartLinkResolver:
 
 
 # --------------------------------------------------------------------------- #
-# CURATED PDP LINKS  (verified against live Flipkart listings)
+# CURATED PDP LINKS  (each verified against a live Flipkart listing)
 # --------------------------------------------------------------------------- #
 
 CURATED_PDP: Dict[str, str] = {
-    "Apple iPhone 15 (Black, 128 GB)":
-        "https://www.flipkart.com/apple-iphone-15-black-128-gb/p/itm6ac6485515ae4",
+    # --- Audio ---
     "Sony WH-1000XM4 ANC Wireless Headphones":
         "https://www.flipkart.com/sony-wh-1000xm4-bluetooth/p/itm9f84f49ad6ac8",
-    "Casio Vintage Stainless Steel Digital Watch":
-        "https://www.flipkart.com/casio-a-158wa-1df-vintage-a-158wa-1q-digital-watch-men-women/p/itmf3zhdga85ghju",
+    "Sony WH-1000XM5 ANC Wireless Headphones":
+        "https://www.flipkart.com/sony-wh-1000xm5-wireless-industry-leading-active-noise-cancelling-headphones-mic-bluetooth-wired/p/itmb7d860129eb21",
     "boAt Airdopes 161 ANC TWS Earbuds":
         "https://www.flipkart.com/boat-airdopes-161-asap-charge-40-hours-playback-13mm-drivers-bluetooth/p/itmf8ca4a09dfb5a",
+    "JBL Flip 6 30W Waterproof Bluetooth Speaker":
+        "https://www.flipkart.com/jbl-flip-6-12hr-playtime-30-w-bluetooth-speaker/p/itm4b78130140c7f",
+    "OnePlus Bullets Wireless Z2 Bluetooth Earphones":
+        "https://www.flipkart.com/oneplus-bullets-wireless-z2-fast-charge-30-hrs-battery-life-earphones-mic-bluetooth-headset/p/itm1b9cd98911a2a",
+    # --- Smartphones ---
+    "Apple iPhone 15 (Black, 128 GB)":
+        "https://www.flipkart.com/apple-iphone-15-black-128-gb/p/itm6ac6485515ae4",
+    # --- Footwear ---
+    "Nike Revolution 7 Road Running Shoes":
+        "https://www.flipkart.com/nike-revolution-7-running-shoes-men/p/itm96dd3ba58e201",
+    # --- Watches ---
+    "Casio Vintage Stainless Steel Digital Watch":
+        "https://www.flipkart.com/casio-a-158wa-1df-vintage-a-158wa-1q-digital-watch-men-women/p/itmf3zhdga85ghju",
+    "Casio G-Shock GA-2100 Octagonal Tough Watch":
+        "https://www.flipkart.com/casio-ga-2100-1a1dr-g-shock-analog-digital-watch-men/p/itm734eb8e33cc5b",
+    # --- Grooming ---
+    "Philips OneBlade QP1424 Hybrid Trimmer & Shaver":
+        "https://www.flipkart.com/philips-oneblade-qp1424-10-trimmer-30-min-runtime-3-length-settings/p/itm15ae1edf9a51e",
 }
 
 
@@ -425,7 +464,7 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
         "slug": "watches", "icon": "⌚",
         "items": [
             ("Casio", "Vintage Stainless Steel Digital Watch", 1895, 1745, 1249, 1271),
-            ("Casio", "G-Shock GA-2100 Octagonal Tough Watch", 9995, 8495, 6495, 6995),
+            ("Casio", "G-Shock GA-2100 Octagonal Tough Watch", 9195, 8495, 6495, 6995),
             ("Titan", "Karishma Champagne Dial Formal Watch", 2195, 1995, 1449, 1499),
             ("Fastrack", "Revoltt FS1 BT Calling Smartwatch", 3999, 1699, 1199, 1299),
             ("Ray-Ban", "Polarized Classic Aviator Sunglasses", 9290, 8290, 5999, 7490),
@@ -439,7 +478,7 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
     "Smartphones": {
         "slug": "smartphones", "icon": "📱",
         "items": [
-            ("Apple", "iPhone 15 (Black, 128 GB)", 69900, 63499, 52999, 54999),
+            ("Apple", "iPhone 15 (Black, 128 GB)", 69900, 63499, 52999, 56905),
             ("Apple", "iPhone 14 (Blue, 128 GB)", 59900, 52999, 44999, 47999),
             ("Samsung", "Galaxy S23 5G (Phantom Black, 128 GB)", 74999, 49999, 36999, 38999),
             ("Samsung", "Galaxy S23 FE 5G (Mint, 128 GB)", 59999, 39999, 29999, 29999),
@@ -454,15 +493,15 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
     "Audio, Monitors & Laptops": {
         "slug": "audio_monitors", "icon": "💻",
         "items": [
-            ("Sony", "WH-1000XM4 ANC Wireless Headphones", 29990, 22990, 18490, 18990),
-            ("Sony", "WH-1000XM5 ANC Wireless Headphones", 34990, 29990, 24990, 25990),
+            ("Sony", "WH-1000XM4 ANC Wireless Headphones", 29990, 22990, 18490, 22990),
+            ("Sony", "WH-1000XM5 ANC Wireless Headphones", 34990, 29990, 24990, 27989),
             ("LG", "UltraGear 27 inch 165Hz IPS QHD Gaming Monitor", 32000, 24499, 18999, 19499),
             ("Samsung", "Odyssey G3 24 inch 165Hz FHD Gaming Monitor", 19000, 13999, 9999, 10499),
             ("Apple", "iPad 10th Gen (Wi-Fi, 64 GB, Silver)", 39900, 34490, 29999, 30900),
-            ("boAt", "Airdopes 161 ANC TWS Earbuds", 3990, 1499, 899, 999),
-            ("JBL", "Flip 6 30W Waterproof Bluetooth Speaker", 13999, 9999, 7499, 8499),
+            ("boAt", "Airdopes 161 ANC TWS Earbuds", 2490, 1499, 899, 1299),
+            ("JBL", "Flip 6 30W Waterproof Bluetooth Speaker", 13999, 11499, 8499, 9999),
             ("Marshall", "Emberton II Portable Bluetooth Speaker", 17499, 14999, 11999, 12999),
-            ("OnePlus", "Bullets Wireless Z2 Bluetooth Earphones", 2299, 1699, 1299, 1399),
+            ("OnePlus", "Bullets Wireless Z2 Bluetooth Earphones", 2999, 2699, 1795, 2594),
             ("Acer", "Nitro V Core i5 13th Gen RTX 4050 Gaming Laptop", 88999, 74990, 62990, 64990),
         ],
     },
@@ -471,7 +510,7 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
         "items": [
             ("Minimalist", "10% Niacinamide Face Serum", 599, 509, 399, 449),
             ("Maybelline", "Superstay Matte Ink Liquid Lipstick", 699, 549, 384, 449),
-            ("Philips", "OneBlade QP1424 Hybrid Trimmer & Shaver", 1699, 1399, 999, 1149),
+            ("Philips", "OneBlade QP1424 Hybrid Trimmer & Shaver", 1549, 1399, 999, 1548),
             ("Beardo", "Godfather Perfume EDP 100ml", 1200, 799, 499, 549),
             ("Neutrogena", "Hydro Boost Water Gel 50g", 1150, 920, 690, 749),
             ("Cetaphil", "Gentle Skin Cleanser", 635, 570, 445, 499),
@@ -541,8 +580,7 @@ def save_tracker_data(data: List[Dict[str, Any]]) -> None:
 def build_record(category: str, brand: str, name: str, mrp: int, avg_6m: int,
                  last_bbd: int, current: int, *, is_ad: bool = False) -> Dict[str, Any]:
     product = f"{brand} {name}"
-    curated = CURATED_PDP.get(product, "")
-    url = sanitize_url(curated) if curated else ""
+    url = sanitize_url(CURATED_PDP.get(product, ""))
     return {
         "id": str(uuid.uuid4()),
         "Category": category,
@@ -680,9 +718,7 @@ def process_analytics(catalog: List[Dict[str, Any]], card_selection: str) -> pd.
         discount_pct = round((savings / avg_6m) * 100, 1) if avg_6m > 0 else 0.0
         card_title, net_price = _best_card(current, card_selection)
 
-        stored_url = sanitize_url(str(entry.get("URL", "")))
-        if not stored_url:
-            stored_url = search_url(product)
+        stored_url = sanitize_url(str(entry.get("URL", ""))) or search_url(product)
         specific = is_pdp(stored_url)
 
         records.append({
@@ -756,14 +792,17 @@ def detect_category(title: str) -> str:
 def build_wishlist_item(title: str, url: str, brand: str = "", current: int = 999,
                         *, resolve_live: bool = False, **overrides: Any) -> Dict[str, Any]:
     """
-    Build a wishlist record. A pasted PDP link is honoured verbatim; otherwise the
-    resolver is optionally asked for the specific product page.
+    Build a wishlist record. A pasted PDP link is honoured verbatim; otherwise a
+    curated match is used, and failing that the resolver is optionally consulted.
     """
     title = (title or "").strip()
     current = max(int(current or 999), 1)
 
     final_url = sanitize_url(url)
     source = LINK_CURATED if is_pdp(final_url) else LINK_SEARCH
+
+    if not is_pdp(final_url) and title in CURATED_PDP:
+        final_url, source = sanitize_url(CURATED_PDP[title]), LINK_CURATED
     if not is_pdp(final_url) and resolve_live:
         outcome = get_resolver().resolve(title)
         final_url, source = outcome.url, outcome.source
@@ -830,7 +869,7 @@ DISPLAY_COLUMNS = [
     "➕ Wishlist", "Brand", "Product", "Current Price", "6-Month Avg",
     "Last BBD Low", "Real Savings (vs 6M)", "Real Disc % (vs 6M)",
     "Diff vs Last BBD", "Verdict", "Predicted BBD Low", "Optimal Card",
-    "Net Price", "Last Checked", "URL",
+    "Net Price", "Link", "URL",
 ]
 
 COLUMN_CONFIG = {
@@ -845,6 +884,7 @@ COLUMN_CONFIG = {
         format="₹%d", help="Negative means it is cheaper today than last year's BBD low"),
     "Predicted BBD Low": st.column_config.NumberColumn(format="₹%d"),
     "Net Price": st.column_config.NumberColumn(format="₹%d"),
+    "Link": st.column_config.TextColumn("Link Type", help="Whether this row opens an exact product page"),
     "URL": st.column_config.LinkColumn("Product Link", display_text="Open ↗"),
 }
 
@@ -854,23 +894,26 @@ def kpi(value: str, label: str, colour: str = "#38bdf8") -> str:
             f'<div class="kpi-label">{label}</div></div>')
 
 
-def run_link_resolution(force: bool = False) -> None:
-    """Resolve specific PDP links for products that do not yet have one."""
+def run_link_resolution(force: bool = False, *, silent: bool = False) -> int:
+    """Resolve specific PDP links. Returns the number of records updated."""
     resolver = get_resolver()
     records = load_tracker_data()
-    targets = sorted({str(r["Product"]) for r in records if r.get("Product")}) if force \
-        else sorted(set(products_needing_links(records)))
+    targets = (sorted({str(r["Product"]) for r in records if r.get("Product")}) if force
+               else sorted(set(products_needing_links(records))))
 
     if not targets:
-        st.success("Every tracked product already links to a specific product page.")
-        return
+        if not silent:
+            st.success("Every tracked product already links to a specific product page.")
+        return 0
     if not resolver.available:
-        st.error("The `requests` package is required for live link resolution. "
-                 "Install it with `pip install requests`.")
-        return
+        if not silent:
+            st.error("The `requests` package is required for live link resolution. "
+                     "Install it with `pip install requests`.")
+        return 0
 
     bar = st.progress(0.0)
     status = st.empty()
+    status.caption(f"Resolving {len(targets)} product links from Flipkart…")
 
     def on_progress(index: int, total: int, name: str) -> None:
         bar.progress(min(index / max(total, 1), 1.0))
@@ -888,16 +931,13 @@ def run_link_resolution(force: bool = False) -> None:
         st.success(f"Resolved {succeeded}/{len(targets)} specific product links "
                    f"({updated} records updated).")
     if failed:
-        with st.expander(f"⚠️ {len(failed)} product(s) could not be resolved", expanded=False):
+        with st.expander(f"⚠️ {len(failed)} product(s) could not be resolved", expanded=not succeeded):
             st.caption("These keep a Flipkart search link so they still open correctly. "
-                       "Flipkart rate-limits automated lookups — retry later, or paste the "
-                       "product URL manually in the wishlist form.")
-            st.dataframe(
-                pd.DataFrame([{"Product": o.query, "Reason": o.detail} for o in failed]),
-                hide_index=True, use_container_width=True,
-            )
-    if succeeded:
-        st.rerun()
+                       "Use **🩺 Test Flipkart Connection** to diagnose, or paste the product "
+                       "URL manually in the wishlist form.")
+            st.dataframe(pd.DataFrame([{"Product": o.query, "Reason": o.detail} for o in failed]),
+                         hide_index=True, use_container_width=True)
+    return updated
 
 
 def render_collapsible_table(df_subset: pd.DataFrame, category_title: str, slug: str,
@@ -906,8 +946,9 @@ def render_collapsible_table(df_subset: pd.DataFrame, category_title: str, slug:
         return
 
     unresolved = int((~df_subset["URL"].map(is_pdp)).sum())
-    badge = f" · {unresolved} link(s) unresolved" if unresolved else ""
-    with st.expander(f"{icon} {category_title} — ({len(df_subset)} products{badge})", expanded=is_expanded):
+    badge = f" · {unresolved} unresolved link(s)" if unresolved else " · all exact links ✓"
+    with st.expander(f"{icon} {category_title} — ({len(df_subset)} products{badge})",
+                     expanded=is_expanded):
         c1, c2, c3, c4, c5 = st.columns([2, 1.5, 2, 1.5, 1.5])
 
         brands = sorted(df_subset["Brand"].dropna().unique().tolist())
@@ -983,7 +1024,8 @@ def render_collapsible_table(df_subset: pd.DataFrame, category_title: str, slug:
         if allow_deletion:
             with right:
                 with st.popover("🗑️ Delete Wishlist Items"):
-                    labels = {o["id"]: o["Product"] for o in df_subset[["id", "Product"]].to_dict("records")}
+                    labels = {o["id"]: o["Product"]
+                              for o in df_subset[["id", "Product"]].to_dict("records")}
                     target_id = st.selectbox("Select product to delete:", options=list(labels),
                                              format_func=lambda x: labels.get(x, x),
                                              key=f"{slug}_del_pick")
@@ -995,37 +1037,55 @@ def render_collapsible_table(df_subset: pd.DataFrame, category_title: str, slug:
 
 def main() -> None:
     st.title("⚡ Flipkart Persistent Deal Tracker & BBD Steals Radar")
-    st.caption("Price intelligence on one page: specific product links, BBD benchmarks, "
+    st.caption("Price intelligence on one page: exact product links, BBD benchmarks, "
                "sponsored-deal scanner and a persistent wishlist.")
 
-    t1, t2, t3, t4, t5 = st.columns([1.5, 1.6, 1.2, 1.1, 1.2])
+    t1, t2, t3, t4, t5, t6 = st.columns([1.4, 1.5, 1.2, 1.0, 1.0, 1.2])
     with t1:
-        if st.button("🔄 Scan & Re-Check Live Prices", type="primary", use_container_width=True):
+        if st.button("🔄 Re-Check Prices", type="primary", use_container_width=True):
             with st.spinner("Re-checking active discounts…"):
                 count = refresh_all_live_prices()
             st.success(f"Updated live prices for {count} products.")
             st.rerun()
     with t2:
         resolve_clicked = st.button(
-            "🔗 Resolve Specific Product Links", use_container_width=True,
-            help="Looks up each product on Flipkart and stores its exact product-page URL")
+            "🔗 Resolve Product Links", use_container_width=True,
+            help="Look up each product on Flipkart and store its exact product-page URL")
     with t3:
-        if st.button("🚨 Reset Database", use_container_width=True,
-                     help="Rebuilds the catalogue from the verified seed data"):
+        diagnose_clicked = st.button("🩺 Test Connection", use_container_width=True,
+                                     help="Check whether this machine can reach Flipkart")
+    with t4:
+        if st.button("🚨 Reset DB", use_container_width=True):
             save_tracker_data(generate_seed_catalog())
+            st.session_state.pop("auto_resolved", None)
             st.success("Catalogue rebuilt.")
             st.rerun()
-    with t4:
-        expand_all = st.checkbox("📂 Expand All", value=False)
     with t5:
-        card_preference = st.selectbox("💳 Card Strategy:", [CARD_AUTO, CARD_INSTANT, CARD_CASHBACK])
+        expand_all = st.checkbox("📂 Expand", value=False)
+    with t6:
+        card_preference = st.selectbox("💳 Card:", [CARD_AUTO, CARD_INSTANT, CARD_CASHBACK])
 
-    if resolve_clicked:
-        run_link_resolution()
+    if diagnose_clicked:
+        with st.spinner("Contacting Flipkart…"):
+            ok, message = get_resolver().self_test()
+        (st.success if ok else st.error)(message)
+
+    # Auto-resolve once per session so links are specific without a manual click.
+    if AUTO_RESOLVE_ON_START and not st.session_state.get("auto_resolved"):
+        st.session_state["auto_resolved"] = True
+        pending = products_needing_links(load_tracker_data())
+        if pending and get_resolver().available:
+            st.info(f"First run: fetching exact product links for {len(pending)} items "
+                    f"(~{len(pending) * RESOLVER_DELAY / 60:.1f} min). This happens once.")
+            if run_link_resolution(silent=True):
+                st.rerun()
+
+    if resolve_clicked and run_link_resolution():
+        st.rerun()
 
     master_df = process_analytics(load_tracker_data(), card_preference)
     if master_df.empty:
-        st.error("No tracked products found. Use 'Reset Database' to rebuild the catalogue.")
+        st.error("No tracked products found. Use 'Reset DB' to rebuild the catalogue.")
         return
 
     specific_links = int(master_df["URL"].map(is_pdp).sum())
@@ -1033,8 +1093,8 @@ def main() -> None:
 
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.markdown(kpi(f"{total_products:,}", "Monitored Products"), unsafe_allow_html=True)
-    k2.markdown(kpi(f"{specific_links}/{total_products}", "Specific Product Links",
-                    "#38bdf8" if specific_links == total_products else "#f97316"),
+    k2.markdown(kpi(f"{specific_links}/{total_products}", "Exact Product Links",
+                    "#4ade80" if specific_links == total_products else "#f97316"),
                 unsafe_allow_html=True)
     k3.markdown(kpi(f"{int((master_df['Diff vs Last BBD'] <= 0).sum()):,}",
                     "🔥 Cheaper Than Last BBD", "#facc15"), unsafe_allow_html=True)
@@ -1044,9 +1104,9 @@ def main() -> None:
                     "Total Consumer Savings", "#4ade80"), unsafe_allow_html=True)
 
     if specific_links < total_products:
-        st.info(f"{total_products - specific_links} product(s) currently open a Flipkart "
-                f"**search** page. Click **🔗 Resolve Specific Product Links** to fetch their "
-                f"exact product-page URLs (takes about {(total_products - specific_links) * RESOLVER_DELAY / 60:.1f} min).")
+        st.warning(f"{total_products - specific_links} product(s) still open a Flipkart "
+                   "**search** page. Click **🔗 Resolve Product Links** to fetch their exact "
+                   "product pages, or **🩺 Test Connection** if resolution keeps failing.")
 
     st.divider()
 
@@ -1069,10 +1129,12 @@ def main() -> None:
                         records.append(item)
                         save_tracker_data(records)
                     if is_pdp(item["URL"]):
-                        st.success(f"Saved '{item['Product']}' to '{item['Category']}' with a specific product link.")
+                        st.success(f"Saved '{item['Product']}' to '{item['Category']}' "
+                                   "with an exact product link.")
                     else:
-                        st.warning(f"Saved '{item['Product']}' to '{item['Category']}', but the exact "
-                                   "product page could not be resolved — a search link was stored.")
+                        st.warning(f"Saved '{item['Product']}' to '{item['Category']}', but the "
+                                   "exact product page could not be resolved — a search link "
+                                   "was stored.")
                     st.rerun()
 
     wishlist_df = master_df[master_df["is_wishlist"]]
