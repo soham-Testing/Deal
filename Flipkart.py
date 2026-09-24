@@ -39,7 +39,7 @@ except ImportError:
 # --------------------------------------------------------------------------- #
 
 APP_TITLE = "Flipkart BBD Deal Tracker & Live Price Radar"
-TRACKER_VERSION = "v20_fast_streaming_30k"
+TRACKER_VERSION = "v21_fixed_atomic_write_json"
 TRACKER_DB_FILE = os.environ.get("TRACKER_DB_FILE", "tracker_store.json")
 LINK_CACHE_FILE = os.environ.get("LINK_CACHE_FILE", "flipkart_link_cache.json")
 SCANNER_STORE_FILE = os.environ.get("SCANNER_STORE_FILE", "flipkart_scan_store.json")
@@ -63,7 +63,7 @@ SCANNER_CHALLENGE_MARKERS = (
     "captcha", "unusual traffic", "are you a human", "access denied", "request blocked"
 )
 
-AUTO_RESOLVE_ON_START = False  # Disabled on startup to prevent timeout with 27k+ records
+AUTO_RESOLVE_ON_START = False  # Disabled on startup to prevent timeout
 RESOLVER_TIMEOUT = 12
 RESOLVER_RETRIES = 2
 RESOLVER_DELAY = 1.0
@@ -124,8 +124,23 @@ st.markdown(
 
 
 # --------------------------------------------------------------------------- #
-# URL UTILITIES
+# ATOMIC FILE IO & URL UTILITIES (DEFINED FIRST)
 # --------------------------------------------------------------------------- #
+
+
+def atomic_write_json(path: str, payload: Any) -> None:
+    """Write JSON atomically using a tempfile so an interrupted run never corrupts the file."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    handle, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 
 
 def search_url(*terms: str) -> str:
@@ -978,7 +993,7 @@ def render_collapsible_table(df_subset: pd.DataFrame, category_title: str, slug:
         else:
             table["➕ Wishlist"] = False
 
-        # Streaming Row Limiter: Prevents WebSocket MessageSizeError while preserving all thousands of items
+        # Streaming Row Limiter: Prevents WebSocket MessageSizeError while keeping all 25k+ products alive
         r_ctrl1, r_ctrl2 = st.columns([3, 1])
         with r_ctrl2:
             display_limit = st.selectbox(
@@ -1447,7 +1462,6 @@ class FlipkartCatalogueScanner:
     def extract_products(cls, html: str) -> List[ScannedProduct]:
         found: Dict[str, ScannedProduct] = {}
 
-        # Layer 1: Extract from __INITIAL_STATE__ JSON
         match = SCANNER_STATE_PATTERN.search(html)
         if match:
             try:
@@ -1466,7 +1480,6 @@ class FlipkartCatalogueScanner:
                     if existing is None or _scanned_richness(product) > _scanned_richness(existing):
                         found[product.key] = product
 
-        # Layer 2: Extract directly from HTML cards (DOM Parser Fallback/Enricher)
         card_chunks = re.findall(r'<div[^>]*data-id="([A-Z0-9]{12,18})"[^>]*>(.*?)</div>\s*</div>\s*</div>', html, re.DOTALL)
         for pid, block in card_chunks:
             pdp_match = re.search(r'href="(/[^"?#]{3,200}/p/itm[0-9a-z]{12,18}[^"]*)"', block, re.IGNORECASE)
@@ -1502,7 +1515,6 @@ class FlipkartCatalogueScanner:
             if product.key not in found:
                 found[product.key] = product
 
-        # Layer 3: Catch-all regex href scan
         if not found:
             for href_match in PDP_HREF_PATTERN.finditer(html):
                 href = href_match.group(1)
