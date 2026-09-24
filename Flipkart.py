@@ -2138,6 +2138,196 @@ def _map_to_tracker_category(title: str, hint: str = "") -> str:
     return "Men's Fashion" if "men" in lowered else "Stationery & Books"
 
 
+
+# --------------------------------------------------------------------------- #
+# IN-APP DIAGNOSTIC
+# --------------------------------------------------------------------------- #
+# Runs entirely inside Streamlit - no terminal needed. This matters because
+# Streamlit Community Cloud gives you no shell, so a standalone script cannot
+# be run there.
+#
+# It tests the EXACT regexes and extraction logic the scanner uses (not an
+# approximation), and reports the FIRST failing step - which is the real cause;
+# everything after it fails as a consequence.
+
+
+DIAG_CHALLENGE_MARKERS = SCANNER_CHALLENGE_MARKERS
+
+
+def run_scanner_diagnostic() -> List[Dict[str, Any]]:
+    """
+    Five sequential checks. Returns a list of step results for display.
+
+    Each entry: {step, name, ok, detail, hint}
+    """
+    steps: List[Dict[str, Any]] = []
+
+    def add(step: int, name: str, ok: bool, detail: str, hint: str = "") -> bool:
+        steps.append({"Step": step, "Check": name,
+                      "Result": "✅ PASS" if ok else "❌ FAIL",
+                      "Detail": detail, "_hint": hint, "_ok": ok})
+        return ok
+
+    if requests is None:
+        add(1, "requests installed", False,
+            "The `requests` package is missing.",
+            "Add `requests>=2.28` to requirements.txt and redeploy.")
+        return steps
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": RESOLVER_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-IN,en;q=0.9",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    })
+
+    # -- 1. reachability ---------------------------------------------------- #
+    try:
+        home = session.get(f"https://{FLIPKART_HOST}/", timeout=20)
+        ok = home.status_code == 200
+        if not add(1, "Reach flipkart.com", ok,
+                   f"HTTP {home.status_code}, {len(home.text):,} bytes",
+                   "" if ok else
+                   "Flipkart refused this server. On Streamlit Community Cloud "
+                   "this is expected: shared datacenter IPs are widely blocked "
+                   "by e-commerce sites. Run the app locally instead."):
+            return steps
+    except Exception as exc:
+        add(1, "Reach flipkart.com", False,
+            f"{type(exc).__name__}: {str(exc)[:140]}",
+            "No connection at all. On Streamlit Cloud this normally means "
+            "Flipkart is dropping traffic from the host's IP range. Running "
+            "the app on your own machine is the only reliable fix.")
+        return steps
+
+    # -- 2. real search results --------------------------------------------- #
+    url = scanner_search_url("laptop")
+    try:
+        resp = session.get(url, timeout=20)
+    except Exception as exc:
+        add(2, "Search returns results", False,
+            f"{type(exc).__name__}: {str(exc)[:140]}",
+            "Homepage loaded but /search did not. Flipkart treats search as "
+            "higher-risk and blocks it more aggressively.")
+        return steps
+
+    html = resp.text or ""
+    if resp.status_code != 200:
+        add(2, "Search returns results", False, f"HTTP {resp.status_code}",
+            "Search is blocked even though the homepage loaded.")
+        return steps
+
+    challenged = any(m in html[:4000].lower() for m in DIAG_CHALLENGE_MARKERS)
+    if not add(2, "Search returns results", not challenged,
+               "Bot-challenge page served" if challenged
+               else f"HTTP 200, {len(html):,} bytes of real markup",
+               "Flipkart served a CAPTCHA instead of products. Wait 10-15 "
+               "minutes, then lower 'Pages per query'." if challenged else ""):
+        return steps
+
+    # -- 3. payload present -------------------------------------------------- #
+    has_state = "__INITIAL_STATE__" in html
+    hrefs = len(set(PDP_HREF_PATTERN.findall(html)))
+    add(3, "__INITIAL_STATE__ present", has_state,
+        f"Payload found · {hrefs} raw PDP links in page" if has_state
+        else f"Payload ABSENT · {hrefs} raw PDP links in page",
+        "" if has_state else
+        "Flipkart changed its markup. The href fallback can still find links "
+        "but without prices, so discounts cannot be ranked.")
+
+    # -- 4. extraction ------------------------------------------------------- #
+    products = FlipkartCatalogueScanner.extract_products(html)
+    priced = [p for p in products if p.price > 0]
+    extract_ok = len(products) > 0
+    add(4, "Parser extracts products", extract_ok,
+        f"{len(products)} products extracted, {len(priced)} with prices"
+        if extract_ok else
+        "ZERO products extracted from a page that loaded fine",
+        "" if extract_ok else
+        "The page downloaded but the parser's key names no longer match "
+        "Flipkart's schema. This is a code fix - send this result and the "
+        "extraction can be corrected precisely.")
+
+    # -- 5. price-band facets (bisection depends on these) ------------------- #
+    banded_url = scanner_search_url("laptop", price_min=20000, price_max=40000)
+    try:
+        banded = session.get(banded_url, timeout=20)
+        banded_products = FlipkartCatalogueScanner.extract_products(banded.text or "")
+        saturated = len(banded_products) >= SCANNER_SATURATION
+        add(5, "Price-band facets work", len(banded_products) > 0,
+            f"{len(banded_products)} products in ₹20k-40k band · "
+            f"{'saturated → bisection will split' if saturated else 'short → slice complete'}"
+            if banded_products else "Banded query returned nothing",
+            "" if banded_products else
+            "Bisection cannot run, so scans stay shallow even when other "
+            "steps pass.")
+    except Exception as exc:
+        add(5, "Price-band facets work", False,
+            f"{type(exc).__name__}: {str(exc)[:140]}", "")
+
+    return steps
+
+
+def render_diagnostic_panel() -> None:
+    """Diagnostic UI. Deliberately placed ABOVE the scan controls."""
+    st.markdown("**Before scanning, confirm this server can actually reach "
+                "Flipkart.**")
+    st.caption("A scan that returns nothing looks identical whether the cause "
+               "is blocking or a parser mismatch. These are opposite problems "
+               "with opposite fixes, so test rather than guess.")
+
+    if st.button("🩺 Run Full Diagnostic", key="diag_run", type="primary"):
+        with st.spinner("Testing connection, markup and parser…"):
+            st.session_state["diag_results"] = run_scanner_diagnostic()
+
+    steps = st.session_state.get("diag_results")
+    if not steps:
+        return
+
+    frame = pd.DataFrame([{k: v for k, v in s.items() if not k.startswith("_")}
+                          for s in steps])
+    st.dataframe(frame, use_container_width=True, hide_index=True)
+
+    failures = [s for s in steps if not s["_ok"]]
+    if not failures:
+        st.success("**All checks passed.** This server can scan Flipkart. If a "
+                   "scan still returns few products, the limit is rate-limiting "
+                   "during sustained use — lower 'Pages per query' and retry.")
+        return
+
+    first = failures[0]
+    st.error(f"**First failure — step {first['Step']}: {first['Check']}**\n\n"
+             f"{first['Detail']}\n\nEverything after this point fails as a "
+             f"consequence.")
+    if first["_hint"]:
+        st.warning(first["_hint"])
+
+    if first["Step"] in (1, 2):
+        st.markdown(
+            "### This is a network/blocking problem, not a code problem\n"
+            "The scanner logic is fine — it simply cannot obtain data.\n\n"
+            "**If you are on Streamlit Community Cloud, this is the expected "
+            "result.** Flipkart blocks shared datacenter IP ranges, and every "
+            "Streamlit Cloud app shares those ranges. No code change fixes "
+            "this.\n\n"
+            "**What actually works:**\n"
+            "- Run the app on your own machine: `streamlit run "
+            "flipkart_deal_tracker.py` on a home/office network\n"
+            "- Or use Flipkart's official Affiliate API, which is built for "
+            "programmatic access and is not IP-blocked\n\n"
+            "The tracker's own 90-product catalogue, BBD benchmarks, card "
+            "maths and wishlist keep working regardless — only live discovery "
+            "needs the connection.")
+    elif first["Step"] in (3, 4):
+        st.markdown(
+            "### This is a parser problem\n"
+            "Pages are downloading, but the extraction keys no longer match "
+            "Flipkart's markup. Share this table and the extraction can be "
+            "corrected precisely instead of guessed at.")
+
+
 def render_deep_scanner() -> None:
     """
     Compact scan controls. Results are merged into the tracker catalogue above,
@@ -2148,6 +2338,9 @@ def render_deep_scanner() -> None:
     st.divider()
     with st.expander("🛰️ Deep Catalogue Scanner — find more products for the "
                      "tables above", expanded=False):
+
+        render_diagnostic_panel()
+        st.divider()
 
         if not scanner.available:
             st.error("The `requests` package is required for scanning. "
