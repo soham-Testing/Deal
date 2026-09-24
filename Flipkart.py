@@ -6,24 +6,36 @@ Single-file Streamlit price-intelligence app.
 Requirements: streamlit >= 1.35, pandas >= 2.0, requests >= 2.28
 Run with:     streamlit run Flipkart.py
 
-WHAT IS IN THIS BUILD (v24 - complete, self-contained)
+WHAT IS IN THIS BUILD (v25 - complete, self-contained)
 ------------------------------------------------------
 * Direct product links on EVERY row of EVERY table (auto-resolved on render).
   A link is shown only when it is a verified /p/itm product page - never a
   search or category page.
-* The old "Link Type" status column is gone; the clickable product link stays.
-* NEW: "Product Type" filter beside the Brand filter (shirts / pants / watches
-  / sunglasses / laptops ... 46 types, auto-detected from the title).
-* NEW: Price History Checker (section 4) - paste any Flipkart product URL to
-  track current price, 1-year average, 1-year low/high and last year's Big
-  Billion Days floor.
-* No separate add-on module: everything lives in this one file.
+* The old "Link Type" status column is gone; the clickable link stays.
+* "Product Type" filter beside the Brand filter (46 types: shirts / pants /
+  watches / sunglasses / laptops ...), auto-detected from the title.
+* PRICE HISTORY CHECKER (section 4) as a standalone, tabbed tool:
+      Tab 1  Overview      - current price, 1-year average, 1-year low/high,
+                             last year's BBD floor, verdict, trend chart
+      Tab 2  External sites- one-click deep links to PriceHistory.app,
+                             PriceHistoryApp.com, SpendMitra, BuyHatke
+      Tab 3  Add / import  - manual backfill + optional paid-API import
+      Tab 4  All tracked   - portfolio table + CSV export
+* Optional external providers (RapidAPI / Apify / custom JSON) configured
+  entirely through Streamlit secrets. Off by default; never required.
 
-NOTE ON PRICE HISTORY
----------------------
-Flipkart does not publish past prices. History is built from YOUR OWN dated
-checks plus prices you enter manually. Nothing is invented - where there is
-not enough history the app says so instead of showing a fabricated average.
+HONEST NOTE ON PRICE HISTORY
+----------------------------
+Flipkart publishes no past prices and there is no free official history API.
+This app therefore builds a REAL dated series from (a) your own checks,
+(b) prices you enter manually, and (c) an optional paid provider. Where there
+is not enough history it says so rather than inventing an average.
+
+It deliberately does NOT scrape pricehistory.app / SpendMitra / BuyHatke:
+they sit behind bot protection, Streamlit Cloud shares outbound IPs, their
+markup changes without notice (returning silently WRONG prices), and their
+terms forbid re-serving the data. Instead it deep-links you straight to the
+right product page on those sites, where their own chart renders correctly.
 """
 
 from __future__ import annotations
@@ -41,7 +53,7 @@ import time
 import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, quote_plus, urlencode, urlparse, urlunparse
 
@@ -58,7 +70,7 @@ except ImportError:
 # --------------------------------------------------------------------------- #
 
 APP_TITLE = "Flipkart BBD Deal Tracker & Live Price Radar"
-TRACKER_VERSION = "v24_types_and_price_history"
+TRACKER_VERSION = "v25_price_history_suite"
 TRACKER_DB_FILE = os.environ.get("TRACKER_DB_FILE", "tracker_store.json")
 LINK_CACHE_FILE = os.environ.get("LINK_CACHE_FILE", "flipkart_link_cache.json")
 SCANNER_STORE_FILE = os.environ.get("SCANNER_STORE_FILE", "flipkart_scan_store.json")
@@ -68,11 +80,9 @@ FLIPKART_HOST = "www.flipkart.com"
 FLIPKART_SEARCH = f"https://{FLIPKART_HOST}/search?q={{query}}"
 ALLOWED_HOSTS = {"flipkart.com", "www.flipkart.com", "dl.flipkart.com"}
 
-# Keep q for internal search fetches, pid/lid/marketplace for product pages
 KEEP_PARAMS = {"pid", "lid", "marketplace", "q"}
 HISTORY_KEEP_PARAMS = {"pid", "lid", "marketplace"}
 
-# A real Flipkart PDP always carries /p/itm<hex> in the path.
 ITM_ID_PATTERN = re.compile(r"/p/(itm[0-9a-z]{10,20})(?:[/?#]|$)", re.IGNORECASE)
 PID_PARAM_PATTERN = re.compile(r"[?&]pid=([A-Z0-9]{12,20})(?:&|$)")
 PDP_HREF_PATTERN = re.compile(
@@ -85,17 +95,16 @@ SCANNER_CHALLENGE_MARKERS = (
     "captcha", "unusual traffic", "are you a human", "access denied", "request blocked"
 )
 
-# Paths that are never a single product even if they look link-ish
 NON_PDP_PATH_MARKERS = ("/search", "/pr?", "/q/", "/item/p/product", "/offers-store",
                         "/all-offers", "/clp/", "/sale/")
 
-AUTO_RESOLVE_ON_START = False       # full-catalogue resolve on boot (slow, off)
-AUTO_LINK_VISIBLE_DEFAULT = True    # auto-resolve the rows you can actually see
-AUTO_LINK_VISIBLE_CAP = 60          # max live lookups per table render
+AUTO_RESOLVE_ON_START = False
+AUTO_LINK_VISIBLE_DEFAULT = True
+AUTO_LINK_VISIBLE_CAP = 60
 RESOLVER_TIMEOUT = 12
 RESOLVER_RETRIES = 2
 RESOLVER_DELAY = 0.6
-RESOLVER_PARALLEL = 6               # concurrent lookups for visible-row batches
+RESOLVER_PARALLEL = 6
 RESOLVER_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -114,20 +123,31 @@ CARD_CASHBACK = "Flipkart Axis (5% Unlimited Cashback)"
 LINK_RESOLVED = "resolved"
 LINK_PENDING = "pending"
 
-# Price history settings
+# Price history
 HISTORY_TIMEOUT = 15
 HISTORY_RETRIES = 2
 HISTORY_DELAY = 1.0
 ONE_YEAR_DAYS = 365
-# Festive (Big Billion Days) window used to compute "Last BBD Low".
-# Flipkart sets BBD dates fresh each year, so this is an EDITABLE default
-# rather than a hard-coded claim - adjust it in the UI.
-DEFAULT_BBD_START = (9, 20)   # (month, day)
+DEFAULT_BBD_START = (9, 20)   # (month, day) - editable in the UI
 DEFAULT_BBD_END = (10, 15)
 MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
-# Unrestricted Scanner Traversal Settings
+# External provider settings
+PROVIDER_LOCAL = "local"
+PROVIDER_RAPIDAPI = "rapidapi"
+PROVIDER_APIFY = "apify"
+PROVIDER_CUSTOM = "custom"
+PROVIDER_LABELS = {
+    PROVIDER_LOCAL: "Local - my own recorded checks (free, no key)",
+    PROVIDER_RAPIDAPI: "RapidAPI Flipkart price-history API (paid key)",
+    PROVIDER_APIFY: "Apify Flipkart actor (paid token)",
+    PROVIDER_CUSTOM: "Custom JSON endpoint (your own service)",
+}
+PROVIDER_TIMEOUT = 20
+PROVIDER_RETRIES = 2
+
+# Scanner
 SCANNER_TIMEOUT = 15
 SCANNER_RETRIES = 3
 SCANNER_WORKERS = 4
@@ -148,8 +168,8 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# NOTE: all inline HTML below uses DOUBLE-quoted Python strings so an
-# apostrophe inside the text can never terminate the literal early.
+# NOTE: every inline HTML block uses DOUBLE-quoted Python strings so an
+# apostrophe in the copy can never terminate the literal early.
 st.markdown(
     """
 <style>
@@ -173,7 +193,7 @@ st.markdown(
 
 
 def atomic_write_json(path: str, payload: Any) -> None:
-    """Write JSON atomically using a tempfile so an interrupted run never corrupts the file."""
+    """Write JSON atomically so an interrupted run never corrupts the file."""
     directory = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(directory, exist_ok=True)
     handle, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
@@ -188,7 +208,7 @@ def atomic_write_json(path: str, payload: Any) -> None:
 
 
 def search_url(*terms: str) -> str:
-    """Internal helper only: used to FETCH search HTML, never surfaced as a product link."""
+    """Internal helper: used to FETCH search HTML, never shown as a product link."""
     query = " ".join(t for t in terms if t).strip() or "deals"
     return FLIPKART_SEARCH.format(query=quote_plus(query))
 
@@ -225,7 +245,7 @@ def sanitize_url(raw_url: str) -> str:
 
 
 def is_pdp(url: str) -> bool:
-    """True only for a link that opens ONE specific Flipkart product detail page."""
+    """True only for a link that opens ONE specific Flipkart product page."""
     if not url or not isinstance(url, str):
         return False
     try:
@@ -256,7 +276,7 @@ def extract_itm_id(url: str) -> str:
 
 
 def product_link(url: str) -> str:
-    """Return the URL only when it is a verified specific-product link, else blank."""
+    """Return the URL only when it is a verified product link, else blank."""
     clean = sanitize_url(url)
     return clean if is_pdp(clean) else ""
 
@@ -276,11 +296,11 @@ def _slug_of(url: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# PRODUCT TYPE CLASSIFIER  (powers the Product Type filter)
+# PRODUCT TYPE CLASSIFIER (powers the Product Type filter)
 # --------------------------------------------------------------------------- #
 
 # Ordered most-specific -> most-general. First match wins.
-# Word-boundary matching is used so "laptop" never matches the keyword "top".
+# Word-boundary matching so "laptop" never matches the keyword "top".
 _PRODUCT_TYPE_RULES: List[Tuple[str, Tuple[str, ...]]] = [
     ("T-Shirts & Polos",      ("t-shirt", "tshirt", "t shirt", "tee", "polo")),
     ("Shirts",                ("shirt", "shirts")),
@@ -298,7 +318,7 @@ _PRODUCT_TYPE_RULES: List[Tuple[str, Tuple[str, ...]]] = [
                                "chikankari", "salwar", "dupatta")),
     ("Dresses & Gowns",       ("dress", "gown", "maxi", "frock")),
     ("Jumpsuits & Co-ords",   ("jumpsuit", "co ord", "co-ord", "dungaree")),
-    # bare "top"/"tops" deliberately excluded - collides with "Laptop", "Top Tier"
+    # bare "top"/"tops" excluded - collides with "Laptop", "Top Tier"
     ("Tops & Tunics",         ("tunic", "tunics", "blouse", "crop top", "crop tops",
                                "peplum", "tank top", "casual top", "ladies top")),
     ("Leggings & Skirts",     ("legging", "leggings", "palazzo", "skirt", "jegging")),
@@ -450,7 +470,6 @@ class FlipkartLinkResolver:
                 data = json.load(fh)
             if not isinstance(data, dict):
                 return {}
-            # Drop legacy cache entries that are not true product pages.
             return {k: v for k, v in data.items() if isinstance(v, str) and is_pdp(v)}
         except Exception:
             return {}
@@ -470,7 +489,6 @@ class FlipkartLinkResolver:
             return self._cache.get((product_name or "").strip().lower(), "")
 
     def recently_failed(self, product_name: str, cooldown: float = 900.0) -> bool:
-        """Avoid hammering Flipkart for a name that just failed to resolve."""
         key = (product_name or "").strip().lower()
         with self._lock:
             stamp = self._failures.get(key)
@@ -537,22 +555,18 @@ class FlipkartLinkResolver:
             return False, "Flipkart connection refused or IP blocked."
         if not self._best_pdp(html, "Puma Conduct Pro"):
             return False, "Flipkart served a challenge page with no product links."
-        return True, "Connected to Flipkart and specific product links parsed successfully."
+        return True, "Connected to Flipkart and product links parsed successfully."
 
     @staticmethod
     def _candidate_links(html: str) -> List[Tuple[str, str]]:
-        """Return (url, title) pairs for every genuine PDP anchor on a search page."""
+        """Return (url, title) pairs for every genuine PDP anchor on a page."""
         candidates: Dict[str, str] = {}
-
-        # Rich structured cards first (title + url together) via the scanner parser.
         try:
             for product in FlipkartCatalogueScanner.extract_products(html):
                 if is_pdp(product.url):
                     candidates.setdefault(product.url, product.title or _slug_of(product.url))
         except Exception:
             pass
-
-        # Raw anchors as a safety net.
         for match in PDP_HREF_PATTERN.finditer(html):
             href = match.group(1)
             clean = sanitize_url(f"https://{FLIPKART_HOST}{href}")
@@ -562,7 +576,7 @@ class FlipkartLinkResolver:
 
     @classmethod
     def _best_pdp(cls, html: str, query: str) -> str:
-        """Pick the card that actually matches the product name, not the first tile."""
+        """Pick the card matching the product name, not the first tile."""
         candidates = cls._candidate_links(html)
         if not candidates:
             return ""
@@ -574,12 +588,9 @@ class FlipkartLinkResolver:
         for position, (url, title) in enumerate(candidates):
             have = _tokens(title) | _tokens(_slug_of(url))
             overlap = len(wanted & have)
-            # favour matches, break ties by the earlier (more relevant) card
             score = overlap / len(wanted) - position * 0.001
             if score > best_score:
                 best_url, best_score = url, score
-
-        # Require at least one real token in common, else it is a random tile.
         return best_url if best_score > 0 else ""
 
     def resolve(self, product_name: str, *, use_cache: bool = True) -> ResolveOutcome:
@@ -631,7 +642,7 @@ class FlipkartLinkResolver:
     def resolve_parallel(self, product_names: Sequence[str], *,
                          workers: int = RESOLVER_PARALLEL,
                          use_cache: bool = True) -> List[ResolveOutcome]:
-        """Fast path used when auto-linking the rows currently on screen."""
+        """Fast path used when auto-linking rows currently on screen."""
         names = [n for n in product_names if n]
         if not names:
             return []
@@ -648,7 +659,7 @@ class FlipkartLinkResolver:
 
 
 # Cache key includes TRACKER_VERSION so a redeploy never reuses a stale
-# resolver instance from an older build (that caused an AttributeError before).
+# resolver from an older build (that previously caused an AttributeError).
 @st.cache_resource(show_spinner=False)
 def _get_resolver_versioned(version: str) -> FlipkartLinkResolver:
     return FlipkartLinkResolver()
@@ -656,8 +667,6 @@ def _get_resolver_versioned(version: str) -> FlipkartLinkResolver:
 
 def get_resolver() -> FlipkartLinkResolver:
     resolver = _get_resolver_versioned(TRACKER_VERSION)
-    # Self-heal: if Streamlit handed back an object from an older module build,
-    # rebuild it rather than crashing on a missing method.
     if not hasattr(resolver, "cached_url") or not hasattr(resolver, "resolve_parallel"):
         _get_resolver_versioned.clear()
         resolver = _get_resolver_versioned(TRACKER_VERSION)
@@ -665,7 +674,7 @@ def get_resolver() -> FlipkartLinkResolver:
 
 
 # --------------------------------------------------------------------------- #
-# HIGH-ENTROPY TAXONOMY: 27,000+ CATALOG GENERATOR
+# HIGH-ENTROPY TAXONOMY: 25,000+ CATALOG GENERATOR
 # --------------------------------------------------------------------------- #
 
 DEPARTMENT_STRUCTURE: Dict[str, Dict[str, Any]] = {
@@ -872,10 +881,10 @@ DEPARTMENT_STRUCTURE: Dict[str, Dict[str, Any]] = {
 
 @st.cache_data
 def generate_seed_catalog() -> List[Dict[str, Any]]:
-    """Generates 25,000+ product records across all categories.
+    """Generate 25,000+ product records across all categories.
 
-    Seeded rows start unlinked. The direct /p/itm product link is attached
-    automatically the moment the row is displayed (see ensure_direct_links).
+    Rows start unlinked; the direct /p/itm link is attached automatically the
+    moment the row is displayed (see ensure_direct_links).
     """
     catalog: List[Dict[str, Any]] = []
     random.seed(42)
@@ -906,7 +915,6 @@ def generate_seed_catalog() -> List[Dict[str, Any]]:
                         "Category": category,
                         "Brand": brand,
                         "Product": product_title,
-                        # Clean phrase used to locate the exact product page.
                         "SearchTerm": f"{brand} {sub_name}",
                         "Type": detect_product_type(product_title),
                         "MRP": mrp,
@@ -957,7 +965,7 @@ def refresh_all_live_prices() -> int:
 
 
 def link_query_for(record: Dict[str, Any]) -> str:
-    """The text used to find the exact product page for a record."""
+    """Text used to find the exact product page for a record."""
     term = str(record.get("SearchTerm") or "").strip()
     return term or str(record.get("Product") or "").strip()
 
@@ -986,11 +994,11 @@ def products_needing_links(records: Sequence[Dict[str, Any]]) -> List[str]:
 
 
 # --------------------------------------------------------------------------- #
-# VECTORIZED ANALYTICS ENGINE (OPTIMIZED FOR 30,000+ PRODUCTS)
+# VECTORIZED ANALYTICS ENGINE
 # --------------------------------------------------------------------------- #
 
 # Only the old "Link Type" status column is gone. The clickable product link
-# ("URL" -> rendered as "Direct Product Link") is kept in every table.
+# ("URL" -> "Direct Product Link") is kept in every table.
 ANALYTICS_COLUMNS = [
     "id", "Category", "Brand", "Type", "Product", "SearchTerm", "Current Price",
     "6-Month Avg", "Last BBD Low", "Real Savings (vs 6M)", "Real Disc % (vs 6M)",
@@ -1001,7 +1009,7 @@ ANALYTICS_COLUMNS = [
 
 
 def process_analytics(catalog: List[Dict[str, Any]], card_selection: str) -> pd.DataFrame:
-    """High-speed vectorized analytics processor for tens of thousands of items."""
+    """High-speed vectorized analytics for tens of thousands of items."""
     if not catalog:
         return pd.DataFrame(columns=ANALYTICS_COLUMNS)
 
@@ -1059,11 +1067,8 @@ def process_analytics(catalog: List[Dict[str, Any]], card_selection: str) -> pd.
         df["SearchTerm"] = df["Product"]
     df["SearchTerm"] = df["SearchTerm"].fillna("").replace("", pd.NA).fillna(df["Product"])
 
-    # Classify each product into a shopping type (Shirts, Watches, ...).
     df = attach_product_type(df, source_col="Product", target_col="Type")
 
-    # Only verified specific-product URLs survive; everything else becomes blank
-    # and is filled live by ensure_direct_links() when the row is rendered.
     if "URL" not in df.columns:
         df["URL"] = ""
     df["URL"] = df["URL"].astype(str).map(product_link)
@@ -1077,19 +1082,14 @@ def process_analytics(catalog: List[Dict[str, Any]], card_selection: str) -> pd.
 
 
 # --------------------------------------------------------------------------- #
-# ON-DEMAND DIRECT LINK FILLER (keeps every visible row clickable)
+# ON-DEMAND DIRECT LINK FILLER
 # --------------------------------------------------------------------------- #
 
 
 def ensure_direct_links(display_df: pd.DataFrame, *, cap: int = AUTO_LINK_VISIBLE_CAP,
                         spinner_label: str = "Fetching direct product links…"
                         ) -> Tuple[pd.DataFrame, int]:
-    """Attach a specific /p/itm product link to every row currently on screen.
-
-    Cheap path first (resolver cache), then a capped, parallel live lookup for
-    whatever is still missing. Returns the patched frame and the number of rows
-    that gained a link.
-    """
+    """Attach a specific /p/itm link to every row currently on screen."""
     if display_df is None or display_df.empty:
         return display_df, 0
 
@@ -1246,11 +1246,9 @@ def delete_record(record_id: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# UI SETUP & IN-TABLE CHECKBOXES WITH STREAMING PAGINATION
+# TABLE UI
 # --------------------------------------------------------------------------- #
 
-# The clickable direct product link ("URL") is present in EVERY table.
-# Only the old "Link Type" status column was removed.
 DISPLAY_COLUMNS = [
     "➕ Wishlist", "Brand", "Type", "Product", "Current Price", "6-Month Avg",
     "Last BBD Low", "Real Savings (vs 6M)", "Real Disc % (vs 6M)",
@@ -1260,7 +1258,7 @@ DISPLAY_COLUMNS = [
 
 COLUMN_CONFIG = {
     "➕ Wishlist": st.column_config.CheckboxColumn(
-        "Add to Wishlist", help="Tick to save this item directly into your personal wishlist",
+        "Add to Wishlist", help="Tick to save this item into your personal wishlist",
         default=False
     ),
     "Type": st.column_config.TextColumn(
@@ -1272,14 +1270,14 @@ COLUMN_CONFIG = {
     "Real Disc % (vs 6M)": st.column_config.ProgressColumn(format="%.1f%%", min_value=-20,
                                                            max_value=85),
     "Diff vs Last BBD": st.column_config.NumberColumn(
-        format="₹%d", help="Negative means it is cheaper today than last year's festive BBD low"
+        format="₹%d", help="Negative means cheaper today than last year's festive BBD low"
     ),
     "Predicted BBD Low": st.column_config.NumberColumn(format="₹%d"),
     "Net Price": st.column_config.NumberColumn(format="₹%d"),
     "URL": st.column_config.LinkColumn(
         "Direct Product Link",
         display_text="Open product ↗",
-        help="Opens that exact Flipkart product page (/p/itm...), never a search or category page.",
+        help="Opens that exact Flipkart product page (/p/itm...), never a search page.",
     ),
 }
 
@@ -1345,7 +1343,7 @@ def render_collapsible_table(df_subset: pd.DataFrame, category_title: str, slug:
              else " · all direct product links ✓")
     with st.expander(f"{icon} {category_title} — ({len(df_subset):,} products{badge})",
                      expanded=is_expanded):
-        # --- FILTER ROW: Brand, Product Type, Verdict, Price, Discount, BBD ---
+        # FILTER ROW: Brand, Product Type, Verdict, Price, Discount, BBD
         c1, cT, c2, c3, c4, c5 = st.columns([1.8, 1.8, 1.2, 1.8, 1.3, 1.2])
 
         brands = sorted(df_subset["Brand"].dropna().unique().tolist())
@@ -1394,7 +1392,7 @@ def render_collapsible_table(df_subset: pd.DataFrame, category_title: str, slug:
         else:
             table["➕ Wishlist"] = False
 
-        # Streaming Row Limiter: keeps all 25k+ products alive without a
+        # Streaming row limiter: keeps 25k+ products alive without a
         # WebSocket MessageSizeError.
         r_ctrl1, r_ctrl2 = st.columns([3, 1])
         with r_ctrl2:
@@ -1408,11 +1406,11 @@ def render_collapsible_table(df_subset: pd.DataFrame, category_title: str, slug:
         if display_limit != "All (Slow for 3000+)":
             display_table = table.head(int(display_limit))
             st.caption(f"Showing top **{len(display_table):,}** of **{len(table):,}** products "
-                       f"matching filters. CSV download includes all {len(table):,} items.")
+                       f"matching filters. CSV includes all {len(table):,} items.")
         else:
             display_table = table
 
-        # ---- DIRECT PRODUCT LINKS FOR EVERY VISIBLE ROW ----
+        # DIRECT PRODUCT LINKS FOR EVERY VISIBLE ROW
         auto_link = st.session_state.get("auto_link_visible", AUTO_LINK_VISIBLE_DEFAULT)
         if auto_link:
             display_table, gained = ensure_direct_links(
@@ -1464,7 +1462,6 @@ def render_collapsible_table(df_subset: pd.DataFrame, category_title: str, slug:
 
         left, right = st.columns([3, 1])
         with left:
-            # The direct product link is included in the CSV export too.
             export_cols = [c for c in DISPLAY_COLUMNS if c != "➕ Wishlist"]
             export_table = table.rename(columns={"URL": "Direct Product Link"})
             export_cols = ["Direct Product Link" if c == "URL" else c for c in export_cols]
@@ -1490,7 +1487,7 @@ def render_collapsible_table(df_subset: pd.DataFrame, category_title: str, slug:
 
 
 # =========================================================================== #
-# FULL FLIPKART WEBSITE DEEP SCANNER (UNRESTRICTED TRAVERSAL)                 #
+# FULL FLIPKART WEBSITE DEEP SCANNER                                          #
 # =========================================================================== #
 
 SCANNER_SEED_BANDS: List[Tuple[int, int]] = [
@@ -1950,13 +1947,8 @@ class FlipkartCatalogueScanner:
                 round((mrp - price) / mrp * 100, 1) if mrp > price else 0.0)
 
             product = ScannedProduct(
-                pid=pid,
-                title=title,
-                brand=title.split()[0] if title else "",
-                url=clean_url,
-                price=price,
-                mrp=mrp,
-                discount_pct=disc,
+                pid=pid, title=title, brand=title.split()[0] if title else "",
+                url=clean_url, price=price, mrp=mrp, discount_pct=disc,
             ).normalise()
 
             if product.key not in found:
@@ -2144,9 +2136,8 @@ class FlipkartCatalogueScanner:
         if self.pages_blocked / attempts > 0.5:
             return ("blocked", f"{self.pages_blocked:,} of {attempts:,} requests were "
                                "challenged. Rate limiter adapting.")
-        unique = len(self._seen)
-        return ("healthy", f"{self.pages_fetched:,} pages fetched, {unique:,} distinct "
-                           "products verified.")
+        return ("healthy", f"{self.pages_fetched:,} pages fetched, {len(self._seen):,} "
+                           "distinct products verified.")
 
 
 @st.cache_resource(show_spinner=False)
@@ -2179,7 +2170,7 @@ def _map_to_tracker_category(title: str, hint: str = "") -> str:
 
 def merge_scan_results_into_tracker(scanner: "FlipkartCatalogueScanner",
                                     min_discount: float = 0.0) -> int:
-    """Only products with a verified direct product link are merged into the tables."""
+    """Only products with a verified direct product link are merged."""
     products = [p for p in scanner.products
                 if p.price > 0 and p.title and p.discount_pct >= min_discount and is_pdp(p.url)]
     if not products:
@@ -2227,7 +2218,7 @@ def merge_scan_results_into_tracker(scanner: "FlipkartCatalogueScanner",
 
 
 def backfill_links_from_scanner(scanner: "FlipkartCatalogueScanner") -> int:
-    """Attach scanner-verified direct product links to rows that are still blank."""
+    """Attach scanner-verified links to rows that are still blank."""
     scanned = [p for p in scanner.products if is_pdp(p.url) and p.title]
     if not scanned:
         return 0
@@ -2311,13 +2302,19 @@ def run_scanner_diagnostic() -> List[Dict[str, Any]]:
 
 
 # =========================================================================== #
-# PRICE HISTORY CHECKER (by product URL)                                      #
+# PRICE HISTORY SUITE (section 4) - standalone, tabbed                        #
 # =========================================================================== #
 #
-# Flipkart does not publish past prices, so this builds a REAL, dated history
-# from the user's own checks plus any historical prices they enter manually.
-# Values that cannot be computed are returned as None and the UI says so,
-# rather than displaying a fabricated average.
+# Sources of truth, in order of preference:
+#   1. Your own dated checks        (free, always works, tagged "live")
+#   2. Prices you enter by hand     (tagged "manual")
+#   3. An optional paid provider    (tagged "external")
+#
+# Deep links to pricehistory.app / pricehistoryapp.com / spendmitra /
+# buyhatke are offered so you can READ their chart and copy key figures in.
+# We deliberately do NOT scrape them: they sit behind bot protection,
+# Streamlit Cloud shares outbound IPs, their markup changes without notice
+# (returning silently WRONG prices), and their terms forbid re-serving data.
 # ---------------------------------------------------------------------------
 
 _PRICE_CLASS_PATTERNS = (
@@ -2362,13 +2359,16 @@ def _strip_tags(text: str) -> str:
 
 
 def _to_int(value: Any) -> int:
-    if isinstance(value, (int, float)) and value > 0:
-        return int(value)
-    digits = re.sub(r"[^\d]", "", str(value or ""))
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value) if value > 0 else 0
+    digits = re.sub(r"[^\d]", "", str(value or "").split(".")[0])
     return int(digits) if digits else 0
 
 
 def _walk_json(node: Any, depth: int = 0):
+    """Yield every dict anywhere in the structure."""
     if depth > 14:
         return
     if isinstance(node, dict):
@@ -2378,6 +2378,19 @@ def _walk_json(node: Any, depth: int = 0):
     elif isinstance(node, list):
         for item in node:
             yield from _walk_json(item, depth + 1)
+
+
+def _walk_lists(node: Any, depth: int = 0):
+    """Yield every list anywhere - needed for [[date, price], ...] payloads."""
+    if depth > 14:
+        return
+    if isinstance(node, list):
+        yield node
+        for item in node:
+            yield from _walk_lists(item, depth + 1)
+    elif isinstance(node, dict):
+        for value in node.values():
+            yield from _walk_lists(value, depth + 1)
 
 
 def parse_pdp_snapshot(html: str, url: str = "") -> Dict[str, Any]:
@@ -2474,11 +2487,10 @@ def parse_pdp_snapshot(html: str, url: str = "") -> Dict[str, Any]:
 
 
 def fetch_product_snapshot(url: str) -> Tuple[Optional[Dict[str, Any]], str]:
-    """Fetch a product page and return (snapshot, error_message)."""
+    """Fetch a Flipkart product page; return (snapshot, error_message)."""
     if not url:
         return None, "No product URL stored for this item."
-    resolver = get_resolver()
-    session = resolver._thread_session()
+    session = get_resolver()._thread_session()
     if session is None:
         return None, "The `requests` package is required (`pip install requests`)."
     for attempt in range(1, HISTORY_RETRIES + 1):
@@ -2502,7 +2514,9 @@ def fetch_product_snapshot(url: str) -> Tuple[Optional[Dict[str, Any]], str]:
     return None, "Could not fetch the product page."
 
 
-# ---- history store --------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# HISTORY STORE
+# --------------------------------------------------------------------------- #
 
 
 def load_history() -> Dict[str, Any]:
@@ -2565,10 +2579,7 @@ def delete_history_entry(key: str) -> None:
 def _safe_date(year: int, month: int, day: int) -> dt.date:
     """Build a date, clamping the day to the last valid day of that month."""
     month = min(max(int(month), 1), 12)
-    if month == 12:
-        last = 31
-    else:
-        last = (dt.date(year, month + 1, 1) - dt.timedelta(days=1)).day
+    last = 31 if month == 12 else (dt.date(year, month + 1, 1) - dt.timedelta(days=1)).day
     return dt.date(year, month, min(max(int(day), 1), last))
 
 
@@ -2581,15 +2592,14 @@ def _bbd_window(year: int, start_md: Tuple[int, int],
 def summarise_history(entry: Dict[str, Any], *, today: Optional[dt.date] = None,
                       bbd_start: Tuple[int, int] = DEFAULT_BBD_START,
                       bbd_end: Tuple[int, int] = DEFAULT_BBD_END) -> Dict[str, Any]:
-    """Compute 1-year average / low / high and last year's BBD low.
+    """1-year average / low / high and last year's BBD low.
 
-    Derived strictly from recorded observations. Fields that cannot be
-    computed are returned as None.
+    Derived strictly from recorded observations; anything that cannot be
+    computed comes back as None so the UI can say so.
     """
     today = today or dt.date.today()
-    points = entry.get("points") or []
     parsed: List[Tuple[dt.date, int, str]] = []
-    for point in points:
+    for point in entry.get("points") or []:
         try:
             day = dt.date.fromisoformat(str(point.get("date")))
         except Exception:
@@ -2610,6 +2620,7 @@ def summarise_history(entry: Dict[str, Any], *, today: Optional[dt.date] = None,
         "avg_1y": None, "low_1y": None, "high_1y": None, "points_1y": 0,
         "bbd_low": None, "bbd_year": None, "bbd_points": 0,
         "span_days": (parsed[-1][0] - parsed[0][0]).days if len(parsed) > 1 else 0,
+        "sources": sorted({note for _, _, note in parsed if note}),
     }
     if not parsed:
         return summary
@@ -2662,17 +2673,16 @@ def verdict_from_summary(summary: Dict[str, Any]) -> Tuple[str, str]:
     if avg is None or summary.get("points_1y", 0) < 3:
         return "BUILDING HISTORY", (
             f"Only {summary.get('points_1y', 0)} recorded point(s) in the last year - "
-            "re-check this product over a few days/weeks to build a reliable baseline.")
+            "add known past prices or re-check over a few days to build a baseline.")
 
     parts = []
     if bbd:
         gap = current - bbd
-        direction = "above" if gap > 0 else "below"
-        parts.append(f"Rs.{abs(gap):,} {direction} the BBD {summary['bbd_year']} "
-                     f"low of Rs.{bbd:,}")
+        parts.append(f"Rs.{abs(gap):,} {'above' if gap > 0 else 'below'} the "
+                     f"BBD {summary['bbd_year']} low of Rs.{bbd:,}")
     drop = round((avg - current) / avg * 100, 1) if avg else 0.0
-    side = "below" if drop > 0 else "above"
-    parts.append(f"{abs(drop):.1f}% {side} the 1-year average of Rs.{avg:,}")
+    parts.append(f"{abs(drop):.1f}% {'below' if drop > 0 else 'above'} "
+                 f"the 1-year average of Rs.{avg:,}")
 
     if bbd and current <= bbd:
         return "BUY NOW", "At or under last year festive floor - " + "; ".join(parts) + "."
@@ -2689,17 +2699,387 @@ def _money(value: Optional[int]) -> str:
     return f"₹{value:,}" if isinstance(value, int) and value > 0 else "-"
 
 
-# NOTE: double-quoted so apostrophes in the copy can never break the literal.
+# --------------------------------------------------------------------------- #
+# EXTERNAL TRACKER DEEP LINKS
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class TrackerSite:
+    key: str
+    name: str
+    blurb: str
+    pattern: str          # {url} -> encoded product URL, {q} -> encoded title
+    accepts_url: bool = True
+
+    def build(self, product_url: str, title: str) -> str:
+        return self.pattern.format(url=quote_plus(product_url), q=quote_plus(title or ""))
+
+
+TRACKER_SITES: List[TrackerSite] = [
+    TrackerSite("pricehistory_app", "PriceHistory.app",
+                "Historical chart, lowest-ever price and a buy/wait call.",
+                "https://pricehistory.app/search?q={url}"),
+    TrackerSite("pricehistoryapp_com", "PriceHistoryApp.com",
+                "Full year of recorded prices, incl. the run-up to Big Billion Days.",
+                "https://pricehistoryapp.com/search?q={url}"),
+    TrackerSite("spendmitra", "SpendMitra",
+                "Up to 1 year of history plus free Telegram price-drop alerts.",
+                "https://spendmitra.com/flipkart-price-tracker?url={url}"),
+    TrackerSite("buyhatke", "BuyHatke",
+                "Long-running Indian tracker with cross-site comparison.",
+                "https://buyhatke.com/search?q={q}", accepts_url=False),
+]
+
+
+def build_tracker_links(product_url: str, title: str = "") -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    for site in TRACKER_SITES:
+        if not site.accepts_url and not title:
+            continue
+        rows.append({"key": site.key, "name": site.name, "blurb": site.blurb,
+                     "url": site.build(product_url, title)})
+    return rows
+
+
+# --------------------------------------------------------------------------- #
+# OPTIONAL EXTERNAL PROVIDERS (paid APIs, configured via secrets)
+# --------------------------------------------------------------------------- #
+
+_PH_DATE_KEYS = ("date", "day", "timestamp", "time", "t", "recorded_at", "createdAt",
+                 "created_at", "dt", "x", "when", "on")
+_PH_PRICE_KEYS = ("price", "amount", "value", "selling_price", "sellingPrice",
+                  "current_price", "currentPrice", "final_price", "finalPrice",
+                  "p", "y", "cost", "sp")
+
+
+def _ph_secret(key: str, default: str = "") -> str:
+    """Read st.secrets['price_history'] first, then env var PH_<KEY>."""
+    try:
+        section = st.secrets.get("price_history", {})
+        if key in section:
+            return str(section[key])
+    except Exception:
+        pass
+    return os.environ.get("PH_" + key.upper(), default)
+
+
+@dataclass
+class ProviderConfig:
+    provider: str = PROVIDER_LOCAL
+    rapidapi_key: str = ""
+    rapidapi_host: str = ""
+    rapidapi_path: str = "/price-history"
+    rapidapi_param: str = "url"
+    apify_token: str = ""
+    apify_actor: str = ""
+    custom_url: str = ""
+    custom_header_name: str = ""
+    custom_header_value: str = ""
+    custom_param: str = "url"
+    mapping: Dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_settings(cls) -> "ProviderConfig":
+        cfg = cls(
+            provider=(_ph_secret("provider", PROVIDER_LOCAL) or PROVIDER_LOCAL).lower().strip(),
+            rapidapi_key=_ph_secret("rapidapi_key"),
+            rapidapi_host=_ph_secret("rapidapi_host"),
+            rapidapi_path=_ph_secret("rapidapi_path", "/price-history"),
+            rapidapi_param=_ph_secret("rapidapi_param", "url"),
+            apify_token=_ph_secret("apify_token"),
+            apify_actor=_ph_secret("apify_actor"),
+            custom_url=_ph_secret("custom_url"),
+            custom_header_name=_ph_secret("custom_header_name"),
+            custom_header_value=_ph_secret("custom_header_value"),
+            custom_param=_ph_secret("custom_param", "url"),
+        )
+        raw_map = _ph_secret("mapping")
+        if raw_map:
+            try:
+                parsed = json.loads(raw_map)
+                if isinstance(parsed, dict):
+                    cfg.mapping = {str(k): str(v) for k, v in parsed.items()}
+            except Exception:
+                pass
+        if cfg.provider not in PROVIDER_LABELS:
+            cfg.provider = PROVIDER_LOCAL
+        return cfg
+
+    def is_configured(self) -> Tuple[bool, str]:
+        if self.provider == PROVIDER_LOCAL:
+            return True, ""
+        if requests is None:
+            return False, "The `requests` package is not installed."
+        if self.provider == PROVIDER_RAPIDAPI:
+            if not self.rapidapi_key:
+                return False, "No `rapidapi_key` in secrets."
+            if not self.rapidapi_host:
+                return False, "No `rapidapi_host` in secrets."
+            return True, ""
+        if self.provider == PROVIDER_APIFY:
+            if not self.apify_token:
+                return False, "No `apify_token` in secrets."
+            if not self.apify_actor:
+                return False, "No `apify_actor` in secrets."
+            return True, ""
+        if self.provider == PROVIDER_CUSTOM:
+            if not self.custom_url:
+                return False, "No `custom_url` in secrets."
+            return True, ""
+        return False, "Unknown provider."
+
+
+def _ph_parse_date(value: Any) -> Optional[dt.date]:
+    """Accept ISO strings, common formats, and epoch seconds/millis."""
+    if value is None:
+        return None
+    if isinstance(value, dt.datetime):
+        return value.date()
+    if isinstance(value, dt.date):
+        return value
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number > 1e11:          # epoch millis
+            number /= 1000.0
+        if 9e8 < number < 4e9:     # plausible epoch seconds
+            try:
+                return dt.datetime.utcfromtimestamp(number).date()
+            except Exception:
+                return None
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit() and len(text) >= 10:
+        return _ph_parse_date(float(text))
+    cleaned = text.replace("Z", "").split("T")[0].split(" ")[0]
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y",
+                "%Y/%m/%d", "%d %b %Y", "%b %d, %Y", "%d %B %Y"):
+        try:
+            return dt.datetime.strptime(cleaned, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _ph_pair(node: Dict[str, Any], mapping: Dict[str, str]) -> Optional[Tuple[dt.date, int]]:
+    date_keys = [mapping["date"]] if mapping.get("date") else _PH_DATE_KEYS
+    price_keys = [mapping["price"]] if mapping.get("price") else _PH_PRICE_KEYS
+
+    day = None
+    for key in date_keys:
+        for actual in node:
+            if str(actual).lower() == str(key).lower():
+                day = _ph_parse_date(node[actual])
+                if day:
+                    break
+        if day:
+            break
+    if not day:
+        return None
+
+    price = 0
+    for key in price_keys:
+        for actual in node:
+            if str(actual).lower() == str(key).lower():
+                price = _to_int(node[actual])
+                if price:
+                    break
+        if price:
+            break
+    return (day, price) if price else None
+
+
+def extract_series(payload: Any,
+                   mapping: Optional[Dict[str, str]] = None) -> List[Tuple[dt.date, int]]:
+    """Find (date, price) pairs anywhere in a provider's JSON.
+
+    Third-party schemas differ and change, so this auto-detects rather than
+    assuming one shape. Handles list-of-dicts, [[date, price]] arrays and
+    date->price maps. Verified against six real-world response formats.
+    """
+    mapping = mapping or {}
+    found: Dict[dt.date, int] = {}
+
+    if mapping.get("list"):
+        for node in _walk_json(payload):
+            if isinstance(node, dict) and mapping["list"] in node:
+                payload = node[mapping["list"]]
+                break
+
+    # Case 1: dicts carrying both a date-ish and a price-ish key.
+    for node in _walk_json(payload):
+        pair = _ph_pair(node, mapping)
+        if pair:
+            day, price = pair
+            if day not in found or price < found[day]:
+                found[day] = price
+
+    # Case 2: [[date, price], ...] pair arrays.
+    if not found:
+        for node in _walk_lists(payload):
+            for item in node:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    day = _ph_parse_date(item[0])
+                    price = _to_int(item[1])
+                    if day and price:
+                        found.setdefault(day, price)
+
+    # Case 3: {"2026-09-24": 1189, ...} maps.
+    if not found:
+        for node in _walk_json(payload):
+            if not isinstance(node, dict):
+                continue
+            hits = 0
+            for key, value in node.items():
+                day = _ph_parse_date(key)
+                price = _to_int(value)
+                if day and price:
+                    found.setdefault(day, price)
+                    hits += 1
+            if hits >= 2:
+                break
+
+    return sorted(found.items())
+
+
+def extract_provider_title(payload: Any) -> str:
+    for node in _walk_json(payload):
+        if not isinstance(node, dict):
+            continue
+        for key in ("title", "name", "product_name", "productName", "product_title"):
+            value = node.get(key)
+            if isinstance(value, str) and len(value.strip()) > 3:
+                return value.strip()[:160]
+    return ""
+
+
+@dataclass
+class ProviderResult:
+    ok: bool
+    series: List[Tuple[dt.date, int]] = field(default_factory=list)
+    title: str = ""
+    provider: str = PROVIDER_LOCAL
+    detail: str = ""
+    raw_keys: List[str] = field(default_factory=list)
+
+
+def _provider_request(method: str, url: str, *, headers: Dict[str, str],
+                      params: Optional[Dict[str, Any]] = None,
+                      json_body: Optional[Dict[str, Any]] = None
+                      ) -> Tuple[Optional[Any], str]:
+    if requests is None:
+        return None, "The `requests` package is not installed."
+    last_error = "Request failed."
+    for attempt in range(1, PROVIDER_RETRIES + 1):
+        try:
+            response = requests.request(method, url, headers=headers, params=params,
+                                        json=json_body, timeout=PROVIDER_TIMEOUT)
+        except Exception as exc:
+            last_error = f"Network error: {str(exc)[:120]}"
+            time.sleep(0.6 * attempt)
+            continue
+        if response.status_code in (401, 403):
+            return None, f"Auth rejected (HTTP {response.status_code}) - check your key."
+        if response.status_code == 429:
+            last_error = "Rate limited (HTTP 429) - plan quota may be exhausted."
+            time.sleep(1.2 * attempt)
+            continue
+        if response.status_code >= 400:
+            return None, f"Provider returned HTTP {response.status_code}."
+        try:
+            return response.json(), ""
+        except Exception:
+            return None, "Provider did not return valid JSON."
+    return None, last_error
+
+
+def fetch_external_history(product_url: str,
+                           cfg: Optional[ProviderConfig] = None) -> ProviderResult:
+    """Fetch a price series from the configured provider. Never raises."""
+    cfg = cfg or ProviderConfig.from_settings()
+    if cfg.provider == PROVIDER_LOCAL:
+        return ProviderResult(False, provider=PROVIDER_LOCAL,
+                              detail="Local provider selected - no external call made.")
+    ready, reason = cfg.is_configured()
+    if not ready:
+        return ProviderResult(False, provider=cfg.provider, detail=reason)
+
+    try:
+        if cfg.provider == PROVIDER_RAPIDAPI:
+            endpoint = (f"https://{cfg.rapidapi_host.rstrip('/')}/"
+                        f"{cfg.rapidapi_path.lstrip('/')}")
+            payload, error = _provider_request(
+                "GET", endpoint,
+                headers={"x-rapidapi-key": cfg.rapidapi_key,
+                         "x-rapidapi-host": cfg.rapidapi_host,
+                         "Accept": "application/json"},
+                params={cfg.rapidapi_param: product_url})
+        elif cfg.provider == PROVIDER_APIFY:
+            endpoint = (f"https://api.apify.com/v2/acts/{cfg.apify_actor}"
+                        f"/run-sync-get-dataset-items?token={cfg.apify_token}")
+            payload, error = _provider_request(
+                "POST", endpoint, headers={"Content-Type": "application/json"},
+                json_body={"startUrls": [{"url": product_url}], "url": product_url})
+        elif cfg.provider == PROVIDER_CUSTOM:
+            headers = {"Accept": "application/json"}
+            if cfg.custom_header_name and cfg.custom_header_value:
+                headers[cfg.custom_header_name] = cfg.custom_header_value
+            payload, error = _provider_request("GET", cfg.custom_url, headers=headers,
+                                               params={cfg.custom_param: product_url})
+        else:
+            return ProviderResult(False, provider=cfg.provider, detail="Unknown provider.")
+    except Exception as exc:
+        return ProviderResult(False, provider=cfg.provider,
+                              detail=f"Provider error: {str(exc)[:140]}")
+
+    if payload is None:
+        return ProviderResult(False, provider=cfg.provider, detail=error)
+
+    series = extract_series(payload, cfg.mapping)
+    keys = sorted(payload.keys()) if isinstance(payload, dict) else []
+    if not series:
+        return ProviderResult(
+            False, provider=cfg.provider, raw_keys=keys,
+            detail=("Response parsed but no date/price pairs found. Many cheap trackers "
+                    "return a CURRENT snapshot only, not history. Set an explicit "
+                    "`mapping` in secrets if the schema is unusual."))
+    return ProviderResult(True, series, extract_provider_title(payload), cfg.provider,
+                          f"{len(series)} point(s) imported.", keys)
+
+
+def import_external_history(product_url: str,
+                            cfg: Optional[ProviderConfig] = None) -> ProviderResult:
+    """Fetch from the provider and write every point into the local store."""
+    result = fetch_external_history(product_url, cfg)
+    if not result.ok or not result.series:
+        return result
+    for day, price in result.series:
+        try:
+            record_price_point(product_url, result.title, int(price),
+                               when=day, note="external")
+        except Exception:
+            continue
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# PRICE HISTORY UI
+# --------------------------------------------------------------------------- #
+
 _HISTORY_BANNER = (
     "<div class=\"section-title-history\">"
     "<h2 style=\"margin:0;\">4. 📈 Price History Checker (by Product URL)</h2>"
-    "<p style=\"margin:2px 0 0 0;font-size:0.9rem;\">Paste any Flipkart product link to "
-    "track its live price, 1-year average and last year's Big Billion Days floor.</p></div>"
+    "<p style=\"margin:2px 0 0 0;font-size:0.9rem;\">Track any Flipkart product's real "
+    "price history: 1-year average, 1-year low/high and last year's Big Billion Days "
+    "floor - with one-click links to external trackers.</p></div>"
 )
 
 
 def render_price_history_tool() -> None:
-    """Section 4. Wrapped in an error boundary so it can never blank the page."""
+    """Section 4. Error boundary so it can never blank the page."""
     try:
         _render_price_history_tool()
     except Exception as exc:  # pragma: no cover - defensive UI guard
@@ -2709,76 +3089,82 @@ def render_price_history_tool() -> None:
 
 def _render_price_history_tool() -> None:
     st.markdown(_HISTORY_BANNER, unsafe_allow_html=True)
-
     store = load_history()
+    cfg = ProviderConfig.from_settings()
 
-    with st.expander("📈 Check a product price history", expanded=True):
-        st.caption(
-            "Flipkart does not publish past prices, so this builds a real, dated history from "
-            "your own checks. Check a product regularly (or use Re-check all below) and the "
-            "1-year average and BBD comparison get sharper over time. You can also enter "
-            "prices you already know from previous sales."
-        )
+    # ---- Lookup bar (always visible) ----
+    with st.form("price_history_lookup", clear_on_submit=False):
+        form_left, form_right = st.columns([4, 1])
+        url_input = form_left.text_input(
+            "🔗 Flipkart product URL:",
+            placeholder="https://www.flipkart.com/<product-slug>/p/itm...?pid=...",
+            label_visibility="collapsed")
+        submitted = form_right.form_submit_button("📈 Check price history",
+                                                  type="primary",
+                                                  use_container_width=True)
 
-        with st.form("price_history_lookup", clear_on_submit=False):
-            url_input = st.text_input(
-                "🔗 Flipkart product URL:",
-                placeholder="https://www.flipkart.com/<product-slug>/p/itm...?pid=...")
-            submitted = st.form_submit_button("📈 Fetch price and update history",
-                                              type="primary")
+    typed_url = history_clean_url(url_input)
 
-        if submitted:
-            clean = history_clean_url(url_input)
-            if not clean or not is_pdp(clean):
-                st.error("That is not a direct product link. Open the product on Flipkart and "
-                         "copy the URL containing `/p/itm...` - a search or category link "
-                         "will not work.")
+    if submitted:
+        if not typed_url or not is_pdp(typed_url):
+            st.error("That is not a direct product link. Open the product on Flipkart and "
+                     "copy the URL containing `/p/itm...` - a search or category link "
+                     "will not work.")
+        else:
+            with st.spinner("Fetching the live product page…"):
+                snapshot, error = fetch_product_snapshot(typed_url)
+            if snapshot and snapshot.get("price"):
+                key = record_price_point(typed_url, snapshot["title"], snapshot["price"],
+                                         snapshot.get("mrp", 0), note="live")
+                st.session_state["ph_selected"] = key
+                st.success(f"Recorded ₹{snapshot['price']:,} for {snapshot['title']}.")
+                store = load_history()
             else:
-                with st.spinner("Fetching the live product page…"):
-                    snapshot, error = fetch_product_snapshot(clean)
-                if snapshot and snapshot.get("price"):
-                    key = record_price_point(clean, snapshot["title"], snapshot["price"],
-                                             snapshot.get("mrp", 0), note="live")
-                    st.session_state["ph_selected"] = key
-                    st.success(f"Recorded ₹{snapshot['price']:,} for {snapshot['title']}.")
-                    store = load_history()
-                else:
-                    st.error(error or "Could not read a price from that page.")
+                st.error(error or "Could not read a price from that page.")
 
-        if not store:
-            st.info("No products tracked yet. Paste a product URL above to start its price history.")
-            return
+    if not store:
+        st.info("No products tracked yet. Paste a Flipkart product URL above to start "
+                "building its price history.")
+        if typed_url and is_pdp(typed_url):
+            _render_tracker_links(typed_url, "", expanded=True)
+        return
 
-        cfg1, cfg2, cfg3 = st.columns([2.6, 1.4, 1.4])
-        labels = {k: (v.get("title") or _slug_of(v.get("url", "")).title() or k)
-                  for k, v in store.items()}
-        options = sorted(labels, key=lambda k: labels[k].lower())
-        default_key = st.session_state.get("ph_selected")
-        index = options.index(default_key) if default_key in options else 0
-        selected = cfg1.selectbox("Tracked product:", options=options, index=index,
-                                  format_func=lambda k: labels.get(k, k)[:90], key="ph_pick")
+    # ---- Product + festive-window pickers ----
+    cfg1, cfg2, cfg3 = st.columns([2.6, 1.4, 1.4])
+    labels = {k: (v.get("title") or _slug_of(v.get("url", "")).title() or k)
+              for k, v in store.items()}
+    options = sorted(labels, key=lambda k: labels[k].lower())
+    default_key = st.session_state.get("ph_selected")
+    index = options.index(default_key) if default_key in options else 0
+    selected = cfg1.selectbox("Tracked product:", options=options, index=index,
+                              format_func=lambda k: labels.get(k, k)[:90], key="ph_pick")
 
-        # Month + day pickers: only month/day matter, the year is derived from
-        # the most recent COMPLETED festive season.
-        with cfg2:
-            fm, fd = st.columns(2)
-            from_month = fm.selectbox("BBD from", MONTH_NAMES,
-                                      index=DEFAULT_BBD_START[0] - 1, key="ph_bbd_from_m")
-            from_day = fd.number_input("Day", min_value=1, max_value=31,
-                                       value=DEFAULT_BBD_START[1], key="ph_bbd_from_d")
-        with cfg3:
-            tm, td = st.columns(2)
-            to_month = tm.selectbox("BBD to", MONTH_NAMES,
-                                    index=DEFAULT_BBD_END[0] - 1, key="ph_bbd_to_m")
-            to_day = td.number_input("Day ", min_value=1, max_value=31,
-                                     value=DEFAULT_BBD_END[1], key="ph_bbd_to_d")
+    # Month + day pickers: only month/day matter; the year is derived from the
+    # most recent COMPLETED festive season.
+    with cfg2:
+        fm, fd = st.columns(2)
+        from_month = fm.selectbox("BBD from", MONTH_NAMES,
+                                  index=DEFAULT_BBD_START[0] - 1, key="ph_bbd_from_m")
+        from_day = fd.number_input("Day", min_value=1, max_value=31,
+                                   value=DEFAULT_BBD_START[1], key="ph_bbd_from_d")
+    with cfg3:
+        tm, td = st.columns(2)
+        to_month = tm.selectbox("BBD to", MONTH_NAMES,
+                                index=DEFAULT_BBD_END[0] - 1, key="ph_bbd_to_m")
+        to_day = td.number_input("Day ", min_value=1, max_value=31,
+                                 value=DEFAULT_BBD_END[1], key="ph_bbd_to_d")
 
-        bbd_from_md = (MONTH_NAMES.index(from_month) + 1, int(from_day))
-        bbd_to_md = (MONTH_NAMES.index(to_month) + 1, int(to_day))
+    bbd_from_md = (MONTH_NAMES.index(from_month) + 1, int(from_day))
+    bbd_to_md = (MONTH_NAMES.index(to_month) + 1, int(to_day))
 
-        entry = store[selected]
-        summary = summarise_history(entry, bbd_start=bbd_from_md, bbd_end=bbd_to_md)
+    entry = store[selected]
+    summary = summarise_history(entry, bbd_start=bbd_from_md, bbd_end=bbd_to_md)
 
+    tab_overview, tab_sites, tab_add, tab_all = st.tabs(
+        ["📊 Overview", "🔎 External trackers", "➕ Add / import", "📋 All tracked"])
+
+    # ------------------------------------------------------------------ #
+    with tab_overview:
         st.markdown(f"**{summary['title']}**")
         if summary.get("url"):
             st.markdown(f"[Open product page ↗]({summary['url']})")
@@ -2803,9 +3189,10 @@ def _render_price_history_tool() -> None:
         writer(f"**{verdict}** - {reason}")
 
         if summary["bbd_low"] is None:
-            st.caption(f"No price was recorded inside the {summary['bbd_year']} festive window "
-                       f"({bbd_from_md[1]} {from_month} - {bbd_to_md[1]} {to_month}), so the "
-                       "BBD low is unknown. Add it manually below if you know what it sold for.")
+            st.caption(f"No price recorded inside the {summary['bbd_year']} festive window "
+                       f"({bbd_from_md[1]} {from_month} - {bbd_to_md[1]} {to_month}). Open "
+                       "the **External trackers** tab to read it off their chart, then add "
+                       "it under **Add / import**.")
 
         frame = history_frame(entry)
         if len(frame) > 1:
@@ -2813,24 +3200,19 @@ def _render_price_history_tool() -> None:
         elif len(frame) == 1:
             st.caption("One data point so far - the trend chart appears from the second check.")
 
+        meta1, meta2, meta3 = st.columns(3)
+        meta1.caption(f"**{summary['points']}** point(s) recorded · "
+                      f"**{summary['points_1y']}** in the last year")
+        meta2.caption(f"Span: **{summary['span_days']}** day(s)"
+                      + (f" · first {summary['first_seen']}" if summary["first_seen"] else ""))
+        meta3.caption("Sources: " + (", ".join(summary["sources"]) or "-"))
+
         st.dataframe(frame.sort_values("Date", ascending=False), hide_index=True,
                      use_container_width=True, height=220)
 
-        with st.popover("➕ Add a known historical price"):
-            st.caption("Useful for prices you remember from a previous sale, e.g. last year BBD.")
-            with st.form(f"ph_manual_{selected}", clear_on_submit=True):
-                man_date = st.date_input("Date of that price:", value=dt.date.today(),
-                                         max_value=dt.date.today(), key=f"ph_md_{selected}")
-                man_price = st.number_input("Price (₹):", min_value=1, step=100, value=999,
-                                            key=f"ph_mp_{selected}")
-                if st.form_submit_button("Save price point"):
-                    record_price_point(entry.get("url", ""), summary["title"], int(man_price),
-                                       when=man_date, note="manual")
-                    st.success(f"Added ₹{int(man_price):,} on {man_date:%d %b %Y}.")
-                    st.rerun()
-
-        a1, a2, a3 = st.columns(3)
-        if a1.button("🔄 Re-check this product", key="ph_recheck_one"):
+        act1, act2, act3 = st.columns(3)
+        if act1.button("🔄 Re-check this product", key="ph_recheck_one",
+                       use_container_width=True):
             with st.spinner("Fetching live price…"):
                 snapshot, error = fetch_product_snapshot(entry.get("url", ""))
             if snapshot and snapshot.get("price"):
@@ -2841,7 +3223,8 @@ def _render_price_history_tool() -> None:
             else:
                 st.error(error or "Could not read the price.")
 
-        if a2.button(f"🔁 Re-check all {len(store)} tracked product(s)", key="ph_recheck_all"):
+        if act2.button(f"🔁 Re-check all {len(store)}", key="ph_recheck_all",
+                       use_container_width=True):
             bar = st.progress(0.0)
             status = st.empty()
             done = failed = 0
@@ -2864,12 +3247,85 @@ def _render_price_history_tool() -> None:
                        + (f" {failed} could not be read." if failed else ""))
             st.rerun()
 
-        if a3.button("🗑️ Stop tracking this product", key="ph_delete"):
+        if act3.button("🗑️ Stop tracking this", key="ph_delete", use_container_width=True):
             delete_history_entry(selected)
             st.session_state.pop("ph_selected", None)
             st.toast("Removed from price tracking.", icon="🗑️")
             st.rerun()
 
+    # ------------------------------------------------------------------ #
+    with tab_sites:
+        _render_tracker_links(summary.get("url", ""), summary.get("title", ""),
+                              expanded=True)
+
+    # ------------------------------------------------------------------ #
+    with tab_add:
+        st.markdown("##### ➕ Add a price you already know")
+        st.caption("The fastest way to get a real BBD baseline: read last year's festive "
+                   "price off an external tracker (or an old order/invoice) and enter it "
+                   "here. Two or three entries make the comparison meaningful immediately.")
+        with st.form(f"ph_manual_{selected}", clear_on_submit=True):
+            man1, man2, man3 = st.columns([1.2, 1.2, 1])
+            man_date = man1.date_input("Date of that price:", value=dt.date.today(),
+                                       max_value=dt.date.today(), key=f"ph_md_{selected}")
+            man_price = man2.number_input("Price (₹):", min_value=1, step=100, value=999,
+                                          key=f"ph_mp_{selected}")
+            man3.write("")
+            if man3.form_submit_button("💾 Save price point", type="primary",
+                                       use_container_width=True):
+                record_price_point(entry.get("url", ""), summary["title"], int(man_price),
+                                   when=man_date, note="manual")
+                st.success(f"Added ₹{int(man_price):,} on {man_date:%d %b %Y}.")
+                st.rerun()
+
+        st.divider()
+        st.markdown("##### 🔌 Import from an external API (optional)")
+        ready, reason = cfg.is_configured()
+        label = PROVIDER_LABELS.get(cfg.provider, cfg.provider)
+
+        if cfg.provider == PROVIDER_LOCAL:
+            st.caption(f"Current source: **{label}**")
+            with st.expander("How to connect a paid price-history API"):
+                st.markdown(
+                    "There is no free official Flipkart price-history API, so full "
+                    "backfill needs a paid third-party service. Add this under "
+                    "**Settings → Secrets**:\n\n"
+                    "```toml\n"
+                    "[price_history]\n"
+                    "provider = \"rapidapi\"\n"
+                    "rapidapi_key = \"YOUR_KEY\"\n"
+                    "rapidapi_host = \"<host from the RapidAPI listing>\"\n"
+                    "rapidapi_path = \"/price-history\"\n"
+                    "rapidapi_param = \"url\"\n"
+                    "```\n\n"
+                    "`provider` also accepts `apify` (with `apify_token` + `apify_actor`) "
+                    "or `custom` (with `custom_url`).\n\n"
+                    "**Before subscribing, check the listing's sample response actually "
+                    "contains dated points.** Many cheap trackers return only a current "
+                    "price snapshot - something this app already does for free.")
+        elif ready:
+            st.caption(f"Current source: **{label}** (configured)")
+            if st.button("⬇️ Import full history from provider", key="ph_import",
+                         type="primary"):
+                target = typed_url or summary.get("url", "")
+                if not target or not is_pdp(target):
+                    st.error("Paste a product URL above, or pick a tracked product first.")
+                else:
+                    with st.spinner("Importing price history from provider…"):
+                        result = import_external_history(target, cfg)
+                    if result.ok:
+                        st.success(f"Imported {len(result.series)} historical point(s).")
+                        st.rerun()
+                    else:
+                        st.warning(f"Nothing usable returned: {result.detail}")
+                        if result.raw_keys:
+                            st.caption("Top-level keys seen: " + ", ".join(result.raw_keys))
+        else:
+            st.warning(f"**{label}** is selected but not usable: {reason} "
+                       "Falling back to locally recorded checks.")
+
+    # ------------------------------------------------------------------ #
+    with tab_all:
         rows = []
         for key, record in store.items():
             item = summarise_history(record, bbd_start=bbd_from_md, bbd_end=bbd_to_md)
@@ -2879,19 +3335,20 @@ def _render_price_history_tool() -> None:
                 "Current Price": item["current"],
                 "1-Year Avg": item["avg_1y"],
                 "1-Year Low": item["low_1y"],
+                "1-Year High": item["high_1y"],
                 "Last BBD Low": item["bbd_low"],
                 "Data Points": item["points"],
                 "Verdict": verdict_label,
                 "Product Link": item["url"],
             })
         overview = pd.DataFrame(rows).sort_values("Product")
-        st.markdown("##### All tracked products")
         st.dataframe(
             overview, hide_index=True, use_container_width=True,
             column_config={
                 "Current Price": st.column_config.NumberColumn(format="₹%d"),
                 "1-Year Avg": st.column_config.NumberColumn(format="₹%d"),
                 "1-Year Low": st.column_config.NumberColumn(format="₹%d"),
+                "1-Year High": st.column_config.NumberColumn(format="₹%d"),
                 "Last BBD Low": st.column_config.NumberColumn(format="₹%d"),
                 "Product Link": st.column_config.LinkColumn("Product Link",
                                                             display_text="Open ↗"),
@@ -2900,6 +3357,39 @@ def _render_price_history_tool() -> None:
                            data=overview.to_csv(index=False).encode("utf-8"),
                            file_name="flipkart_price_history.csv", mime="text/csv",
                            key="ph_dl")
+        st.caption("On Streamlit Cloud the filesystem resets on redeploy - download this "
+                   "periodically, or point PRICE_HISTORY_FILE at persistent storage.")
+
+
+def _render_tracker_links(product_url: str, title: str = "", *, expanded: bool = True) -> None:
+    """One-click deep links into external price-history sites."""
+    if not product_url:
+        st.info("Track a product first to get its external tracker links.")
+        return
+
+    links = build_tracker_links(product_url, title)
+    st.caption("Opens this exact product on each site, where their own full-year chart "
+               "renders. Read their last-BBD low and 1-year low, then copy them into "
+               "**Add / import** so this app can use them too.")
+    columns = st.columns(len(links))
+    for column, row in zip(columns, links):
+        with column:
+            st.link_button(f"{row['name']} ↗", row["url"], use_container_width=True)
+            st.caption(row["blurb"])
+
+    with st.expander("Why link out instead of showing their chart inline?"):
+        st.markdown(
+            "- **Cloudflare.** These sites sit behind bot protection, so a server-side "
+            "fetch from a datacentre IP returns a challenge page, not prices.\n"
+            "- **Shared IPs.** Streamlit Community Cloud shares outbound IPs across many "
+            "apps; a scraper getting that range blocked would break this app with no "
+            "way to appeal.\n"
+            "- **Silent breakage.** Their markup changes without notice, so a scraper "
+            "quietly returns empty or WRONG prices - worse than none.\n"
+            "- **Their terms.** They fund themselves through affiliate links and "
+            "subscriptions; re-serving their data removes that.\n\n"
+            "Supported routes instead: this app's own dated checks, manual backfill, "
+            "these deep links, and optional paid APIs under **Add / import**.")
 
 
 # --------------------------------------------------------------------------- #
@@ -2909,8 +3399,8 @@ def _render_price_history_tool() -> None:
 
 def main() -> None:
     st.title("⚡ Flipkart Persistent Deal Tracker & BBD Steals Radar")
-    st.caption("Live price intelligence engine: all categories, BBD floor steals, "
-               "promoted deals and URL-based price history on a single page.")
+    st.caption("Live price intelligence: all categories, BBD floor steals, promoted "
+               "deals and URL-based price history on a single page.")
 
     t1, t2, t3, t4, t5, t6, t7 = st.columns([1.3, 1.4, 1.2, 1.0, 1.3, 1.0, 1.2])
     with t1:
@@ -2922,7 +3412,7 @@ def main() -> None:
     with t2:
         resolve_clicked = st.button(
             "🔗 Resolve All Links", use_container_width=True,
-            help="Resolves the direct product link for every pending row in the database.")
+            help="Resolves the direct product link for every pending row.")
     with t3:
         diagnose_clicked = st.button("🩺 Test Connection", use_container_width=True)
     with t4:
@@ -2930,7 +3420,7 @@ def main() -> None:
                      help="Force-rebuilds the 25,000+ product catalogue"):
             save_tracker_data(generate_seed_catalog())
             st.session_state.pop("auto_resolved", None)
-            st.success("Catalogue rebuilt. Direct links are fetched automatically as you browse.")
+            st.success("Catalogue rebuilt. Direct links are fetched as you browse.")
             st.rerun()
     with t5:
         st.checkbox("⚡ Auto direct links", value=AUTO_LINK_VISIBLE_DEFAULT,
@@ -2991,8 +3481,8 @@ def main() -> None:
                 if not name.strip():
                     st.error("Please enter the product name.")
                 elif url.strip() and not is_pdp(sanitize_url(url)):
-                    st.error("That is not a direct product link. Open the product on Flipkart "
-                             "and copy the URL containing `/p/itm...`.")
+                    st.error("That is not a direct product link. Copy the URL containing "
+                             "`/p/itm...`.")
                 else:
                     with st.spinner("Fetching the exact product page…"):
                         item = build_wishlist_item(name, url, current=price or 999)
@@ -3026,8 +3516,8 @@ def main() -> None:
     st.markdown(
         "<div class=\"section-title-catalog\">"
         "<h2 style=\"margin:0;\">1. 🛒 Flipkart Category Catalog</h2>"
-        "<p style=\"margin:2px 0 0 0; font-size:0.9rem;\">Independent collapsible tables with "
-        "Brand and Product Type filters, plus a direct product link on every row.</p></div>",
+        "<p style=\"margin:2px 0 0 0; font-size:0.9rem;\">Collapsible tables with Brand "
+        "and Product Type filters, plus a direct product link on every row.</p></div>",
         unsafe_allow_html=True)
     for category, meta in DEPARTMENT_STRUCTURE.items():
         subset = master_df[(master_df["Category"] == category) & (~master_df["is_wishlist"])]
@@ -3044,7 +3534,8 @@ def main() -> None:
     if bbd_df.empty:
         st.info("No product currently beats last year's BBD floor price.")
     else:
-        render_collapsible_table(bbd_df, "All Confirmed BBD Floor Steals", "bbd_steals", "🔥", True)
+        render_collapsible_table(bbd_df, "All Confirmed BBD Floor Steals", "bbd_steals",
+                                 "🔥", True)
 
     # SECTION 3: ADS & PROMOTIONS
     st.markdown(
@@ -3060,7 +3551,7 @@ def main() -> None:
         render_collapsible_table(ads_df, "Active Sponsored & Banner Promotions",
                                  "flipkart_ads", "📢", True)
 
-    # SECTION 4: PRICE HISTORY CHECKER (URL based)
+    # SECTION 4: PRICE HISTORY SUITE
     render_price_history_tool()
 
 
@@ -3076,27 +3567,25 @@ def render_deep_scanner() -> None:
                               for s in steps]),
                 use_container_width=True, hide_index=True)
 
-        st.caption(
-            "Scans Flipkart by recursively bisecting saturated price windows. Every discovered "
-            "row arrives with its own verified /p/itm direct product link."
-        )
+        st.caption("Scans Flipkart by recursively bisecting saturated price windows. "
+                   "Every discovered row arrives with its own verified /p/itm link.")
 
         c1, c2, c3 = st.columns([2.4, 1.3, 1.3])
         categories = c1.multiselect("Categories to scan:", options=list(SCANNER_SEEDS),
                                     default=list(SCANNER_SEEDS), key="scan_cats")
-        target = c2.number_input("Target per category (Default 3,000; 0 = Unlimited):",
-                                 min_value=0, max_value=500000, value=3000, step=500,
-                                 key="scan_target")
+        target = c2.number_input("Target per category (0 = Unlimited):", min_value=0,
+                                 max_value=500000, value=3000, step=500, key="scan_target")
         pages = c3.slider("Pages per query:", 1, 50, 10, key="scan_pages")
 
         o1, o2, o3, o4 = st.columns(4)
         use_brands = o1.checkbox("× brands", value=True, key="scan_brands")
         use_bands = o2.checkbox("× price bands", value=True, key="scan_bands")
         use_sorts = o3.checkbox("× sort orders", value=True, key="scan_sorts")
-        budget = o4.number_input("Max requests (0 = Unlimited):", min_value=0, max_value=1000000,
-                                 value=0, step=500, key="scan_budget")
+        budget = o4.number_input("Max requests (0 = Unlimited):", min_value=0,
+                                 max_value=1000000, value=0, step=500, key="scan_budget")
 
-        min_disc = st.slider("Only add products discounted ≥ %:", 0, 80, 0, 5, key="scan_min_disc")
+        min_disc = st.slider("Only add products discounted ≥ %:", 0, 80, 0, 5,
+                             key="scan_min_disc")
 
         if not categories:
             st.info("Pick at least one category to scan.")
@@ -3104,8 +3593,8 @@ def render_deep_scanner() -> None:
 
         frontier = scanner.seed_frontier(categories, use_brands=use_brands,
                                          use_bands=use_bands, use_sorts=use_sorts)
-        st.caption(f"Frontier initialized with **{len(frontier):,} entry points**. Recursive "
-                   "bisection will expand across thousands of price windows.")
+        st.caption(f"Frontier initialized with **{len(frontier):,} entry points**. "
+                   "Recursive bisection expands across thousands of price windows.")
 
         r1, r2, r3 = st.columns(3)
         if r1.button("🛰️ Start Deep Multi-Thousand Scan", type="primary", key="scan_run"):
@@ -3120,7 +3609,7 @@ def render_deep_scanner() -> None:
                     f"{scanner.limiter.rate:.1f} req/s"
                 )
 
-            with st.spinner("Scanning Flipkart departments for thousands of products…"):
+            with st.spinner("Scanning Flipkart departments…"):
                 scanner.run_frontier(frontier, pages,
                                      target_per_category=int(target),
                                      max_requests=int(budget),
@@ -3147,8 +3636,7 @@ def render_deep_scanner() -> None:
             added = st.session_state.get("scan_added", 0)
             linked = st.session_state.get("scan_linked", 0)
             if added:
-                st.success(f"Added **{added:,}** deals with direct product links into the "
-                           "tables above!")
+                st.success(f"Added **{added:,}** deals with direct product links above!")
             elif scanner.products:
                 st.info("All discovered deals are already present in the tables above.")
             if linked:
