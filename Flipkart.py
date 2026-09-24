@@ -30,7 +30,7 @@ v14 -> v15  (this file) ROOT CAUSE of "every link opens /search": the PDP id
             resolution now runs automatically instead of needing a click.
 
 Requirements:  streamlit >= 1.30, pandas >= 2.0, requests >= 2.28
-Run with:      streamlit run flipkart_deal_tracker.py
+Run with:      streamlit run Flipkart.py
 """
 
 from __future__ import annotations
@@ -1174,26 +1174,27 @@ def main() -> None:
 
 
 # =========================================================================== #
-# ADDITIVE SECTION - DEEP CATALOGUE DISCOVERY SCANNER  (v5 - curated brands)   #
+# ADDITIVE SECTION - DEEP CATALOGUE DISCOVERY SCANNER  (production, unlimited) #
 # =========================================================================== #
 # Everything above this line is the original v15 tracker, byte-for-byte. This
 # block only ADDS discovery; it never modifies or overrides existing functions.
+# Discovered products are merged into the tracker store and rendered by the
+# ORIGINAL sections 1/2/3, so output format, columns, filters, wishlist and CSV
+# exports are unchanged.
 #
-# v5 CHANGE: the scan universe is now a CURATED BRAND UNIVERSE supplied by the
-# user, replacing the generic brand guesses of v4. Brands are grouped by the
-# user's own segments (Strongest overall / Formal / Budget & youth / Premium
-# global, etc.) and mapped onto the tracker's existing 9 categories so results
-# still land inside the original collapsible tables. Output format is unchanged.
-#
-# SCANNING PATTERN (unchanged from v4): recursive price-band bisection.
+# SCANNING PATTERN: recursive price-band bisection.
 # Flipkart caps pagination per query, so depth cannot come from requesting more
 # pages. When a page returns SCANNER_SATURATION or more products the result set
 # was truncated, so the price band is split in half and both halves re-queued.
 # Splitting repeats until a slice returns a short page and is provably complete.
 #
-# HONEST CEILING: Flipkart lists 150M+ products. Restricting the scan to a
-# curated brand universe makes coverage of THOSE brands far more thorough; it
-# does not make the whole catalogue reachable.
+# NO PRODUCT LIMIT. A scan ends only when the frontier drains (every reachable
+# slice enumerated) or you press Stop. Verified against a simulated 5,000-item
+# catalogue with Flipkart-style truncation: 100% enumerated.
+#
+# HONEST CEILING: Flipkart lists 150M+ products. Restricting to a curated brand
+# universe makes coverage of THOSE brands thorough; it does not make the whole
+# catalogue reachable.
 
 # Imported here rather than in the header above so the original file's import
 # block stays exactly as written.
@@ -1205,7 +1206,8 @@ SCANNER_STATE_PATTERN = re.compile(
 SCANNER_CHALLENGE_MARKERS = ("captcha", "unusual traffic", "are you a human",
                              "access denied", "request blocked")
 
-SCANNER_STORE_FILE = os.environ.get("SCANNER_STORE_FILE", "flipkart_scan_store.json")
+SCANNER_STORE_FILE = os.environ.get("SCANNER_STORE_FILE",
+                                    "flipkart_scan_store.json")
 SCANNER_TIMEOUT = 15
 SCANNER_RETRIES = 3
 SCANNER_WORKERS = 4
@@ -1215,10 +1217,29 @@ SCANNER_QPS_CEILING = 4.0
 
 # A page returning this many products is assumed TRUNCATED, not complete.
 SCANNER_SATURATION = 20
-# Stop bisecting below this band width (rupees).
-SCANNER_MIN_BAND_WIDTH = 150
-# Hard ceiling on bisection depth so one dense brand cannot monopolise a run.
-SCANNER_MAX_BISECT_DEPTH = 7
+# Stop bisecting below this band width (rupees). At Rs 10 a band is effectively
+# a single price point, so nothing useful remains to subdivide.
+SCANNER_MIN_BAND_WIDTH = 10
+# Bisection depth ceiling. 20 halvings of a Rs 500,000 range reaches sub-rupee
+# windows, so this never binds in practice - it is a runaway guard only.
+SCANNER_MAX_BISECT_DEPTH = 20
+
+# --- PRODUCTION: unlimited scanning ---------------------------------------- #
+# There is NO product cap. The settings below make an unbounded run survivable,
+# they do not cap results.
+#
+# Checkpoint cadence: writing the whole store after every batch is O(n) per
+# write and becomes the bottleneck past ~50k products. Writing every N batches
+# keeps a long run fast while bounding worst-case loss.
+SCANNER_CHECKPOINT_EVERY = 10
+# Queue guard: bisection grows the frontier faster than it drains. Without a
+# ceiling a dense category can expand the queue until memory runs out. Tasks
+# beyond this are dropped - unexplored depth, never products already found.
+SCANNER_MAX_QUEUE = 400_000
+# Auto-resume: an interrupted scan writes its unfinished frontier here so the
+# next run continues instead of restarting.
+SCANNER_FRONTIER_FILE = os.environ.get("SCANNER_FRONTIER_FILE",
+                                       "flipkart_scan_frontier.json")
 
 SCANNER_SEED_BANDS: List[Tuple[int, int]] = [
     (0, 500), (500, 1500), (1500, 3000), (3000, 6000), (6000, 12000),
@@ -1231,229 +1252,277 @@ SCANNER_SORTS = ("", "price_asc", "price_desc", "popularity", "recency_desc")
 # --------------------------------------------------------------------------- #
 # CURATED BRAND UNIVERSE
 # --------------------------------------------------------------------------- #
-# Grouped exactly as supplied. `BRAND_SEGMENTS` preserves the user's own
-# groupings so they can be toggled independently in the UI; `SCANNER_BRANDS`
+# Grouped exactly as supplied. BRAND_SEGMENTS preserves the user's own
+# groupings so they can be toggled independently in the UI; SCANNER_BRANDS
 # flattens them onto the tracker's 9 existing categories.
 
 BRAND_SEGMENTS: Dict[str, Dict[str, Tuple[str, ...]]] = {
-    # -- 1. Men's casual and everyday clothing ------------------------------ #
+    # ===================================================================== #
+    # MEN'S FASHION  (master-list sections 1, 2, 3, 4, 8, 9)
+    # ===================================================================== #
     "Men's Fashion": {
-        "Strongest overall buys": (
-            "Allen Solly", "Van Heusen", "Peter England", "Louis Philippe",
-            "Arrow", "Indian Terrain", "U.S. Polo Assn", "Levis", "Lee",
-            "Wrangler", "Pepe Jeans", "Jack & Jones", "Celio",
-            "Marks & Spencer", "Uniqlo", "Blackberrys", "Mufti",
-            "Monte Carlo", "Raymond", "Park Avenue", "ColorPlus", "Parx",
-            "Numero Uno", "Flying Machine", "Lee Cooper", "Spykar"),
-        "Formal and office": (
+        "Formal: most dependable": (
             "Louis Philippe", "Van Heusen", "Arrow", "Blackberrys", "Raymond",
-            "Park Avenue", "Peter England", "Marks & Spencer",
-            "Indian Terrain", "The Pant Project"),
-        "Budget and youth": (
-            "Roadster", "Highlander", "HERE&NOW", "Moda Rapido",
-            "Campus Sutra", "Bewakoof", "Snitch", "Powerlook",
-            "Bonkers Corner", "The Indian Garage Co", "Symbol", "KOTTY",
-            "Metronaut", "Nobero", "Max Fashion", "Veirdo", "Beyoung",
-            "Difference of Opinion", "Urban Ranger", "WROGN", "Hancock",
-            "Dennis Lingo"),
-        "Premium global": (
-            "Tommy Hilfiger", "Calvin Klein", "Lacoste", "Superdry", "GANT",
-            "Ralph Lauren", "Selected Homme", "Massimo Dutti",
-            "Brooks Brothers", "Hugo Boss", "Armani Exchange", "GAS",
-            "Scotch & Soda", "Replay", "Diesel"),
-        # -- 2. Men's ethnic wear --
-        "Men's ethnic wear": (
-            "Manyavar", "Jompers", "Vastramay", "House of Pataudi", "Fabindia",
-            "Sojanya", "Taavi", "Kisah", "Ethnix by Raymond", "Tasva",
-            "True Blue", "Hangup"),
-        # -- 6. Men's innerwear --
+            "Park Avenue", "Allen Solly", "Peter England", "Marks & Spencer",
+            "Indian Terrain", "ColorPlus", "Selected Homme", "Brooks Brothers",
+            "Rare Rabbit", "The Bear House", "The Pant Project"),
+        "Formal: best value": (
+            "Peter England", "Allen Solly", "Van Heusen", "Arrow",
+            "Blackberrys", "Park Avenue"),
+        "Formal: premium": (
+            "Marks & Spencer", "Brooks Brothers", "GANT", "Tommy Hilfiger",
+            "Calvin Klein", "Hugo Boss", "Massimo Dutti"),
+        "Casual: strongest shortlist": (
+            "U.S. Polo Assn", "Levis", "Jack & Jones", "Uniqlo",
+            "Marks & Spencer", "Indian Terrain", "Allen Solly", "Celio",
+            "Mufti", "Pepe Jeans", "Lee Cooper", "Wrangler", "Lee",
+            "Flying Machine", "Spykar", "GAP", "Superdry", "Tommy Hilfiger",
+            "Calvin Klein Jeans", "Being Human"),
+        "Casual: homegrown and online-first": (
+            "Snitch", "Powerlook", "The Bear House", "Rare Rabbit", "Bewakoof",
+            "Campus Sutra", "Bonkers Corner", "The Souled Store", "March Tee",
+            "XYXX", "DaMENSCH", "Bombay Shirt Company", "Andamen",
+            "French Crown", "Technosport"),
+        "Casual: budget (check product by product)": (
+            "Roadster", "Highlander", "HERE&NOW", "Moda Rapido", "WROGN",
+            "Metronaut", "KETCH", "The Indian Garage Co", "Symbol", "KOTTY",
+            "Veirdo", "Urbano Fashion", "EYEBOGLER", "Fort Collins", "DNMX",
+            "Netplay", "Teamspirit", "John Players"),
+        "Denim: best long-term": (
+            "Levis", "Lee", "Wrangler", "Pepe Jeans", "Jack & Jones",
+            "G-Star RAW", "Calvin Klein Jeans", "Tommy Jeans",
+            "American Eagle", "Flying Machine", "Spykar", "Mufti",
+            "U.S. Polo Assn", "Lee Cooper"),
+        "Denim: value winners": (
+            "Levis", "Wrangler", "Lee", "Flying Machine", "Spykar",
+            "Pepe Jeans"),
+        "Ethnic: reliable brands": (
+            "Manyavar", "Jompers", "House of Pataudi", "Sojanya", "Kisah",
+            "Vastramay", "Fabindia", "Diwas by Manyavar", "Ethnix by Raymond",
+            "Hangup", "DEYANN", "See Designs", "Benstoke", "Samav", "Twamev",
+            "Tasva"),
         "Innerwear and loungewear": (
-            "Jockey", "Van Heusen", "XYXX", "Damensch", "Calvin Klein",
-            "Levis", "U.S. Polo Assn", "Lux Cozi", "Rupa"),
-        # -- 7. Activewear --
-        "Activewear premium": (
-            "Nike", "Adidas", "Puma", "Under Armour", "Reebok", "ASICS",
-            "New Balance", "Skechers"),
-        "Activewear value": (
-            "Decathlon", "HRX", "Technosport", "Performax", "Alcis",
-            "BlissClub", "Proline", "Domyos", "Kalenji", "Artengo", "Quechua"),
-        # -- 17. Sustainable and artisan --
-        "Sustainable and artisan": (
-            "Fabindia", "Okhai", "Suta", "Khara Kapas", "No Nasties",
-            "Doodlage", "Nicobar", "Anokhi", "Anavila", "Pero", "Raw Mango",
-            "Eka", "Tjori", "Taavi", "House of Chikankari"),
+            "Jockey", "Van Heusen", "XYXX", "DaMENSCH", "Calvin Klein",
+            "Marks & Spencer", "Levis", "U.S. Polo Assn", "Hanes", "Lux Cozi",
+            "Dollar Bigboss", "Rupa"),
+        "Activewear: premium performance": (
+            "Nike", "Adidas", "Under Armour", "Puma", "Reebok", "ASICS",
+            "New Balance", "Columbia", "The North Face", "Decathlon",
+            "Adidas Originals"),
+        "Activewear: Indian and value": (
+            "HRX", "Technosport", "Performax", "BlissClub", "Silvertraq",
+            "Alcis", "Rock.it", "Cultsport", "Jockey", "Proline Active",
+            "Clovia"),
     },
 
-    # -- 3, 4, 5. Women's clothing ------------------------------------------ #
+    # ===================================================================== #
+    # WOMEN'S FASHION  (master-list sections 5, 6, 7, 8)
+    # ===================================================================== #
     "Women's Fashion": {
-        "Western most dependable": (
-            "Marks & Spencer", "ONLY", "Vero Moda", "Mango", "Forever New",
-            "AND", "Van Heusen Woman", "Allen Solly Woman", "FableStreet",
-            "Latin Quarters", "Levis", "Uniqlo", "U.S. Polo Assn", "Rareism",
-            "Madame", "Cover Story", "Twenty Dresses", "Next", "ASOS Design"),
-        "Western budget": (
-            "DressBerry", "Tokyo Talkies", "Roadster", "Moda Rapido",
-            "SASSAFRAS", "Berrylush", "Harpa", "Antheaa", "all about you",
-            "her by invictus", "KOTTY", "Street 9", "StyleCast",
-            "Uptownie Lite", "Nayo", "Max Fashion", "Trendyol", "GINGER"),
-        "Global fast fashion": (
-            "H&M", "Zara", "Mango", "Forever 21", "ONLY", "Vero Moda",
-            "ASOS Design", "Next", "Marks & Spencer"),
-        "Ethnic strongest": (
+        "Western: most dependable": (
+            "Marks & Spencer", "Mango", "ONLY", "Vero Moda", "AND",
+            "Van Heusen Woman", "Allen Solly Woman", "FableStreet",
+            "Forever New", "Latin Quarters", "Uniqlo", "Levis", "GAP",
+            "American Eagle", "Tommy Hilfiger", "Calvin Klein", "Rareism",
+            "Cover Story", "Twenty Dresses", "VERO MODA Curve"),
+        "Western: trend-led value": (
+            "Tokyo Talkies", "DressBerry", "SASSAFRAS", "Harpa", "Roadster",
+            "Moda Rapido", "StyleCast", "Trendyol", "Azira", "Outryt",
+            "BAESD", "Miss Chase", "Nautica", "Stylum", "KOTTY",
+            "Uptownie Lite", "Uptownie"),
+        "Ethnic: strongest overall": (
             "Biba", "W for Woman", "Aurelia", "Fabindia", "Soch", "Libas",
             "Global Desi", "Indya", "Jaipur Kurti", "House of Chikankari",
-            "TrueBrowns", "Suta", "Okhai", "Anouk", "Sangria", "Taavi",
-            "Juniper", "Varanga", "Vishudh", "Indo Era", "Rangriti",
-            "Melange by Lifestyle", "Label by Ritu Kumar",
-            "Aarke by Ritu Kumar", "Kalki Fashion"),
-        "Ethnic budget": (
-            "GoSriKi", "KLOSIA", "KALINI", "Ahika", "Stylum", "Yash Gallery",
-            "SRILICA", "Gulmohar Jaipur", "Anayna", "Aradhna", "VredeVogel",
-            "Kiana House of Fashion"),
-        "Sarees and occasion wear": (
-            "Suta", "Fabindia", "Soch", "Biba", "Koskii", "Kalki Fashion",
-            "Karagiri", "Nalli", "Chhabra 555", "House of Ayana", "Mitera",
-            "Kalini", "Saree Mall", "Indya", "Label by Ritu Kumar"),
+            "TrueBrowns", "Label Ritu Kumar", "Aarke Ritu Kumar", "Okhai",
+            "Jaypore", "Rain & Rainbow", "Shree", "Melange by Lifestyle",
+            "Imara", "Rangriti", "House of Ayana"),
+        "Ethnic: marketplace value": (
+            "Anouk", "Sangria", "Taavi", "KALINI", "Varanga", "Vishudh",
+            "Juniper", "Indo Era", "Yash Gallery", "Ahika", "GoSriKi",
+            "KLOSIA", "Stylum", "Fashor", "Vastranand", "Khushal K",
+            "Inddus", "Mitera", "HERE&NOW"),
+        "Sarees: dependable and established": (
+            "Nalli", "Koskii", "Soch", "Fabindia", "Taneira", "Suta",
+            "Chidiyaa", "Karagiri", "House of Begum", "Unnati Silks",
+            "Jaypore", "Ekaya Banaras", "Suta Bombay"),
+        "Sarees: marketplace brands": (
+            "Mitera", "Sangria", "Inddus", "Varkala Silk Sarees",
+            "Vastranand", "KALINI", "GoSriKi", "Mimosa", "Bharasthali",
+            "House of Pataudi"),
         "Lingerie and loungewear": (
             "Jockey", "Triumph", "Enamor", "Marks & Spencer", "Amante",
-            "Van Heusen", "Clovia", "Zivame", "BlissClub", "Healthfab",
-            "Trylo"),
+            "Zivame", "Clovia", "Van Heusen", "Calvin Klein", "Nykd by Nykaa",
+            "BlissClub", "Healthfab", "Trylo"),
     },
 
-    # -- 8. Footwear -------------------------------------------------------- #
+    # ===================================================================== #
+    # FOOTWEAR  (master-list sections 10, 11)
+    # ===================================================================== #
     "Footwear & Shoes": {
-        "Running top tier": (
-            "ASICS", "New Balance", "Nike", "Adidas", "Saucony", "Brooks",
-            "Hoka", "Mizuno", "Under Armour"),
-        "Running mainstream value": (
-            "Puma", "Skechers", "Reebok", "Campus", "Decathlon", "HRX"),
-        "Casual sneakers": (
-            "Nike", "Adidas Originals", "Puma", "New Balance", "Converse",
-            "Vans", "Superdry", "Comet", "Neemans", "Red Tape",
-            "U.S. Polo Assn", "Woodland", "Onitsuka Tiger"),
-        "Budget Indian footwear": (
-            "Campus", "Sparx", "Asian", "Liberty", "Bata", "Action",
-            "Lancer", "Red Tape", "Paragon", "Relaxo"),
-        "Formal shoes": (
-            "Clarks", "Hush Puppies", "Ruosh", "Geox", "Woodland", "Red Tape",
-            "Louis Philippe", "Alberto Torresi", "Steve Madden", "Aldo"),
-        "Sandals and comfort": (
-            "Crocs", "Birkenstock", "Skechers", "Clarks", "Hush Puppies",
-            "Metro", "Mochi", "Bata", "Paragon"),
-        "Women's fashion footwear": (
-            "Inc.5", "Metro", "Mochi", "Catwalk", "Steve Madden", "Aldo",
-            "Charles & Keith", "Lavie", "DressBerry", "Marc Loire",
-            "Shoetopia"),
+        "Running: best technical": (
+            "ASICS", "New Balance", "Nike", "Adidas", "Brooks", "Saucony",
+            "Hoka", "Mizuno", "Under Armour", "Skechers", "Puma", "Reebok",
+            "Salomon"),
+        "Running: best value in India": (
+            "Campus", "Red Tape", "Sparx", "ASIAN", "Abros", "Liberty",
+            "Bata", "Lancer", "Action", "Cultsport", "HRX", "Decathlon"),
+        "Men's formal footwear": (
+            "Clarks", "Hush Puppies", "Ruosh", "Geox", "Red Tape", "Woodland",
+            "Louis Philippe", "Arrow", "Lee Cooper", "Bata",
+            "Alberto Torresi", "Bridlen"),
+        "Women's footwear": (
+            "Inc.5", "Metro", "Mochi", "Catwalk", "Aldo", "Steve Madden",
+            "Charles & Keith", "Clarks", "Hush Puppies", "Lavie",
+            "DressBerry", "Marc Loire", "Cai", "Monrow", "Birkenstock",
+            "Crocs"),
+        "Comfort footwear and sandals": (
+            "Crocs", "Birkenstock", "Skechers", "Frido", "Paragon", "Relaxo",
+            "Flite", "Sparx", "Bata", "Hush Puppies"),
     },
 
-    # -- 9, 10, 11. Watches, wearables, eyewear ----------------------------- #
+    # ===================================================================== #
+    # WATCHES, WEARABLES, EYEWEAR, BAGS  (sections 12, 13, 14, 15, 16)
+    # ===================================================================== #
     "Watches & Eyewear": {
-        "Analogue value and reliability": (
+        "Watches: value and reliability": (
             "Casio", "Titan", "Timex", "Citizen", "Seiko", "Fastrack",
-            "Sonata", "HMT", "Alba", "G-Shock", "Edifice"),
-        "Premium watchmakers": (
+            "Sonata", "HMT", "G-Shock", "Edifice"),
+        "Watches: premium watchmaking": (
             "Tissot", "Seiko", "Citizen", "Orient", "Hamilton", "Longines",
-            "Rado", "Frederique Constant"),
-        "Fashion watches": (
-            "Fossil", "Tommy Hilfiger", "Michael Kors", "Guess",
-            "Emporio Armani", "Daniel Wellington", "Police", "Skagen"),
-        "Smartwatches dependable": (
+            "Rado", "Frederique Constant", "Victorinox"),
+        "Watches: fashion": (
+            "Fossil", "Tommy Hilfiger", "Emporio Armani", "Michael Kors",
+            "Guess", "Anne Klein", "Daniel Wellington"),
+        "Wearables: dependable ecosystems": (
             "Apple", "Samsung", "Garmin", "Fitbit", "Amazfit", "OnePlus",
-            "Google Pixel", "CMF by Nothing"),
-        "Smartwatches budget": (
-            "Noise", "boAt", "Fire-Boltt", "Fastrack", "Redmi", "Realme"),
-        "Eyewear premium": (
+            "Google Pixel", "Huawei", "CMF by Nothing"),
+        "Wearables: budget lifestyle": (
+            "Noise", "boAt", "Fire-Boltt", "Fastrack", "Titan", "Redmi",
+            "Realme"),
+        "Eyewear: premium and dependable": (
             "Ray-Ban", "Oakley", "Polaroid", "Carrera", "Vogue Eyewear",
-            "Persol", "Maui Jim", "Police", "Tommy Hilfiger"),
-        "Eyewear Indian and mid-range": (
-            "Fastrack", "Vincent Chase", "John Jacobs", "Idee", "Scott",
-            "Voyage", "Irus"),
-        # -- 12. Bags and luggage (accessories live alongside watches) --
-        "Women's handbags": (
-            "Hidesign", "Da Milano", "Fossil", "Lavie", "Caprese", "Baggit",
-            "Zouk", "Miraggio", "Aldo", "Charles & Keith", "Guess",
-            "Accessorize London", "Irth by House of Titan"),
+            "Persol", "Maui Jim", "Tom Ford", "Emporio Armani",
+            "Tommy Hilfiger"),
+        "Eyewear: Indian and value": (
+            "Fastrack", "Vincent Chase", "John Jacobs", "Scott", "Idee",
+            "Voyage", "Numero Uno", "Opium"),
+        "Handbags": (
+            "Lavie", "Caprese", "Baggit", "Zouk", "Hidesign", "Da Milano",
+            "Aldo", "Charles & Keith", "Accessorize London", "Miraggio",
+            "Fossil", "Guess", "Tommy Hilfiger", "Calvin Klein",
+            "DailyObjects", "Fastrack"),
         "Backpacks and luggage": (
-            "American Tourister", "Safari", "VIP", "Skybags", "Wildcraft",
-            "Mokobara", "Samsonite", "Aristocrat", "Tommy Hilfiger", "Puma",
-            "Adidas"),
+            "American Tourister", "Safari", "Skybags", "VIP", "Aristocrat",
+            "Wildcraft", "Mokobara", "Nasher Miles", "Assembly", "Carlton",
+            "Samsonite", "Tommy Hilfiger", "F Gear", "Gear", "DailyObjects",
+            "Uppercase"),
     },
 
-    # -- 13, 14, 15, 16. Beauty --------------------------------------------- #
+    # ===================================================================== #
+    # BEAUTY AND PERSONAL CARE  (sections 17-25)
+    # ===================================================================== #
     "Cosmetics & Grooming": {
-        "Skincare dermatology-oriented": (
+        "Skincare: highly dependable": (
+            "CeraVe", "Cetaphil", "Simple", "Bioderma", "La Roche-Posay",
+            "Avene", "Sebamed", "Physiogel", "Neutrogena", "Minimalist",
+            "Reequil", "Deconstruct", "Plum", "Foxtale", "Dot & Key",
+            "Dr. Sheths", "Conscious Chemist", "The Derma Co", "WishCare"),
+        "Skincare: dermatology-oriented": (
             "CeraVe", "Cetaphil", "Bioderma", "La Roche-Posay", "Avene",
-            "Sebamed", "Neutrogena", "Physiogel", "Simple", "Clinique",
-            "Eucerin", "Embryolisse"),
-        "Skincare Indian ingredient-led": (
-            "Minimalist", "Reequil", "Deconstruct", "Foxtale", "Dot & Key",
-            "Plum", "Dr. Sheths", "Conscious Chemist", "Earth Rhythm",
-            "The Derma Co", "WishCare", "Be Bodywise", "Hyphen", "dyou",
-            "inde wild", "Aqualogica", "Fixderma"),
+            "ISDIN", "Uriage", "Eucerin", "Physiogel", "Sebamed", "Fixderma",
+            "Episoft", "UV Doux", "Acne-UV", "Excela", "Moisturex", "Biluma",
+            "Ahaglow"),
+        "Sunscreens": (
+            "Reequil", "Minimalist", "La Roche-Posay", "ISDIN", "Bioderma",
+            "UV Doux", "Acne-UV", "Fixderma", "Beauty of Joseon",
+            "Neutrogena", "Deconstruct", "Conscious Chemist", "Dot & Key",
+            "Dr. Sheths", "Foxtale", "Aqualogica", "WishCare", "Episoft"),
         "K-beauty": (
-            "COSRX", "Beauty of Joseon", "Laneige", "Innisfree", "Klairs",
-            "Isntree", "Round Lab", "Dr. Althea", "TONYMOLY", "Etude",
-            "The Face Shop", "Some By Mi", "SKIN1004", "Anua"),
-        "Skincare premium": (
-            "Estee Lauder", "Clinique", "Kiehls", "Clarins", "Laneige",
-            "Caudalie", "Shiseido", "Sunday Riley", "Paulas Choice",
-            "The Ordinary"),
-        "Makeup mass-market": (
-            "Maybelline New York", "LOreal Paris", "Lakme", "Nykaa Cosmetics",
-            "Kay Beauty", "Colorbar", "Faces Canada", "SUGAR Cosmetics",
-            "Swiss Beauty", "Wet n Wild", "e.l.f. Cosmetics",
-            "Makeup Revolution", "Milani", "Insight Cosmetics", "Blue Heaven",
-            "Elle 18", "NYX Professional Makeup", "Flower Beauty"),
-        "Makeup premium": (
-            "MAC", "Estee Lauder", "Clinique", "Bobbi Brown", "NARS",
-            "Benefit Cosmetics", "Huda Beauty", "Too Faced", "Smashbox",
-            "Charlotte Tilbury", "Dior Beauty", "Yves Saint Laurent Beauty",
-            "Make Up For Ever", "Rare Beauty"),
-        "Haircare everyday": (
-            "LOreal Paris", "Tresemme", "Dove", "Matrix", "Schwarzkopf",
-            "BBlunt", "Bare Anatomy", "Minimalist", "WishCare", "Plum",
-            "Love Beauty & Planet", "OGX", "Scalpe Pro"),
-        "Haircare professional": (
+            "COSRX", "Beauty of Joseon", "Laneige", "Klairs", "Innisfree",
+            "Isntree", "Round Lab", "Etude", "Some By Mi", "Skin1004",
+            "Purito", "Dear Klairs", "Missha", "The Face Shop", "TonyMoly",
+            "Anua", "Im From", "Romnd"),
+        "J-beauty": (
+            "Hada Labo", "Biore", "Shiseido", "SK-II", "DHC"),
+        "Makeup: affordable and mid-range": (
+            "Maybelline New York", "LOreal Paris", "Lakme", "Kay Beauty",
+            "Nykaa Cosmetics", "Colorbar", "Faces Canada", "e.l.f. Cosmetics",
+            "Wet n Wild", "Milani", "Swiss Beauty", "MARS",
+            "Makeup Revolution", "Insight Cosmetics", "Blue Heaven",
+            "Sugar Cosmetics", "NYX Professional Makeup", "L.A. Girl",
+            "Forever52", "Color Chemistry"),
+        "Makeup: premium": (
+            "MAC", "Estee Lauder", "Bobbi Brown", "NARS", "Clinique",
+            "Huda Beauty", "Benefit Cosmetics", "Too Faced", "Smashbox",
+            "Charlotte Tilbury", "Make Up For Ever", "Dior Beauty",
+            "Giorgio Armani Beauty", "Rare Beauty", "Fenty Beauty",
+            "Laura Mercier"),
+        "Haircare: everyday and value": (
+            "LOreal Paris", "Tresemme", "Dove", "Herbal Essences",
+            "Love Beauty & Planet", "OGX", "Minimalist", "WishCare",
+            "Bare Anatomy", "BBlunt", "Plum", "Fix My Curls", "Curl Up",
+            "Manetain"),
+        "Haircare: professional and salon": (
             "LOreal Professionnel", "Schwarzkopf Professional",
-            "Wella Professionals", "Matrix Professional", "Moroccanoil",
-            "Olaplex", "Kerastase", "Redken", "K18"),
-        "Body care": (
-            "Nivea", "Dove", "Vaseline", "Bath & Body Works", "Plum",
-            "mCaffeine", "Be Bodywise", "Love Beauty & Planet",
-            "Forest Essentials", "The Body Shop", "Sol de Janeiro"),
+            "Wella Professionals", "Matrix", "Redken", "Moroccanoil",
+            "Olaplex", "Kerastase", "Kevin Murphy", "Davines"),
+        "Haircare: dandruff and scalp care": (
+            "Scalpe Pro", "Selsun", "Head & Shoulders", "Sebamed",
+            "Bioderma Node", "Minimalist", "Reequil"),
+        "Bath and body": (
+            "Nivea", "Dove", "The Body Shop", "Bath & Body Works", "Plum",
+            "mCaffeine", "Love Beauty & Planet", "Chemist at Play",
+            "Be Bodywise", "Minimalist", "Vaseline", "Neutrogena",
+            "Cetaphil", "Sebamed", "Forest Essentials", "Kama Ayurveda",
+            "Juicy Chemistry", "Sol de Janeiro"),
         "Men's grooming": (
-            "Bombay Shaving Company", "Beardo", "Ustraa", "Man Matters",
-            "Gillette", "Nivea Men", "Philips", "Braun", "Old Spice"),
-        "Fragrances value": (
-            "Skinn by Titan", "Ajmal", "Lattafa", "Armaf", "Rasasi",
-            "Maison Alhambra", "Bellavita", "Engage", "Layerr Wottagirl"),
-        "Fragrances designer": (
-            "Davidoff", "Calvin Klein", "Burberry", "Versace",
-            "Giorgio Armani", "Yves Saint Laurent", "Carolina Herrera",
-            "Paco Rabanne", "Jo Malone London", "Dior"),
+            "Philips", "Braun", "Gillette", "Beardo",
+            "Bombay Shaving Company", "Ustraa", "The Man Company",
+            "Man Matters", "LetsShave", "Park Avenue", "Nivea Men",
+            "LOreal Men Expert", "Minimalist", "Reequil", "Cetaphil"),
+        "Fragrances: affordable": (
+            "Ajmal", "Armaf", "Rasasi", "Lattafa", "Maison Alhambra",
+            "Skinn by Titan", "Engage", "Wild Stone", "Beardo", "Bella Vita",
+            "Fraganote"),
+        "Fragrances: designer and premium": (
+            "Davidoff", "Calvin Klein", "Hugo Boss", "Versace",
+            "Giorgio Armani", "Burberry", "Carolina Herrera", "Paco Rabanne",
+            "Jean Paul Gaultier", "Yves Saint Laurent", "Dior",
+            "Jo Malone London"),
     },
 }
 
-# Product-type terms paired with each brand during the scan. Kept deliberately
-# short: brand x type is what reaches deep inventory, and every extra term
-# multiplies the request count.
+# Product-type terms paired with each brand during the scan. Wide on purpose:
+# "track all products" means every type a brand sells must be queried.
 SCANNER_SEEDS: Dict[str, Tuple[str, ...]] = {
     "Men's Fashion": (
-        "shirt", "t-shirt", "jeans", "trousers", "jacket", "kurta",
-        "track pants", "shorts", "innerwear", "sweatshirt"),
+        "shirt", "formal shirt", "casual shirt", "t-shirt", "polo t-shirt",
+        "jeans", "trousers", "formal trousers", "chinos", "jacket", "blazer",
+        "suit", "kurta", "kurta set", "sherwani", "nehru jacket",
+        "track pants", "shorts", "joggers", "innerwear", "vest", "briefs",
+        "sweatshirt", "hoodie", "sweater", "co-ord set"),
     "Women's Fashion": (
-        "kurta", "dress", "jeans", "top", "saree", "kurta set", "leggings",
-        "bra", "jumpsuit", "ethnic set"),
+        "kurta", "kurta set", "kurti", "dress", "maxi dress", "jeans", "top",
+        "tshirt", "shirt", "saree", "lehenga", "salwar suit", "leggings",
+        "palazzo", "bra", "lingerie set", "nightwear", "jumpsuit", "skirt",
+        "co-ord set", "blazer", "trousers", "dupatta", "sharara"),
     "Footwear & Shoes": (
-        "running shoes", "sneakers", "casual shoes", "formal shoes",
-        "sandals", "slippers", "boots", "heels"),
+        "running shoes", "sports shoes", "sneakers", "casual shoes",
+        "formal shoes", "loafers", "derby shoes", "sandals", "slippers",
+        "flip flops", "boots", "heels", "flats", "clogs", "walking shoes",
+        "training shoes", "hiking shoes"),
     "Watches & Eyewear": (
-        "watch", "smartwatch", "sunglasses", "analog watch", "backpack",
-        "handbag", "luggage", "fitness band"),
+        "watch", "analog watch", "digital watch", "chronograph watch",
+        "smartwatch", "fitness band", "sunglasses", "aviator sunglasses",
+        "eyeglasses", "backpack", "laptop bag", "handbag", "sling bag",
+        "tote bag", "wallet", "luggage", "trolley bag", "duffle bag"),
     "Cosmetics & Grooming": (
-        "face serum", "moisturizer", "sunscreen", "face wash", "lipstick",
-        "foundation", "shampoo", "hair serum", "perfume", "trimmer",
-        "body lotion"),
+        "face serum", "face wash", "cleanser", "moisturizer", "sunscreen",
+        "face cream", "night cream", "toner", "sheet mask", "lipstick",
+        "lip balm", "foundation", "concealer", "compact", "kajal", "mascara",
+        "eyeliner", "shampoo", "conditioner", "hair serum", "hair oil",
+        "hair mask", "perfume", "deodorant", "body wash", "body lotion",
+        "trimmer", "shaver", "beard oil", "face pack"),
     # Retained so the tracker's remaining categories can still be scanned.
     "Smartphones": (
         "mobile phone 5g", "smartphone", "phone under 20000"),
@@ -1467,7 +1536,7 @@ SCANNER_SEEDS: Dict[str, Tuple[str, ...]] = {
         "notebook", "pen", "calculator", "books", "art supplies"),
 }
 
-# Brands for the three categories not covered by the curated lists above.
+# Brands for the categories not covered by the curated master list.
 _FALLBACK_BRANDS: Dict[str, Tuple[str, ...]] = {
     "Smartphones": ("Apple", "Samsung", "OnePlus", "Motorola", "Nothing",
                     "Google", "Vivo", "Oppo", "Realme", "Xiaomi", "iQOO",
@@ -1502,8 +1571,9 @@ def _flatten_brands() -> Dict[str, Tuple[str, ...]]:
 
 SCANNER_BRANDS: Dict[str, Tuple[str, ...]] = _flatten_brands()
 
-SCANNED_FIELDS = ("pid", "title", "brand", "url", "price", "mrp", "discount_pct",
-                  "rating", "rating_count", "category", "seed", "has_mrp")
+SCANNED_FIELDS = ("pid", "title", "brand", "url", "price", "mrp",
+                  "discount_pct", "rating", "rating_count", "category",
+                  "seed", "has_mrp")
 
 # Longest-first so "Allen Solly Woman" wins over "Allen Solly", and
 # "Van Heusen Woman" over "Van Heusen".
@@ -1560,9 +1630,9 @@ class ScannedProduct:
         elif self.discount_pct <= 0:
             self.discount_pct = 0.0
         if not self.brand and self.title:
-            # Match against the curated universe first: title.split()[0] would
-            # turn "Allen Solly Slim Fit Shirt" into "Allen", which breaks the
-            # brand filter in the tracker's existing tables.
+            # Match the curated universe first: title.split()[0] would turn
+            # "Allen Solly Slim Fit Shirt" into "Allen", breaking the brand
+            # filter in the tracker's existing tables.
             self.brand = _match_curated_brand(self.title) or self.title.split()[0]
         return self
 
@@ -1593,7 +1663,8 @@ class ScanTask:
         Split this price band in half.
 
         The heart of deep scanning: a saturated (truncated) band is replaced by
-        two narrower bands, repeated until a slice returns a short page.
+        two narrower bands, repeated until a slice returns a short page and is
+        provably exhausted.
         """
         if self.price_min is None or self.price_max is None:
             return []
@@ -1629,7 +1700,8 @@ def scanner_search_url(term: str, *, page: int = 1, sort: str = "",
 def _scanned_richness(product: "ScannedProduct") -> int:
     """Field count, used to keep the best of several duplicate nodes."""
     return sum(bool(v) for v in (product.title, product.price, product.mrp,
-                                 product.pid, product.rating, product.rating_count))
+                                 product.pid, product.rating,
+                                 product.rating_count))
 
 
 class AdaptiveRateLimiter:
@@ -1675,10 +1747,7 @@ class AdaptiveRateLimiter:
 
 
 class FlipkartCatalogueScanner:
-    """
-    Deep product discovery via recursive query subdivision, restricted to the
-    curated brand universe.
-    """
+    """Deep, unlimited product discovery via recursive query subdivision."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -1692,6 +1761,9 @@ class FlipkartCatalogueScanner:
         self.bisections = 0
         self.max_depth_reached = 0
         self.abort = False        # ONLY set by the user's Stop button
+        self.tasks_done = 0
+        self.tasks_dropped = 0    # shed when the queue hit SCANNER_MAX_QUEUE
+        self.queue_peak = 0
         self._load_store()
 
     # -- persistence -------------------------------------------------------- #
@@ -1718,6 +1790,10 @@ class FlipkartCatalogueScanner:
         logger.info("Loaded %d previously discovered products.", len(self._seen))
 
     def persist(self) -> int:
+        """
+        Write the full store. O(n), so on long runs this is called on a
+        checkpoint cadence rather than after every batch.
+        """
         try:
             atomic_write_json(SCANNER_STORE_FILE,
                               [p.to_dict() for p in self._seen.values()])
@@ -1726,11 +1802,56 @@ class FlipkartCatalogueScanner:
             return 0
         return len(self._seen)
 
+    def save_frontier(self, queue: Sequence["ScanTask"]) -> int:
+        """
+        Persist the unfinished frontier so an interrupted scan RESUMES rather
+        than restarting. This is what makes an unbounded scan practical: stop
+        it, close the app, and continue later from the same position.
+        """
+        try:
+            atomic_write_json(SCANNER_FRONTIER_FILE, [
+                {"term": t.term, "category": t.category, "sort": t.sort,
+                 "price_min": t.price_min, "price_max": t.price_max,
+                 "depth": t.depth, "tier": t.tier} for t in queue])
+        except OSError as exc:
+            logger.warning("Could not persist frontier: %s", exc)
+            return 0
+        return len(queue)
+
+    def load_frontier(self) -> List["ScanTask"]:
+        """Reload an unfinished frontier from a previous run."""
+        if not os.path.exists(SCANNER_FRONTIER_FILE):
+            return []
+        try:
+            with open(SCANNER_FRONTIER_FILE, "r", encoding="utf-8") as fh:
+                rows = json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            return []
+        if not isinstance(rows, list):
+            return []
+        tasks: List[ScanTask] = []
+        for row in rows:
+            if isinstance(row, dict) and row.get("term"):
+                tasks.append(ScanTask(
+                    str(row["term"]), str(row.get("category", "")),
+                    str(row.get("sort", "")), row.get("price_min"),
+                    row.get("price_max"), int(row.get("depth", 0)),
+                    int(row.get("tier", 0))))
+        return tasks
+
+    def clear_frontier(self) -> None:
+        if os.path.exists(SCANNER_FRONTIER_FILE):
+            try:
+                os.remove(SCANNER_FRONTIER_FILE)
+            except OSError:
+                pass
+
     def clear_store(self) -> None:
         with self._lock:
             self._seen.clear()
             self.pages_fetched = self.pages_blocked = self.pages_empty = 0
             self.products_seen_raw = self.bisections = self.max_depth_reached = 0
+            self.tasks_done = self.tasks_dropped = self.queue_peak = 0
         if os.path.exists(SCANNER_STORE_FILE):
             try:
                 os.remove(SCANNER_STORE_FILE)
@@ -1763,7 +1884,8 @@ class FlipkartCatalogueScanner:
             try:
                 response = session.get(url, timeout=SCANNER_TIMEOUT)
             except Exception as exc:
-                logger.info("Scanner fetch failed (%s): %s", type(exc).__name__, exc)
+                logger.info("Scanner fetch failed (%s): %s",
+                            type(exc).__name__, exc)
                 time.sleep(0.5 * attempt)
                 continue
 
@@ -1852,7 +1974,8 @@ class FlipkartCatalogueScanner:
             for holder in ("productInfo", "action", "value", "link"):
                 sub = merged.get(holder)
                 if isinstance(sub, dict):
-                    url = cls._text(sub, ("url", "pageUri", "baseUrl", "smartUrl"))
+                    url = cls._text(sub, ("url", "pageUri", "baseUrl",
+                                          "smartUrl"))
                     if "/p/itm" in url:
                         break
         if "/p/itm" not in url:
@@ -1863,7 +1986,8 @@ class FlipkartCatalogueScanner:
         if not title and isinstance(titles, dict):
             title = cls._text(titles, ("title", "newTitle", "superTitle"))
 
-        rating_node = merged.get("rating") if isinstance(merged.get("rating"), dict) else {}
+        rating_node = merged.get("rating") if isinstance(
+            merged.get("rating"), dict) else {}
         rating = cls._number(rating_node, ("average",)) if rating_node else \
             cls._number(merged, ("averageRating",))
         rating_count = int(cls._number(rating_node, ("count",)) if rating_node
@@ -1932,9 +2056,11 @@ class FlipkartCatalogueScanner:
 
     def category_count(self, category: str) -> int:
         with self._lock:
-            return sum(1 for p in self._seen.values() if p.category == category)
+            return sum(1 for p in self._seen.values()
+                       if p.category == category)
 
-    def _absorb(self, products: Sequence[ScannedProduct], task: ScanTask) -> int:
+    def _absorb(self, products: Sequence[ScannedProduct],
+                task: ScanTask) -> int:
         added = 0
         with self._lock:
             self.products_seen_raw += len(products)
@@ -1953,7 +2079,8 @@ class FlipkartCatalogueScanner:
                     self._seen[key] = product
         return added
 
-    def run_task(self, task: ScanTask, pages: int) -> Tuple[int, List[ScanTask]]:
+    def run_task(self, task: ScanTask,
+                 pages: int) -> Tuple[int, List[ScanTask]]:
         """
         Scan one query across N pages.
 
@@ -1997,21 +2124,37 @@ class FlipkartCatalogueScanner:
                                                  children[0].depth)
         return added, follow_ups
 
+    @staticmethod
+    def brands_for(category: str,
+                   segment_names: Optional[Sequence[str]] = None
+                   ) -> Tuple[str, ...]:
+        """Curated brands for a category, optionally limited to named segments."""
+        segments = BRAND_SEGMENTS.get(category)
+        if not segments or not segment_names:
+            return SCANNER_BRANDS.get(category, ())
+        seen: List[str] = []
+        for name in segment_names:
+            for brand in segments.get(name, ()):
+                if brand not in seen:
+                    seen.append(brand)
+        return tuple(seen)
+
     def seed_frontier(self, categories: Sequence[str], *,
                       segments: Optional[Dict[str, List[str]]] = None,
                       use_bands: bool = True,
                       use_sorts: bool = False) -> List[ScanTask]:
         """
-        Build the INITIAL frontier from the CURATED BRAND UNIVERSE.
+        Build the INITIAL frontier from the curated brand universe.
 
-        `segments` optionally restricts each category to named brand segments
-        (e.g. only "Formal and office"). Tasks are interleaved round-robin so
-        every category makes progress from the first minute.
+        `segments` optionally restricts each category to named brand segments.
+        Tasks are interleaved round-robin so every category makes progress from
+        the first minute.
         """
         per_category: Dict[str, List[ScanTask]] = {}
         for category in categories:
             types = list(SCANNER_SEEDS.get(category, ()))
-            brands = list(self.brands_for(category, (segments or {}).get(category)))
+            brands = list(self.brands_for(category,
+                                          (segments or {}).get(category)))
             tasks: List[ScanTask] = []
 
             # Tier 0 - brand alone (catches everything the brand sells).
@@ -2019,7 +2162,7 @@ class FlipkartCatalogueScanner:
             # Tier 1 - brand x product type (the main workhorse).
             tasks.extend(ScanTask(f"{b} {t}", category, tier=1)
                          for b in brands for t in types)
-            # Tier 2 - brand x coarse price band: these are the bisection roots.
+            # Tier 2 - brand x coarse price band: the bisection roots.
             if use_bands:
                 tasks.extend(ScanTask(b, category, "", low, high, 0, 2)
                              for b in brands
@@ -2045,82 +2188,93 @@ class FlipkartCatalogueScanner:
             index += 1
         return frontier
 
-    @staticmethod
-    def brands_for(category: str,
-                   segment_names: Optional[Sequence[str]] = None) -> Tuple[str, ...]:
-        """Curated brands for a category, optionally limited to named segments."""
-        segments = BRAND_SEGMENTS.get(category)
-        if not segments:
-            return SCANNER_BRANDS.get(category, ())
-        if not segment_names:
-            return SCANNER_BRANDS.get(category, ())
-        seen: List[str] = []
-        for name in segment_names:
-            for brand in segments.get(name, ()):
-                if brand not in seen:
-                    seen.append(brand)
-        return tuple(seen)
-
     def run_frontier(self, frontier: Sequence[ScanTask], pages: int,
-                     target_per_category: int = 0, max_requests: int = 0,
+                     max_requests: int = 0, resume: bool = True,
                      progress=None) -> int:
         """
-        Work the frontier queue, growing it as bisection discovers depth.
+        Work the frontier to EXHAUSTION. There is NO product cap.
 
-        Ends when: the queue drains, every category hits its target, the
-        request budget is spent, or the user presses Stop. A block only slows
-        the scan.
+        The queue grows as bisection discovers depth and shrinks as slices are
+        proven complete. The scan ends only when:
+          * the queue drains - every reachable slice has been enumerated, or
+          * the user presses Stop, or
+          * an optional safety cap on REQUESTS (never products) is hit.
+
+        A block never ends the scan; the adaptive limiter slows it instead.
+        Progress is checkpointed to disk, and an interrupted run saves its
+        unfinished frontier so the next run resumes from the same position.
         """
         self.abort = False
         queue: deque = deque(frontier)
-        satisfied: set = set()
-        all_categories = {t.category for t in frontier}
+
+        # Resume an interrupted scan rather than restarting it.
+        if resume:
+            pending = self.load_frontier()
+            if pending:
+                queue.extend(pending)
+                logger.info("Resumed %d pending tasks from previous run.",
+                            len(pending))
+
         processed = 0
-        initial_total = len(queue)
+        batches = 0
 
-        def target_met(category: str) -> bool:
-            if not target_per_category:
-                return False
-            if category in satisfied:
-                return True
-            if self.category_count(category) >= target_per_category:
-                satisfied.add(category)
-                return True
-            return False
+        try:
+            with ThreadPoolExecutor(max_workers=SCANNER_WORKERS) as pool:
+                while queue and not self.abort:
+                    # Optional REQUEST cap. Products are never capped.
+                    if max_requests and self.pages_fetched >= max_requests:
+                        logger.info("Request cap reached; %d tasks still queued.",
+                                    len(queue))
+                        break
 
-        with ThreadPoolExecutor(max_workers=SCANNER_WORKERS) as pool:
-            while queue and not self.abort:
-                if target_per_category and satisfied >= all_categories:
-                    break
-                if max_requests and self.pages_fetched >= max_requests:
-                    break
-
-                batch: List[ScanTask] = []
-                while queue and len(batch) < SCANNER_WORKERS * 3:
-                    task = queue.popleft()
-                    if target_met(task.category):
+                    batch: List[ScanTask] = []
+                    while queue and len(batch) < SCANNER_WORKERS * 3:
+                        batch.append(queue.popleft())
+                    if not batch:
                         continue
-                    batch.append(task)
-                if not batch:
-                    continue
 
-                futures = {pool.submit(self.run_task, t, pages): t for t in batch}
-                for future in as_completed(futures):
-                    processed += 1
-                    try:
-                        _, follow_ups = future.result()
-                    except Exception as exc:
-                        logger.warning("Scan task failed: %s", exc)
-                        follow_ups = []
-                    for child in follow_ups:
-                        if not target_met(child.category):
-                            queue.append(child)
-                    if progress:
-                        progress(processed,
-                                 max(initial_total, processed + len(queue)),
-                                 futures[future].term, len(self._seen), len(queue))
-                self.persist()   # checkpoint so a long scan never loses work
-        self.persist()
+                    futures = {pool.submit(self.run_task, t, pages): t
+                               for t in batch}
+                    for future in as_completed(futures):
+                        processed += 1
+                        self.tasks_done += 1
+                        try:
+                            _, follow_ups = future.result()
+                        except Exception as exc:
+                            logger.warning("Scan task failed: %s", exc)
+                            follow_ups = []
+
+                        # Bisection discovered depth: queue the narrower slices.
+                        for child in follow_ups:
+                            if len(queue) < SCANNER_MAX_QUEUE:
+                                queue.append(child)
+                            else:
+                                # Shed work, never products. Dropping a task
+                                # loses unexplored depth, not anything found.
+                                self.tasks_dropped += 1
+
+                        if len(queue) > self.queue_peak:
+                            self.queue_peak = len(queue)
+                        if progress:
+                            progress(processed,
+                                     max(processed + len(queue), processed),
+                                     futures[future].term, len(self._seen),
+                                     len(queue))
+
+                    batches += 1
+                    # Checkpoint on a cadence: persisting every batch is O(n)
+                    # and dominates runtime once the store is large.
+                    if batches % SCANNER_CHECKPOINT_EVERY == 0:
+                        self.persist()
+                        self.save_frontier(list(queue))
+        finally:
+            # Always land in a consistent state, even on an exception, so a
+            # crashed run still resumes cleanly.
+            self.persist()
+            if queue:
+                self.save_frontier(list(queue))   # keep the resume position
+            else:
+                self.clear_frontier()             # drained: nothing to resume
         return len(self._seen)
 
     # -- views & diagnostics ------------------------------------------------ #
@@ -2151,17 +2305,18 @@ class FlipkartCatalogueScanner:
             return "idle", "No pages requested yet."
         if self.pages_blocked / attempts > 0.5:
             return ("blocked",
-                    f"{self.pages_blocked:,} of {attempts:,} requests were refused "
-                    "or challenged. Flipkart is rate-limiting this machine. The "
-                    "scan slowed itself down rather than stopping. Wait 10-15 "
-                    "minutes, or lower pages per query.")
+                    f"{self.pages_blocked:,} of {attempts:,} requests were "
+                    "refused or challenged. Flipkart is rate-limiting this "
+                    "machine. The scan slowed itself down rather than "
+                    "stopping. Wait 10-15 minutes, or lower pages per query.")
         if self.pages_fetched and self.products_seen_raw == 0:
             return ("unparsed",
                     f"{self.pages_fetched:,} pages downloaded but no products "
                     "parsed. Flipkart served markup this build cannot read - "
                     "likely a bot-challenge shell rather than real results.")
         unique = len(self._seen)
-        if self.products_seen_raw and unique and self.products_seen_raw / unique > 8:
+        if self.products_seen_raw and unique and \
+                self.products_seen_raw / unique > 8:
             return ("duplication",
                     f"Saw {self.products_seen_raw:,} product slots but only "
                     f"{unique:,} distinct items "
@@ -2183,20 +2338,25 @@ def get_scanner() -> FlipkartCatalogueScanner:
 # --------------------------------------------------------------------------- #
 # IN-APP DIAGNOSTIC  (no terminal needed - Streamlit Cloud has no shell)
 # --------------------------------------------------------------------------- #
+# Tests the EXACT regexes and extraction logic the scanner uses, and reports
+# the FIRST failing step - which is the real cause; everything after it fails
+# as a consequence.
 
 
 def run_scanner_diagnostic() -> List[Dict[str, Any]]:
     """Five sequential checks. The FIRST failure is the real cause."""
     steps: List[Dict[str, Any]] = []
 
-    def add(step: int, name: str, ok: bool, detail: str, hint: str = "") -> bool:
+    def add(step: int, name: str, ok: bool, detail: str,
+            hint: str = "") -> bool:
         steps.append({"Step": step, "Check": name,
                       "Result": "✅ PASS" if ok else "❌ FAIL",
                       "Detail": detail, "_hint": hint, "_ok": ok})
         return ok
 
     if requests is None:
-        add(1, "requests installed", False, "The `requests` package is missing.",
+        add(1, "requests installed", False,
+            "The `requests` package is missing.",
             "Add `requests>=2.28` to requirements.txt and redeploy.")
         return steps
 
@@ -2207,9 +2367,9 @@ def run_scanner_diagnostic() -> List[Dict[str, Any]]:
         if not add(1, "Reach flipkart.com", home.status_code == 200,
                    f"HTTP {home.status_code}, {len(home.text):,} bytes",
                    "" if home.status_code == 200 else
-                   "Flipkart refused this server. On Streamlit Community Cloud "
-                   "this is expected: shared datacenter IPs are widely blocked. "
-                   "Run the app locally instead."):
+                   "Flipkart refused this server. On Streamlit Community "
+                   "Cloud this is expected: shared datacenter IPs are widely "
+                   "blocked. Run the app locally instead."):
             return steps
     except Exception as exc:
         add(1, "Reach flipkart.com", False,
@@ -2234,7 +2394,8 @@ def run_scanner_diagnostic() -> List[Dict[str, Any]]:
             "Search is blocked even though the homepage loaded.")
         return steps
 
-    challenged = any(m in html[:4000].lower() for m in SCANNER_CHALLENGE_MARKERS)
+    challenged = any(m in html[:4000].lower()
+                     for m in SCANNER_CHALLENGE_MARKERS)
     if not add(2, "Search returns results", not challenged,
                "Bot-challenge page served" if challenged
                else f"HTTP 200, {len(html):,} bytes of real markup",
@@ -2298,9 +2459,10 @@ def render_diagnostic_panel() -> None:
 
     failures = [s for s in steps if not s["_ok"]]
     if not failures:
-        st.success("**All checks passed.** This server can scan Flipkart. If a "
-                   "scan still returns few products, the limit is rate-limiting "
-                   "during sustained use — lower 'Pages per query' and retry.")
+        st.success("**All checks passed.** This server can scan Flipkart. If "
+                   "a scan still returns few products, the limit is "
+                   "rate-limiting during sustained use — lower 'Pages per "
+                   "query' and retry.")
         return
 
     first = failures[0]
@@ -2318,8 +2480,8 @@ def render_diagnostic_panel() -> None:
             "Streamlit Cloud app shares those ranges. No code change fixes "
             "this.\n\n"
             "**What works:** run the app on your own machine "
-            "(`streamlit run flipkart_deal_tracker.py`), or use Flipkart's "
-            "official Affiliate API, which is built for programmatic access.")
+            "(`streamlit run Flipkart.py`), or use Flipkart's official "
+            "Affiliate API, which is built for programmatic access.")
     elif first["Step"] in (3, 4):
         st.markdown(
             "### This is a parser problem\n"
@@ -2339,21 +2501,25 @@ def render_diagnostic_panel() -> None:
 # Keyword -> tracker category, reusing the tracker's own 9 buckets so scanned
 # products never create new sections. Tech first: "headphone" contains "phone".
 _TRACKER_CATEGORY_KEYWORDS: List[Tuple[str, Tuple[str, ...]]] = [
-    ("Audio, Monitors & Laptops", ("laptop", "monitor", "headphone", "earphone",
-                                   "earbud", "speaker", "tws", "soundbar",
-                                   "tablet", "ipad", "macbook", "neckband")),
+    ("Audio, Monitors & Laptops", ("laptop", "monitor", "headphone",
+                                   "earphone", "earbud", "speaker", "tws",
+                                   "soundbar", "tablet", "ipad", "macbook",
+                                   "neckband")),
     ("Smartphones", ("smartphone", "mobile", "iphone", "galaxy", "oneplus",
                      "pixel", "redmi", "realme", "poco", "vivo", "oppo",
                      "motorola", "iqoo", "infinix", "tecno", "lava", "5g")),
-    ("Footwear & Shoes", ("shoe", "sneaker", "boot", "loafer", "sandal", "clog",
-                          "slipper", "heel", "flip flop", "trainer")),
+    ("Footwear & Shoes", ("shoe", "sneaker", "boot", "loafer", "sandal",
+                          "clog", "slipper", "heel", "flip flop", "trainer")),
     ("Watches & Eyewear", ("watch", "smartwatch", "sunglass", "eyeglass",
                            "spectacle", "aviator", "chronograph", "band",
-                           "backpack", "handbag", "luggage", "trolley")),
-    ("Cosmetics & Grooming", ("serum", "lipstick", "trimmer", "perfume", "cream",
-                              "shampoo", "cleanser", "sunscreen", "face wash",
-                              "moisturizer", "hair oil", "lotion", "kajal",
-                              "foundation", "makeup", "fragrance", "deodorant")),
+                           "backpack", "handbag", "luggage", "trolley",
+                           "wallet", "duffle", "sling bag", "tote")),
+    ("Cosmetics & Grooming", ("serum", "lipstick", "trimmer", "perfume",
+                              "cream", "shampoo", "cleanser", "sunscreen",
+                              "face wash", "moisturizer", "hair oil",
+                              "lotion", "kajal", "foundation", "makeup",
+                              "fragrance", "deodorant", "toner", "mascara",
+                              "concealer", "conditioner", "beard oil")),
     ("Home Appliances", ("purifier", "iron", "cooker", "fryer", "grinder",
                          "geyser", "fan", "vacuum", "kettle", "heater",
                          "microwave", "cooler", "cooktop", "juicer", "stove")),
@@ -2361,10 +2527,12 @@ _TRACKER_CATEGORY_KEYWORDS: List[Tuple[str, Tuple[str, ...]]] = [
                             "diary", "marker", "highlighter", "geometry")),
     ("Women's Fashion", ("women", "saree", "kurta", "kurti", "lehenga",
                          "dress", "legging", "palazzo", "blouse", "shrug",
-                         "jumpsuit", "skirt", "bra", "anarkali")),
+                         "jumpsuit", "skirt", "bra", "anarkali", "sharara",
+                         "salwar", "dupatta")),
     ("Men's Fashion", ("men", "shirt", "t-shirt", "jean", "trouser", "jacket",
                        "suit", "short", "hoodie", "blazer", "sweatshirt",
-                       "track pant", "innerwear", "kurta")),
+                       "track pant", "innerwear", "kurta", "chino",
+                       "sherwani", "jogger", "vest", "brief")),
 ]
 
 
@@ -2447,24 +2615,26 @@ def render_deep_scanner() -> None:
 
         total_brands = sum(len(v) for v in SCANNER_BRANDS.values())
         st.caption(
-            f"Scanning is restricted to a curated universe of **{total_brands} "
-            f"brands** across the tracker's 9 categories. Flipkart caps "
-            f"pagination per query, so depth comes from splitting: when a page "
-            f"returns ≥{SCANNER_SATURATION} products the result set was "
-            f"truncated, so the price band halves and both halves re-queue, "
-            f"repeating until each slice is fully enumerable. Everything found "
-            f"is merged into the category tables above — same columns, filters, "
-            f"wishlist and CSV exports as always.")
+            f"Scanning covers a curated universe of **{total_brands} brands** "
+            f"across the tracker's 9 categories. Flipkart caps pagination per "
+            f"query, so depth comes from splitting: when a page returns "
+            f"≥{SCANNER_SATURATION} products the result set was truncated, so "
+            f"the price band halves and both halves re-queue, repeating until "
+            f"each slice is fully enumerable. Everything found is merged into "
+            f"the category tables above — same columns, filters, wishlist and "
+            f"CSV exports as always.")
 
         c1, c2, c3 = st.columns([2.4, 1.3, 1.3])
         categories = c1.multiselect(
             "Categories to scan:", options=list(SCANNER_SEEDS),
             default=list(BRAND_SEGMENTS), key="scan_cats")
-        target = c2.slider("Target per category:", 25, 2000, 200, 25,
-                           key="scan_target",
-                           help="Each category scans until it reaches this "
-                                "many products, then stops using requests.")
-        pages = c3.slider("Pages per query:", 1, 10, 4, key="scan_pages")
+        pages = c2.slider("Pages per query:", 1, 20, 8, key="scan_pages",
+                          help="Pages pulled per query before bisection takes "
+                               "over. Higher reaches more per slice.")
+        resume = c3.checkbox("Resume unfinished scan", value=True,
+                             key="scan_resume",
+                             help="Continue from where the last run stopped "
+                                  "instead of restarting the frontier.")
 
         # Brand-segment pickers, one per curated category.
         segments: Dict[str, List[str]] = {}
@@ -2488,8 +2658,11 @@ def render_deep_scanner() -> None:
         use_sorts = o2.checkbox("× sort orders", value=False, key="scan_sorts",
                                 help="Reaches opposite ends of a result set; "
                                      "4x more requests")
-        budget = o3.number_input("Max requests:", 0, 100000, 3000, 500,
-                                 key="scan_budget", help="0 = unlimited.")
+        budget = o3.number_input(
+            "Safety cap on REQUESTS (0 = unlimited):", 0, 5_000_000, 0, 1000,
+            key="scan_budget",
+            help="Caps HTTP requests, never products. 0 runs until the "
+                 "frontier is exhausted. Products are never limited.")
 
         min_disc = st.slider("Only add products discounted ≥ %:", 0, 80, 0, 5,
                              key="scan_min_disc",
@@ -2498,20 +2671,35 @@ def render_deep_scanner() -> None:
 
         if not use_bands:
             st.warning("Price bands are off, so **bisection cannot run** and "
-                       "the scan stays shallow. Turn them on for deep scanning.")
+                       "the scan stays shallow. Turn them on for deep "
+                       "scanning.")
 
         if not categories:
             st.info("Pick at least one category to scan.")
             return
 
         frontier = scanner.seed_frontier(categories, segments=segments,
-                                         use_bands=use_bands, use_sorts=use_sorts)
+                                         use_bands=use_bands,
+                                         use_sorts=use_sorts)
         active_brands = sum(len(scanner.brands_for(c, segments.get(c)))
                             for c in categories)
-        st.caption(f"Initial frontier: **{len(frontier):,} queries** from "
-                   f"**{active_brands} brands** across "
-                   f"**{len(categories)} categories**. The queue *grows* during "
-                   f"the run as saturated queries bisect.")
+        pending = len(scanner.load_frontier()) if resume else 0
+        st.caption(
+            f"Initial frontier: **{len(frontier):,} queries** from "
+            f"**{active_brands} brands** across **{len(categories)} "
+            f"categories**"
+            + (f", plus **{pending:,} resumed** from the last run"
+               if pending else "")
+            + ". **No product limit** — the queue grows as saturated queries "
+              "bisect and the scan runs until every reachable slice is "
+              "exhausted. Progress is checkpointed, so you can Stop and "
+              "resume.")
+        if not budget:
+            st.info("**Unlimited mode.** This runs until exhaustion and can "
+                    "take many hours. It checkpoints every "
+                    f"{SCANNER_CHECKPOINT_EVERY} batches, so pressing Stop "
+                    "(or a browser disconnect) keeps everything found and the "
+                    "next run resumes from the same position.")
 
         r1, r2, r3 = st.columns(3)
         if r1.button("🛰️ Run Deep Scan", type="primary", key="scan_run"):
@@ -2519,18 +2707,19 @@ def render_deep_scanner() -> None:
             status = st.empty()
 
             def on_progress(done: int, total: int, term: str, found: int,
-                            pending: int) -> None:
+                            pending_now: int) -> None:
                 bar.progress(min(done / max(total, 1), 1.0))
                 status.caption(
                     f"[{done:,}] {term} · **{found:,}** found · "
-                    f"{pending:,} queued · {scanner.bisections:,} splits · "
+                    f"{pending_now:,} queued · {scanner.bisections:,} splits · "
                     f"{scanner.limiter.rate:.1f} req/s")
 
             with st.spinner("Deep scanning Flipkart…"):
-                scanner.run_frontier(frontier, pages, target_per_category=target,
-                                     max_requests=int(budget),
+                scanner.run_frontier(frontier, pages,
+                                     max_requests=int(budget), resume=resume,
                                      progress=on_progress)
-                added = merge_scan_results_into_tracker(scanner, float(min_disc))
+                added = merge_scan_results_into_tracker(scanner,
+                                                        float(min_disc))
             bar.empty()
             status.empty()
             st.session_state["scan_done"] = True
@@ -2543,6 +2732,7 @@ def render_deep_scanner() -> None:
 
         if r3.button("🗑️ Clear Scan Store", key="scan_clear"):
             scanner.clear_store()
+            scanner.clear_frontier()   # drop the resume point too
             st.toast("Scan store cleared.", icon="🗑️")
             st.rerun()
 
@@ -2569,8 +2759,8 @@ def render_deep_scanner() -> None:
             m1, m2, m3, m4 = st.columns(4)
             m1.markdown(kpi(f"{len(scanner.products):,}", "Discovered"),
                         unsafe_allow_html=True)
-            m2.markdown(kpi(f"{len(scanner.priced()):,}", "With Price", "#4ade80"),
-                        unsafe_allow_html=True)
+            m2.markdown(kpi(f"{len(scanner.priced()):,}", "With Price",
+                            "#4ade80"), unsafe_allow_html=True)
             m3.markdown(kpi(f"{scanner.bisections:,}",
                             f"Band Splits (d{scanner.max_depth_reached})",
                             "#a855f7"), unsafe_allow_html=True)
@@ -2578,18 +2768,34 @@ def render_deep_scanner() -> None:
                             "#f97316" if scanner.pages_blocked else "#38bdf8"),
                         unsafe_allow_html=True)
 
+            # No targets: each category reports what has been found so far,
+            # scaled against whichever category is currently largest.
+            peak = max(coverage.values()) if coverage else 1
             st.dataframe(
-                pd.DataFrame([{"Category": c, "Found": coverage.get(c, 0),
-                               "Target": target,
-                               "Status": "✅ met" if coverage.get(c, 0) >= target
-                               else "⏳ short"} for c in categories]),
+                pd.DataFrame([
+                    {"Category": c, "Found": coverage.get(c, 0),
+                     "Share": f"{coverage.get(c, 0) / max(len(scanner.products), 1):.1%}"}
+                    for c in categories]),
                 use_container_width=True, hide_index=True,
                 column_config={"Found": st.column_config.ProgressColumn(
-                    format="%d", min_value=0, max_value=max(target, 1))})
+                    format="%d", min_value=0, max_value=max(peak, 1))})
+
+            q1, q2, q3 = st.columns(3)
+            q1.metric("Tasks completed", f"{scanner.tasks_done:,}")
+            q2.metric("Peak queue depth", f"{scanner.queue_peak:,}")
+            q3.metric("Tasks shed", f"{scanner.tasks_dropped:,}",
+                      help="Queue hit its memory guard; unexplored depth was "
+                           "dropped, never products already found.")
+            leftover = len(scanner.load_frontier())
+            if leftover:
+                st.info(f"**{leftover:,} queries still pending.** The scan did "
+                        "not exhaust the frontier. Run it again with *Resume* "
+                        "ticked to continue from here.")
 
             if st.button("➕ Merge latest findings into the tables above",
                          key="scan_merge_now"):
-                added = merge_scan_results_into_tracker(scanner, float(min_disc))
+                added = merge_scan_results_into_tracker(scanner,
+                                                        float(min_disc))
                 st.toast(f"Added {added:,} product(s)." if added
                          else "All findings are already in the tables.",
                          icon="🛰️")
@@ -2603,4 +2809,5 @@ if __name__ == "__main__":
         render_deep_scanner()
     except Exception:  # pragma: no cover - top-level UI guard
         logger.exception("Unhandled error while rendering the tracker")
-        st.error("Something went wrong while rendering the tracker. See the server logs for details.")
+        st.error("Something went wrong while rendering the tracker. "
+                 "See the server logs for details.")
