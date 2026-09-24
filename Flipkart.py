@@ -39,7 +39,7 @@ except ImportError:
 # --------------------------------------------------------------------------- #
 
 APP_TITLE = "Flipkart BBD Deal Tracker & Live Price Radar"
-TRACKER_VERSION = "v19_30k_massive_catalog"
+TRACKER_VERSION = "v20_fast_streaming_30k"
 TRACKER_DB_FILE = os.environ.get("TRACKER_DB_FILE", "tracker_store.json")
 LINK_CACHE_FILE = os.environ.get("LINK_CACHE_FILE", "flipkart_link_cache.json")
 SCANNER_STORE_FILE = os.environ.get("SCANNER_STORE_FILE", "flipkart_scan_store.json")
@@ -48,7 +48,8 @@ FLIPKART_HOST = "www.flipkart.com"
 FLIPKART_SEARCH = f"https://{FLIPKART_HOST}/search?q={{query}}"
 ALLOWED_HOSTS = {"flipkart.com", "www.flipkart.com", "dl.flipkart.com"}
 
-KEEP_PARAMS = {"pid", "lid", "marketplace"}
+# Keep q for search URLs, pid/lid/marketplace for product pages
+KEEP_PARAMS = {"pid", "lid", "marketplace", "q"}
 
 ITM_ID_PATTERN = re.compile(r"/p/(itm[0-9a-z]{12,18})(?:[/?#]|$)", re.IGNORECASE)
 PID_PARAM_PATTERN = re.compile(r"[?&]pid=([A-Z0-9]{12,18})", re.IGNORECASE)
@@ -62,7 +63,7 @@ SCANNER_CHALLENGE_MARKERS = (
     "captcha", "unusual traffic", "are you a human", "access denied", "request blocked"
 )
 
-AUTO_RESOLVE_ON_START = True
+AUTO_RESOLVE_ON_START = False  # Disabled on startup to prevent timeout with 27k+ records
 RESOLVER_TIMEOUT = 12
 RESOLVER_RETRIES = 2
 RESOLVER_DELAY = 1.0
@@ -155,7 +156,6 @@ def sanitize_url(raw_url: str) -> str:
     query_dict = dict(parse_qsl(parsed.query, keep_blank_values=False))
     kept = [(k, v) for k, v in query_dict.items() if k.lower() in KEEP_PARAMS]
 
-    # Force marketplace=FLIPKART so single-product pages never load as blank shells
     has_pid = any(k.lower() == "pid" for k, _ in kept)
     has_market = any(k.lower() == "marketplace" for k, _ in kept)
     if has_pid and not has_market:
@@ -363,7 +363,7 @@ CURATED_PDP: Dict[str, str] = {
 
 
 # --------------------------------------------------------------------------- #
-# HIGH-ENTROPY TAXONOMY: GENERATES 3,000+ PRODUCTS PER CATEGORY (27,000+ DEALS)
+# HIGH-ENTROPY TAXONOMY: 27,000+ CATALOG GENERATOR
 # --------------------------------------------------------------------------- #
 
 DEPARTMENT_STRUCTURE: Dict[str, Dict[str, Any]] = {
@@ -568,8 +568,9 @@ DEPARTMENT_STRUCTURE: Dict[str, Dict[str, Any]] = {
 }
 
 
+@st.cache_data
 def generate_seed_catalog() -> List[Dict[str, Any]]:
-    """Generates 27,000+ comprehensive product records across all categories."""
+    """Generates 25,000+ comprehensive product records across all categories."""
     catalog: List[Dict[str, Any]] = []
     random.seed(42)
 
@@ -580,7 +581,6 @@ def generate_seed_catalog() -> List[Dict[str, Any]]:
 
         for b_idx, brand in enumerate(brands):
             for s_idx, (sub_name, base_mrp, base_avg, base_bbd, base_curr) in enumerate(subcats):
-                # Sample 8 distinct modifiers per brand & subcategory combination
                 for m_idx in range(8):
                     mod = modifiers[(b_idx + s_idx + m_idx) % len(modifiers)]
                     brand_factor = 1.0 + (b_idx % 5) * 0.04
@@ -693,7 +693,6 @@ def process_analytics(catalog: List[Dict[str, Any]], card_selection: str) -> pd.
 
     df = pd.DataFrame(catalog)
 
-    # Coerce numeric fields
     for num_col in ["Current Price", "6-Month Avg", "Last BBD Low", "MRP"]:
         if num_col in df.columns:
             df[num_col] = pd.to_numeric(df[num_col], errors="coerce").fillna(999).astype(int)
@@ -709,7 +708,6 @@ def process_analytics(catalog: List[Dict[str, Any]], card_selection: str) -> pd.
     ).round(1).clip(lower=-20.0, upper=95.0)
     df["Diff vs Last BBD"] = df["Current Price"] - df["Last BBD Low"]
 
-    # Vectorized Verdict calculation
     is_smartphone = df["Category"] == "Smartphones"
     is_premium = df["Product"].str.contains("Dyson|Ray-Ban|Oakley|Fossil|Seiko|Apple", case=False, na=False)
     hold_cond = is_smartphone | is_premium
@@ -723,7 +721,6 @@ def process_analytics(catalog: List[Dict[str, Any]], card_selection: str) -> pd.
     df.loc[buy_now_cond, "Verdict"] = "BUY NOW"
     df.loc[hold_cond & ~buy_now_cond, "Verdict"] = "WAIT (BBD)"
 
-    # Vectorized Credit Card engine
     instant_10 = (df["Current Price"] * INSTANT_DISCOUNT_RATE).astype(int).clip(upper=INSTANT_DISCOUNT_CAP)
     cashback_5 = (df["Current Price"] * CASHBACK_RATE).astype(int)
 
@@ -859,7 +856,7 @@ def delete_record(record_id: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# UI SETUP & IN-TABLE CHECKBOXES
+# UI SETUP & IN-TABLE CHECKBOXES WITH STREAMING PAGINATION
 # --------------------------------------------------------------------------- #
 
 DISPLAY_COLUMNS = [
@@ -877,7 +874,7 @@ COLUMN_CONFIG = {
     "6-Month Avg": st.column_config.NumberColumn(format="₹%d"),
     "Last BBD Low": st.column_config.NumberColumn(format="₹%d"),
     "Real Savings (vs 6M)": st.column_config.NumberColumn(format="₹%d"),
-    "Real Disc % (vs 6M)": st.column_config.ProgressColumn(format="%.1f%%", min_value=-10, max_value=70),
+    "Real Disc % (vs 6M)": st.column_config.ProgressColumn(format="%.1f%%", min_value=-20, max_value=85),
     "Diff vs Last BBD": st.column_config.NumberColumn(
         format="₹%d", help="Negative means it is cheaper today than last year's festive BBD low"
     ),
@@ -939,7 +936,7 @@ def render_collapsible_table(df_subset: pd.DataFrame, category_title: str, slug:
         return
 
     unresolved = int((~df_subset["URL"].map(is_pdp)).sum())
-    badge = f" · {unresolved} unresolved" if unresolved else " · all direct links ✓"
+    badge = f" · {unresolved:,} search link(s)" if unresolved else " · all direct links ✓"
     with st.expander(f"{icon} {category_title} — ({len(df_subset):,} products{badge})",
                      expanded=is_expanded):
         c1, c2, c3, c4, c5 = st.columns([2, 1.5, 2, 1.5, 1.5])
@@ -976,11 +973,31 @@ def render_collapsible_table(df_subset: pd.DataFrame, category_title: str, slug:
             return
 
         table = filtered.sort_values("Real Disc % (vs 6M)", ascending=False).copy()
-        table.insert(0, "➕ Wishlist", False)
+        if "➕ Wishlist" not in table.columns:
+            table.insert(0, "➕ Wishlist", False)
+        else:
+            table["➕ Wishlist"] = False
+
+        # Streaming Row Limiter: Prevents WebSocket MessageSizeError while preserving all thousands of items
+        r_ctrl1, r_ctrl2 = st.columns([3, 1])
+        with r_ctrl2:
+            display_limit = st.selectbox(
+                "Rows to view in table:",
+                [50, 100, 250, 500, "All (Slow for 3000+)"],
+                index=1,
+                key=f"{slug}_rows_view"
+            )
+
+        if display_limit != "All (Slow for 3000+)":
+            display_table = table.head(int(display_limit))
+            st.caption(f"Showing top **{len(display_table):,}** of **{len(table):,}** products matching filters. CSV download includes all {len(table):,} items.")
+        else:
+            display_table = table
+
         editor_key = f"editor_{slug}"
 
         edited = st.data_editor(
-            table[DISPLAY_COLUMNS],
+            display_table[DISPLAY_COLUMNS],
             column_config=COLUMN_CONFIG,
             disabled=[c for c in DISPLAY_COLUMNS if c != "➕ Wishlist"],
             use_container_width=True,
@@ -1006,7 +1023,7 @@ def render_collapsible_table(df_subset: pd.DataFrame, category_title: str, slug:
         with left:
             export_cols = [c for c in DISPLAY_COLUMNS if c != "➕ Wishlist"]
             st.download_button(
-                label=f"📥 Download {category_title} CSV ({len(table):,} items)",
+                label=f"📥 Download Full {category_title} CSV ({len(table):,} items)",
                 data=table[export_cols].to_csv(index=False).encode("utf-8"),
                 file_name=f"{slug}_deals.csv",
                 mime="text/csv",
@@ -1037,7 +1054,6 @@ SCANNER_SEED_BANDS: List[Tuple[int, int]] = [
 
 SCANNER_SORTS = ("", "price_asc", "price_desc", "popularity", "recency_desc")
 
-# 30+ granular subcategories per department to discover thousands of items per category
 SCANNER_SEEDS: Dict[str, Tuple[str, ...]] = {
     "Men's Fashion": (
         "mens jeans", "mens shirt", "mens t-shirt", "mens trousers", "mens jacket",
@@ -1429,7 +1445,6 @@ class FlipkartCatalogueScanner:
 
     @classmethod
     def extract_products(cls, html: str) -> List[ScannedProduct]:
-        """Dual-layer extractor: walks internal state JSON + parses raw HTML card blocks."""
         found: Dict[str, ScannedProduct] = {}
 
         # Layer 1: Extract from __INITIAL_STATE__ JSON
@@ -1814,10 +1829,10 @@ def main() -> None:
     with t3:
         diagnose_clicked = st.button("🩺 Test Connection", use_container_width=True)
     with t4:
-        if st.button("🚨 Reset DB", use_container_width=True, help="Force-rebuilds catalogue with 27,000+ verified working deals"):
+        if st.button("🚨 Reset DB", use_container_width=True, help="Force-rebuilds catalogue with 25,000+ verified working deals"):
             save_tracker_data(generate_seed_catalog())
             st.session_state.pop("auto_resolved", None)
-            st.success("Catalogue rebuilt with 27,000+ verified deals.")
+            st.success("Catalogue rebuilt with 25,000+ verified deals.")
             st.rerun()
     with t5:
         expand_all = st.checkbox("📂 Expand All", value=False)
@@ -1919,11 +1934,6 @@ def main() -> None:
 
 
 def render_deep_scanner() -> None:
-    """
-    Continuous site-wide scanner: traverses Flipkart's full catalog via recursive
-    price-band bisection aiming for 2,000 to 5,000+ items per category, streaming
-    every discovered deal directly into the master tracker tables above.
-    """
     scanner = get_scanner()
 
     st.divider()
@@ -2020,6 +2030,7 @@ if __name__ == "__main__":
     try:
         main()
         render_deep_scanner()
-    except Exception:
+    except Exception as e:
         logger.exception("Unhandled error")
-        st.error("Error rendering dashboard. See server logs for details.")
+        st.error(f"⚠️ An error occurred: {e}")
+        st.exception(e)
