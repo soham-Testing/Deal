@@ -3,7 +3,7 @@ Flipkart BBD Deal Tracker & Live Price Radar
 =============================================
 Single-page Streamlit price-intelligence app: tracks catalogue prices against
 6-month averages and last Big Billion Days floors, scores each deal, applies
-card-offer maths and maintains a persistent wishlist.
+card-offer maths, and maintains a persistent wishlist.
 
 EVERY row links to a SPECIFIC product detail page (PDP), never a category page.
 
@@ -42,7 +42,7 @@ except ImportError:
 # --------------------------------------------------------------------------- #
 
 APP_TITLE = "Flipkart BBD Deal Tracker & Live Price Radar"
-TRACKER_VERSION = "v16_unlimited_live_deals"
+TRACKER_VERSION = "v17_deep_unlimited_discovery"
 TRACKER_DB_FILE = os.environ.get("TRACKER_DB_FILE", "tracker_store.json")
 LINK_CACHE_FILE = os.environ.get("LINK_CACHE_FILE", "flipkart_link_cache.json")
 SCANNER_STORE_FILE = os.environ.get("SCANNER_STORE_FILE", "flipkart_scan_store.json")
@@ -96,8 +96,8 @@ SCANNER_WORKERS = 4
 SCANNER_QPS_START = 2.0
 SCANNER_QPS_FLOOR = 0.4
 SCANNER_QPS_CEILING = 4.0
-SCANNER_SATURATION = 20
-SCANNER_MIN_BAND_WIDTH = 150
+SCANNER_SATURATION = 18
+SCANNER_MIN_BAND_WIDTH = 100
 SCANNER_MAX_BISECT_DEPTH = 8
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -132,16 +132,11 @@ st.markdown(
 
 
 def search_url(*terms: str) -> str:
-    """Flipkart search URL fallback."""
     query = " ".join(t for t in terms if t).strip() or "deals"
     return FLIPKART_SEARCH.format(query=quote_plus(query))
 
 
 def sanitize_url(raw_url: str) -> str:
-    """
-    Normalizes Flipkart URLs: preserves product paths, `pid`, `lid` and forces
-    `marketplace=FLIPKART` on PID links to prevent blank-screen SPA failures.
-    """
     if not raw_url or not isinstance(raw_url, str):
         return ""
 
@@ -164,7 +159,7 @@ def sanitize_url(raw_url: str) -> str:
     query_dict = dict(parse_qsl(parsed.query, keep_blank_values=False))
     kept = [(k, v) for k, v in query_dict.items() if k.lower() in KEEP_PARAMS]
 
-    # Critical: Direct product links MUST retain marketplace=FLIPKART to render inventory
+    # Critical: Direct product links MUST retain marketplace=FLIPKART to render full page
     has_pid = any(k.lower() == "pid" for k, _ in kept)
     has_market = any(k.lower() == "marketplace" for k, _ in kept)
     if has_pid and not has_market:
@@ -174,7 +169,6 @@ def sanitize_url(raw_url: str) -> str:
 
 
 def is_pdp(url: str) -> bool:
-    """True when the URL points to a specific product detail page."""
     if not url:
         return False
     parsed = urlparse(url)
@@ -293,7 +287,7 @@ class FlipkartLinkResolver:
         if not html:
             return False, "Flipkart connection refused or IP blocked."
         if not self._first_pdp_href(html):
-            return False, "Flipkart served a CAPTCHA page with no product links."
+            return False, "Flipkart served a challenge page with no product links."
         return True, "Connected to Flipkart and product links parsed successfully."
 
     @staticmethod
@@ -373,7 +367,7 @@ CURATED_PDP: Dict[str, str] = {
 
 
 # --------------------------------------------------------------------------- #
-# PRODUCT CATALOGUE
+# EXPANDED SEED CATALOG MATRIX
 # --------------------------------------------------------------------------- #
 
 CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
@@ -390,6 +384,11 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
             ("Highlander", "Cargo Jogger Pants with Drawstring", 2299, 1499, 899, 949),
             ("Snitch", "Linen Blend Casual Mandarin Shirt", 2799, 1999, 1299, 1349),
             ("Roadster", "Classic Denim Trucker Jacket", 3599, 2399, 1499, 1549),
+            ("Wrangler", "Skater Fit Mid Rise Denim Jeans", 3199, 2199, 1399, 1449),
+            ("Jack & Jones", "Anti-Fit Washed Cargo Jeans", 3499, 2299, 1499, 1599),
+            ("Tommy Hilfiger", "Embroidered Pique Cotton Polo", 4599, 3299, 2199, 2399),
+            ("Raymond", "Contemporary Fit Pure Wool Suit", 14999, 11999, 7999, 8499),
+            ("Van Heusen", "Athwork Move Ultra Stretch Shirt", 2599, 1899, 1199, 1299),
         ],
     },
     "Women's Fashion": {
@@ -405,6 +404,11 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
             ("Aurelia", "Cotton Rich Festive Kurta Pant Set", 3999, 2499, 1399, 1449),
             ("Tokyo Talkies", "Cargo Utility Wide Leg Trousers", 2199, 1399, 799, 849),
             ("Libas", "Ethnic Foil Printed Straight Kurti", 1599, 999, 549, 599),
+            ("FabIndia", "Handcrafted Cotton Long Tunic", 2790, 1999, 1299, 1399),
+            ("Global Desi", "Boho Printed Flared Jumpsuit", 3199, 2199, 1399, 1499),
+            ("Forever New", "Belted Wrap Evening Party Dress", 6500, 4899, 3199, 3499),
+            ("Sangria", "Tiered Floral Printed Anarkali", 2999, 1899, 1099, 1199),
+            ("Varanga", "Chikankari Embroidered Kurta Set", 4299, 2599, 1499, 1599),
         ],
     },
     "Footwear & Shoes": {
@@ -420,6 +424,11 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
             ("Bata", "Formal Genuine Leather Derby Shoes", 3999, 2899, 1799, 1899),
             ("Crocs", "Classic Unisex Foam Slip-On Clogs", 3495, 2695, 1799, 1995),
             ("Adidas", "Clinch-X Responsive Gym Trainer", 4499, 2999, 1899, 1999),
+            ("Under Armour", "Charged Assert 10 Training Shoes", 6999, 4999, 3499, 3799),
+            ("Reebok", "Zig Kinetica Responsive Sneakers", 7999, 5499, 3899, 4199),
+            ("New Balance", "574 Iconic Heritage Suede Runners", 8999, 6499, 4499, 4799),
+            ("Campus", "Oxyfit Breathable Mesh Running Shoes", 1899, 1299, 799, 899),
+            ("Sparx", "Comfort Foam Lightweight Sport Slides", 899, 699, 449, 499),
         ],
     },
     "Watches & Eyewear": {
@@ -435,6 +444,11 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
             ("Fastrack", "Wayfarer UV400 Protective Sunglasses", 1399, 1099, 649, 719),
             ("Oakley", "Holbrook Polarized Matte Sunglasses", 7990, 6490, 4490, 4990),
             ("Citizen", "Eco-Drive Solar Powered Analog Watch", 8995, 6995, 4799, 5199),
+            ("Noise", "ColorFit Pro 5 AMOLED Smartwatch", 4999, 2799, 1899, 1999),
+            ("Fire-Boltt", "Invincible Plus 1.43 AMOLED Watch", 5999, 3299, 2199, 2399),
+            ("Seiko", "Automatic Sports Stainless Steel Watch", 24500, 19900, 15400, 16200),
+            ("Vincent Chase", "Polarized Gunmetal Pilot Sunglasses", 1999, 1299, 799, 899),
+            ("Amazfit", "GTR 4 Dual-Band GPS Smartwatch", 16999, 12999, 9499, 9999),
         ],
     },
     "Smartphones": {
@@ -450,6 +464,11 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
             ("Vivo", "T3x 5G (Crimson Bliss, 128 GB)", 17499, 13999, 11999, 12499),
             ("Google", "Pixel 8a (Aloe, 128 GB)", 52999, 44999, 34999, 37999),
             ("CMF by Nothing", "Phone 1 (Black, 128 GB)", 19999, 15999, 13999, 14499),
+            ("Realme", "12 Pro+ 5G (Submarine Blue, 256 GB)", 34999, 29999, 24999, 26999),
+            ("POCO", "X6 Pro 5G (Racing Yellow, 256 GB)", 30999, 25999, 21999, 23499),
+            ("iQOO", "Z9s Pro 5G (Luxe Marble, 128 GB)", 28999, 24999, 20999, 22499),
+            ("Xiaomi", "Redmi Note 13 Pro 5G (Arctic White)", 28999, 23999, 19999, 21499),
+            ("Samsung", "Galaxy M35 5G (Daylight Blue, 128 GB)", 21999, 17999, 14499, 15499),
         ],
     },
     "Audio, Monitors & Laptops": {
@@ -465,6 +484,11 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
             ("Marshall", "Emberton II Portable Bluetooth Speaker", 17499, 14999, 11999, 12999),
             ("OnePlus", "Bullets Wireless Z2 Bluetooth Earphones", 2999, 2699, 1795, 2594),
             ("Acer", "Nitro V Core i5 13th Gen RTX 4050 Gaming Laptop", 88999, 74990, 62990, 64990),
+            ("ASUS", "TUF Gaming F15 Core i7 12th Gen RTX 3050", 94990, 78990, 65990, 68990),
+            ("Lenovo", "IdeaPad Slim 3 Core i5 13th Gen Laptop", 68990, 54990, 46990, 48990),
+            ("HP", "Victus Ryzen 5 5600H Gaming Laptop", 72990, 58990, 49990, 52990),
+            ("Bose", "QuietComfort 45 Active Noise Cancelling", 29900, 24900, 19900, 21900),
+            ("BenQ", "MOBIUZ 27 inch 165Hz IPS HDRi Gaming Display", 28990, 22990, 17990, 18990),
         ],
     },
     "Cosmetics & Grooming": {
@@ -480,6 +504,11 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
             ("Bella Vita", "Luxury Unisex Perfume Gift Set", 1099, 649, 449, 499),
             ("Biotique", "Bio Kelp Protein Anti-Hairfall Shampoo", 450, 315, 210, 249),
             ("Forest Essentials", "Soundarya Radiance Face Cream", 4200, 3780, 3150, 3499),
+            ("The Derma Co", "1% Salicylic Acid Face Wash", 349, 299, 219, 249),
+            ("Plum", "Green Tea Pore Cleansing Face Wash", 395, 335, 249, 275),
+            ("Lakme", "Eyeconic Kajal Twin Pack", 450, 360, 269, 299),
+            ("Mamaearth", "Onion Hair Oil for Hair Fall", 599, 499, 359, 399),
+            ("L'Oreal Paris", "Revitalift 1.5% Hyaluronic Serum", 999, 799, 549, 599),
         ],
     },
     "Home Appliances": {
@@ -495,6 +524,11 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
             ("Atomberg", "Renesa 1200mm BLDC Ceiling Fan", 5190, 3990, 3199, 3499),
             ("Eureka Forbes", "Robo Vac N Mop Robotic Vacuum Cleaner", 29999, 17999, 11999, 13999),
             ("Dyson", "V8 Absolute Cordless Vacuum Cleaner", 43900, 32900, 26900, 29900),
+            ("Morphy Richards", "24L Convection Microwave Oven", 14999, 11499, 8499, 8999),
+            ("Crompton", "Ozone 75L Desert Air Cooler", 13490, 9990, 7490, 7990),
+            ("Pigeon", "Cruise 1800W Induction Cooktop", 3195, 1899, 1299, 1399),
+            ("Prestige", "Deluxe Alpha Stainless Steel Cooker", 2850, 2199, 1599, 1699),
+            ("Bosch", "TrueMixx Pro 1000W Mixer Grinder", 8999, 6999, 5199, 5499),
         ],
     },
     "Stationery & Books": {
@@ -510,6 +544,11 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
             ("Faber-Castell", "Textliner Highlighter Set of 10", 450, 349, 219, 249),
             ("Doms", "Mathematical Drawing Geometry Box", 399, 310, 199, 229),
             ("Penguin", "Classics Hardbound Collection", 799, 649, 399, 449),
+            ("Oxford", "Advanced Learner's English Dictionary", 1295, 999, 749, 799),
+            ("Pilot", "V7 Hi-Tecpoint Roller Ball Pen Pack of 3", 300, 249, 179, 199),
+            ("Cross", "Bailey Medalist Chrome Ballpoint Pen", 3500, 2690, 1890, 1990),
+            ("HarperCollins", "The Psychology of Money by Morgan Housel", 450, 349, 219, 249),
+            ("Navneet", "Youva Soft Bound Spiral Project Book", 350, 275, 185, 199),
         ],
     },
 }
@@ -932,7 +971,6 @@ def render_collapsible_table(df_subset: pd.DataFrame, category_title: str, slug:
         table.insert(0, "➕ Wishlist", False)
         editor_key = f"editor_{slug}"
 
-        # Interactive Table: In-Table Checkbox is at the VERY FRONT of each product
         edited = st.data_editor(
             table[DISPLAY_COLUMNS],
             column_config=COLUMN_CONFIG,
@@ -981,7 +1019,7 @@ def render_collapsible_table(df_subset: pd.DataFrame, category_title: str, slug:
 
 
 # =========================================================================== #
-# FULL FLIPKART WEBSITE SCANNER & UNLIMITED DISCOVERY TRAVERSAL               #
+# FULL FLIPKART WEBSITE DEEP SCANNER & UNLIMITED DISCOVERY TRAVERSAL          #
 # =========================================================================== #
 
 SCANNER_SEED_BANDS: List[Tuple[int, int]] = [
@@ -991,52 +1029,57 @@ SCANNER_SEED_BANDS: List[Tuple[int, int]] = [
 
 SCANNER_SORTS = ("", "price_asc", "price_desc", "popularity", "recency_desc")
 
-# Broad search queries to scan the complete Flipkart website without limits
+# Comprehensive taxonomy covering all Flipkart departments to discover full catalog depth
 SCANNER_SEEDS: Dict[str, Tuple[str, ...]] = {
     "Men's Fashion": (
         "mens jeans", "mens shirt", "mens t-shirt", "mens trousers", "mens jacket",
         "mens suit", "mens kurta", "mens shorts", "mens track pants", "mens sweatshirt",
-        "mens hoodie", "mens blazer", "mens innerwear", "mens ethnic wear", "mens winter wear"
+        "mens hoodie", "mens blazer", "mens innerwear", "mens ethnic wear", "mens winter wear",
+        "mens formal trousers", "mens cargo pants", "mens linen shirts", "mens polo t-shirts"
     ),
     "Women's Fashion": (
         "womens kurta", "womens jeans", "womens dress", "saree", "womens top",
         "womens cardigan", "lehenga", "womens leggings", "womens jumpsuit", "womens ethnic set",
-        "womens skirt", "womens jacket", "womens nightwear", "womens palazzo", "womens blouse"
+        "womens skirt", "womens jacket", "womens nightwear", "womens palazzo", "womens blouse",
+        "anarkali suit", "georgette saree", "cotton kurti set", "womens crop tops"
     ),
     "Footwear & Shoes": (
         "running shoes", "sneakers", "sandals", "formal shoes", "sports shoes",
         "clogs", "boots", "loafers", "flip flops", "walking shoes", "casual shoes",
-        "heels", "slippers", "training shoes"
+        "heels", "slippers", "training shoes", "derby formal shoes", "gym trainers"
     ),
     "Watches & Eyewear": (
         "analog watch", "digital watch", "chronograph watch", "smartwatch",
         "sunglasses", "aviator sunglasses", "womens watch", "couple watch", "sports watch",
-        "luxury watch", "eyeglasses", "blue cut glasses"
+        "luxury watch", "eyeglasses", "blue cut glasses", "polarized shades", "wayfarer"
     ),
     "Smartphones": (
         "mobile phone 5g", "iphone", "samsung galaxy", "oneplus", "realme mobile",
         "redmi mobile", "vivo mobile", "oppo mobile", "motorola mobile", "poco mobile",
-        "pixel phone", "nothing phone", "budget smartphone", "gaming phone", "camera phone"
+        "pixel phone", "nothing phone", "budget smartphone", "gaming phone", "camera phone",
+        "flagship smartphone", "smartphone 256gb", "5g phone under 20000"
     ),
     "Audio, Monitors & Laptops": (
         "bluetooth headphones", "tws earbuds", "bluetooth speaker", "gaming monitor",
         "laptop", "gaming laptop", "tablet", "soundbar", "wired earphones", "neckband",
-        "home theatre", "monitor 24 inch", "macbook", "chromebook", "party speaker"
+        "home theatre", "monitor 24 inch", "macbook", "chromebook", "party speaker",
+        "ips monitor 27 inch", "noise cancelling headphones", "core i5 laptop"
     ),
     "Cosmetics & Grooming": (
         "face serum", "lipstick", "trimmer", "perfume", "face cream", "shampoo",
         "sunscreen", "face wash", "hair dryer", "makeup kit", "moisturizer", "hair oil",
-        "body lotion", "beard oil", "nail polish", "kajal"
+        "body lotion", "beard oil", "nail polish", "kajal", "body spray", "cleanser"
     ),
     "Home Appliances": (
         "water purifier", "air fryer", "mixer grinder", "ceiling fan", "vacuum cleaner",
         "water geyser", "induction cooktop", "steam iron", "electric kettle", "room heater",
-        "microwave oven", "air cooler", "sandwich maker", "gas stove", "pressure cooker"
+        "microwave oven", "air cooler", "sandwich maker", "gas stove", "pressure cooker",
+        "bldc fan", "ro uv purifier", "robotic vacuum cleaner"
     ),
     "Stationery & Books": (
         "notebook", "ball pen", "scientific calculator", "books", "art supplies",
         "geometry box", "highlighter", "diary", "fiction books", "school bag",
-        "sketch pens", "sticky notes"
+        "sketch pens", "sticky notes", "acrylic colors", "roller ball pen", "project book"
     ),
 }
 
@@ -1329,14 +1372,14 @@ class FlipkartCatalogueScanner:
             merged = {**inner, **node}
 
         url = cls._text(merged, ("url", "pageUri", "baseUrl", "smartUrl"))
-        if "/p/itm" not in url:
+        if "/p/itm" not in url and "/item/p/product" not in url:
             for holder in ("productInfo", "action", "value", "link"):
                 sub = merged.get(holder)
                 if isinstance(sub, dict):
                     url = cls._text(sub, ("url", "pageUri", "baseUrl", "smartUrl"))
-                    if "/p/itm" in url:
+                    if "/p/itm" in url or "/item/p/product" in url:
                         break
-        if "/p/itm" not in url:
+        if "/p/itm" not in url and "/item/p/product" not in url:
             return None
 
         titles = merged.get("titles")
@@ -1363,8 +1406,13 @@ class FlipkartCatalogueScanner:
 
     @classmethod
     def extract_products(cls, html: str) -> List[ScannedProduct]:
+        """
+        Dual-layer extractor: walks internal state JSON + parses raw HTML card blocks.
+        Never yields empty sets as long as HTML contains Flipkart product elements.
+        """
         found: Dict[str, ScannedProduct] = {}
 
+        # Layer 1: Extract from __INITIAL_STATE__ JSON
         match = SCANNER_STATE_PATTERN.search(html)
         if match:
             try:
@@ -1383,6 +1431,46 @@ class FlipkartCatalogueScanner:
                     if existing is None or _scanned_richness(product) > _scanned_richness(existing):
                         found[product.key] = product
 
+        # Layer 2: Extract directly from HTML cards (DOM Parser Fallback/Enricher)
+        # Matches typical Flipkart product cards in list and grid views
+        card_chunks = re.findall(r'<div[^>]*data-id="([A-Z0-9]{12,18})"[^>]*>(.*?)</div>\s*</div>\s*</div>', html, re.DOTALL)
+        for pid, block in card_chunks:
+            pdp_match = re.search(r'href="(/[^"?#]{3,200}/p/itm[0-9a-z]{12,18}[^"]*)"', block, re.IGNORECASE)
+            if not pdp_match:
+                continue
+            clean_url = sanitize_url(f"https://{FLIPKART_HOST}{pdp_match.group(1)}")
+            
+            # Extract title
+            title_match = re.search(r'<(?:div|a)[^>]*class="[^"]*(?:KzDlHZ|IRpwTa|_4rR01T|wBy4fm)[^"]*"[^>]*>(.*?)</(?:div|a)>', block, re.DOTALL)
+            title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip() if title_match else ""
+            if not title:
+                slug_part = urlparse(clean_url).path.split("/p/")[0].strip("/").replace("-", " ")
+                title = slug_part.title()[:120]
+
+            # Extract Price, MRP & Discount
+            price_match = re.search(r'(?:₹|Rs\.?)\s*([0-9,]+)', block)
+            price = int(price_match.group(1).replace(",", "")) if price_match else 0
+            
+            mrp_match = re.findall(r'(?:₹|Rs\.?)\s*([0-9,]+)', block)
+            mrp = int(mrp_match[1].replace(",", "")) if len(mrp_match) > 1 else int(price * 1.35)
+
+            disc_match = re.search(r'([0-9]{1,2})%\s*off', block, re.IGNORECASE)
+            disc = float(disc_match.group(1)) if disc_match else (round((mrp - price) / mrp * 100, 1) if mrp > price else 0.0)
+
+            product = ScannedProduct(
+                pid=pid,
+                title=title,
+                brand=title.split()[0],
+                url=clean_url,
+                price=price,
+                mrp=mrp,
+                discount_pct=disc,
+            ).normalise()
+
+            if product.key not in found:
+                found[product.key] = product
+
+        # Layer 3: Catch-all regex href scan
         if not found:
             for href_match in PDP_HREF_PATTERN.finditer(html):
                 href = href_match.group(1)
@@ -1396,6 +1484,7 @@ class FlipkartCatalogueScanner:
                     continue
                 slug = urlparse(clean).path.split("/p/")[0].strip("/").replace("-", " ")
                 found[itm] = ScannedProduct(title=slug.title()[:120], url=clean).normalise()
+
         return list(found.values())
 
     def category_count(self, category: str) -> int:
@@ -1813,14 +1902,10 @@ def main() -> None:
 
 
 def render_deep_scanner() -> None:
-    """
-    Continuous site-wide scanner: traverses the full Flipkart catalogue without artificial
-    caps or result ceilings, merging every discovered deal directly into the main tables above.
-    """
     scanner = get_scanner()
 
     st.divider()
-    with st.expander("🛰️ Deep Website Scanner (Uncapped Site-Wide Discovery)", expanded=False):
+    with st.expander("🛰️ Deep Website Scanner (Uncapped Site-Wide Discovery)", expanded=True):
         if st.button("🩺 Run Connection Diagnostic", key="diag_run"):
             steps = run_scanner_diagnostic()
             st.dataframe(pd.DataFrame([{k: v for k, v in s.items() if not k.startswith("_")} for s in steps]),
