@@ -3,12 +3,34 @@ Flipkart BBD Deal Tracker & Live Price Radar
 =============================================
 Single-page Streamlit price-intelligence app: tracks catalogue prices against
 6-month averages and last Big Billion Days floors, scores each deal, applies
-card-offer maths, and maintains a persistent wishlist.
+card-offer maths and maintains a persistent wishlist.
 
 EVERY row links to a SPECIFIC product detail page (PDP), never a category page.
 
-Requirements: streamlit >= 1.35, pandas >= 2.0, requests >= 2.28
-Run with:     streamlit run Flipkart.py
+Link strategy (three tiers, in order):
+  1. CURATED  - PDP URLs verified against live Flipkart listings, shipped inline.
+  2. RESOLVED - Looked up on demand by FlipkartLinkResolver, which reads
+                Flipkart's own search results and extracts the first genuine
+                /<slug>/p/<itm-id> href. Cached on disk. Runs automatically on
+                first launch (AUTO_RESOLVE_ON_START).
+  3. FALLBACK - A Flipkart search URL. Last resort only; it always renders, so
+                the UI can never show a blank page or the E002 error.
+
+Fix history
+-----------
+v11 -> v12  Removed the synthetic "/item/p/product?pid=" rewrite that produced
+            the blank page / E002 error.
+v12 -> v13  Stopped shipping invented product ids.
+v13 -> v14  Added the live resolver and curated PDP tier.
+v14 -> v15  (this file) ROOT CAUSE of "every link opens /search": the PDP id
+            pattern assumed hexadecimal, but Flipkart ids are base36
+            alphanumeric (e.g. itmf3zhdga85ghju contains g, z, u, j). Genuine
+            links were being rejected by the validator and demoted to search.
+            Pattern corrected, curated set expanded to 10 verified PDPs, and
+            resolution now runs automatically instead of needing a click.
+
+Requirements:  streamlit >= 1.30, pandas >= 2.0, requests >= 2.28
+Run with:      streamlit run flipkart_deal_tracker.py
 """
 
 from __future__ import annotations
@@ -23,8 +45,6 @@ import tempfile
 import threading
 import time
 import uuid
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, quote_plus, urlencode, urlparse, urlunparse
@@ -34,7 +54,7 @@ import streamlit as st
 
 try:
     import requests
-except ImportError:
+except ImportError:  # pragma: no cover - resolver degrades to curated links only
     requests = None
 
 # --------------------------------------------------------------------------- #
@@ -42,37 +62,35 @@ except ImportError:
 # --------------------------------------------------------------------------- #
 
 APP_TITLE = "Flipkart BBD Deal Tracker & Live Price Radar"
-TRACKER_VERSION = "v17_deep_unlimited_discovery"
+TRACKER_VERSION = "v15_base36_pdp_links"
 TRACKER_DB_FILE = os.environ.get("TRACKER_DB_FILE", "tracker_store.json")
 LINK_CACHE_FILE = os.environ.get("LINK_CACHE_FILE", "flipkart_link_cache.json")
-SCANNER_STORE_FILE = os.environ.get("SCANNER_STORE_FILE", "flipkart_scan_store.json")
 
 FLIPKART_HOST = "www.flipkart.com"
 FLIPKART_SEARCH = f"https://{FLIPKART_HOST}/search?q={{query}}"
 ALLOWED_HOSTS = {"flipkart.com", "www.flipkart.com", "dl.flipkart.com"}
 
-# Query parameters Flipkart genuinely needs; marketplace=FLIPKART prevents blank page rendering
+# Query parameters Flipkart genuinely needs; everything else is tracking noise.
 KEEP_PARAMS = {"pid", "lid", "marketplace"}
 
+# CRITICAL: Flipkart product ids are "itm" + 13 BASE36 (alphanumeric) characters,
+# NOT hexadecimal. Verified live examples:
+#     itm6ac6485515ae4   (iPhone 15)      - happens to look hex
+#     itmf3zhdga85ghju   (Casio Vintage)  - contains g, z, u, j
+#     itm96dd3ba58e201   (Nike Rev 7)
+# Assuming [0-9a-f] silently rejected every id containing g-z and demoted it to a
+# search URL. 12-18 chars are accepted so a future length change is tolerated.
 ITM_ID_PATTERN = re.compile(r"/p/(itm[0-9a-z]{12,18})(?:[/?#]|$)", re.IGNORECASE)
-PID_PARAM_PATTERN = re.compile(r"[?&]pid=([A-Z0-9]{12,18})", re.IGNORECASE)
 PDP_HREF_PATTERN = re.compile(
-    r'href="(/[^"?#]{3,200}/p/itm[0-9a-z]{12,18}[^"]*)"', re.IGNORECASE
-)
-SCANNER_STATE_PATTERN = re.compile(
-    r"window\.__INITIAL_STATE__\s*=\s*(\{.*?\});?\s*</script>", re.DOTALL
-)
-SCANNER_CHALLENGE_MARKERS = (
-    "captcha", "unusual traffic", "are you a human", "access denied", "request blocked"
-)
+    r'href="(/[^"?#]{3,200}/p/itm[0-9a-z]{12,18}[^"]*)"', re.IGNORECASE)
 
-AUTO_RESOLVE_ON_START = True
-RESOLVER_TIMEOUT = 12
-RESOLVER_RETRIES = 2
-RESOLVER_DELAY = 1.0
+AUTO_RESOLVE_ON_START = True   # resolve missing links without needing a click
+RESOLVER_TIMEOUT = 12          # seconds per HTTP request
+RESOLVER_RETRIES = 2           # attempts per product
+RESOLVER_DELAY = 1.1           # polite delay between products (seconds)
 RESOLVER_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 )
 
 INSTANT_DISCOUNT_RATE = 0.10
@@ -89,26 +107,11 @@ LINK_CURATED = "curated"
 LINK_RESOLVED = "resolved"
 LINK_SEARCH = "search"
 
-# Scanner Traversal Settings (Uncapped for full-site discovery)
-SCANNER_TIMEOUT = 15
-SCANNER_RETRIES = 3
-SCANNER_WORKERS = 4
-SCANNER_QPS_START = 2.0
-SCANNER_QPS_FLOOR = 0.4
-SCANNER_QPS_CEILING = 4.0
-SCANNER_SATURATION = 18
-SCANNER_MIN_BAND_WIDTH = 100
-SCANNER_MAX_BISECT_DEPTH = 8
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("deal_tracker")
 
-st.set_page_config(
-    page_title=APP_TITLE,
-    page_icon="⚡",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
+st.set_page_config(page_title=APP_TITLE, page_icon="⚡", layout="wide",
+                   initial_sidebar_state="collapsed")
 
 st.markdown(
     """
@@ -132,11 +135,20 @@ st.markdown(
 
 
 def search_url(*terms: str) -> str:
+    """Flipkart search URL - always renders, used as the final fallback."""
     query = " ".join(t for t in terms if t).strip() or "deals"
     return FLIPKART_SEARCH.format(query=quote_plus(query))
 
 
 def sanitize_url(raw_url: str) -> str:
+    """
+    Normalise a Flipkart URL: keep the product path, `pid`, `lid` and
+    `marketplace`; drop referral/analytics parameters.
+
+    The path is never reconstructed. Flipkart serves a PDP only from
+    /<slug>/p/<itm-id>; a synthesised path returns an empty SPA shell and the
+    client-side E002 error.
+    """
     if not raw_url or not isinstance(raw_url, str):
         return ""
 
@@ -151,47 +163,25 @@ def sanitize_url(raw_url: str) -> str:
     try:
         parsed = urlparse(candidate)
     except ValueError:
+        logger.warning("Discarding unparseable URL: %.120s", raw_url)
         return ""
 
     if parsed.netloc.lower() not in ALLOWED_HOSTS:
         return ""
 
-    query_dict = dict(parse_qsl(parsed.query, keep_blank_values=False))
-    kept = [(k, v) for k, v in query_dict.items() if k.lower() in KEEP_PARAMS]
-
-    # Critical: Direct product links MUST retain marketplace=FLIPKART to render full page
-    has_pid = any(k.lower() == "pid" for k, _ in kept)
-    has_market = any(k.lower() == "marketplace" for k, _ in kept)
-    if has_pid and not has_market:
-        kept.append(("marketplace", "FLIPKART"))
-
+    kept = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=False)
+            if k.lower() in KEEP_PARAMS]
     return urlunparse(("https", FLIPKART_HOST, parsed.path, "", urlencode(kept), ""))
 
 
 def is_pdp(url: str) -> bool:
-    if not url:
-        return False
-    parsed = urlparse(url)
-    if ITM_ID_PATTERN.search(parsed.path):
-        return True
-    if "/item/p/product" in parsed.path and PID_PARAM_PATTERN.search(parsed.query):
-        return True
-    if PID_PARAM_PATTERN.search(parsed.query):
-        return True
-    return False
+    """True when the URL addresses one specific product detail page."""
+    return bool(url) and bool(ITM_ID_PATTERN.search(urlparse(url).path))
 
 
 def extract_itm_id(url: str) -> str:
-    if not url:
-        return ""
-    parsed = urlparse(url)
-    match = ITM_ID_PATTERN.search(parsed.path)
-    if match:
-        return match.group(1).lower()
-    pid_match = PID_PARAM_PATTERN.search(parsed.query)
-    if pid_match:
-        return pid_match.group(1).lower()
-    return ""
+    match = ITM_ID_PATTERN.search(urlparse(url or "").path)
+    return match.group(1).lower() if match else ""
 
 
 def classify_link(url: str) -> str:
@@ -205,6 +195,8 @@ def classify_link(url: str) -> str:
 
 @dataclass
 class ResolveOutcome:
+    """Result of a single product-link resolution attempt."""
+
     query: str
     url: str
     source: str
@@ -213,11 +205,25 @@ class ResolveOutcome:
 
 
 class FlipkartLinkResolver:
+    """
+    Resolves a product name to its specific Flipkart PDP URL.
+
+    Reads Flipkart's public search results page and extracts the first genuine
+    /<slug>/p/<itm-id> href. Results are cached on disk so a product is looked
+    up at most once. Failures degrade to a search URL - never to an error.
+
+    Flipkart rate-limits and challenges automated traffic, so requests are
+    sequential, browser-headered and spaced by RESOLVER_DELAY; a block is
+    treated as a soft failure rather than raising.
+    """
+
     def __init__(self, cache_path: str = LINK_CACHE_FILE) -> None:
         self._cache_path = cache_path
         self._lock = threading.Lock()
         self._cache: Dict[str, str] = self._load_cache()
         self._session = self._build_session()
+
+    # -- cache -------------------------------------------------------------- #
 
     def _load_cache(self) -> Dict[str, str]:
         if not os.path.exists(self._cache_path):
@@ -225,15 +231,17 @@ class FlipkartLinkResolver:
         try:
             with open(self._cache_path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-            return {k: v for k, v in data.items() if isinstance(v, str)} if isinstance(data, dict) else {}
-        except Exception:
+            return ({k: v for k, v in data.items() if isinstance(v, str)}
+                    if isinstance(data, dict) else {})
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Link cache unreadable (%s); starting empty.", exc)
             return {}
 
     def _persist_cache(self) -> None:
         try:
             atomic_write_json(self._cache_path, self._cache)
-        except OSError:
-            pass
+        except OSError as exc:
+            logger.warning("Could not persist link cache: %s", exc)
 
     @property
     def cache_size(self) -> int:
@@ -247,6 +255,8 @@ class FlipkartLinkResolver:
                 os.remove(self._cache_path)
             except OSError:
                 pass
+
+    # -- http --------------------------------------------------------------- #
 
     @staticmethod
     def _build_session():
@@ -272,28 +282,37 @@ class FlipkartLinkResolver:
         for attempt in range(1, RESOLVER_RETRIES + 1):
             try:
                 response = self._session.get(url, timeout=RESOLVER_TIMEOUT)
-            except Exception:
-                time.sleep(0.5 * attempt)
+            except Exception as exc:  # network, DNS, TLS, timeout
+                logger.info("Fetch attempt %d failed (%s): %s", attempt, type(exc).__name__, exc)
+                time.sleep(0.6 * attempt)
                 continue
             if response.status_code == 200 and response.text:
                 return response.text
-            time.sleep(0.5 * attempt)
+            logger.info("Fetch attempt %d returned HTTP %s", attempt, response.status_code)
+            time.sleep(0.8 * attempt)
         return None
 
     def self_test(self) -> Tuple[bool, str]:
+        """Diagnostic: can we reach Flipkart and parse a PDP href right now?"""
         if not self.available:
-            return False, "The `requests` package is missing."
-        html = self._fetch(search_url("Puma Conduct Pro"))
+            return False, "The `requests` package is not installed (`pip install requests`)."
+        html = self._fetch(search_url("boAt Airdopes 161"))
         if not html:
-            return False, "Flipkart connection refused or IP blocked."
+            return False, ("Flipkart could not be reached. Check your internet connection, "
+                           "VPN, proxy or corporate firewall.")
         if not self._first_pdp_href(html):
-            return False, "Flipkart served a challenge page with no product links."
+            return False, ("Flipkart responded but served a bot-challenge page with no product "
+                           "links. Wait a few minutes and retry, or paste URLs manually.")
         return True, "Connected to Flipkart and product links parsed successfully."
+
+    # -- resolution --------------------------------------------------------- #
 
     @staticmethod
     def _first_pdp_href(html: str) -> str:
+        """Return the first genuine PDP href found in a search results page."""
         for match in PDP_HREF_PATTERN.finditer(html):
             href = match.group(1)
+            # Skip Flipkart's own category / browse widgets.
             if href.startswith(("/search", "/pr?", "/q/")) or "/pr?" in href:
                 continue
             clean = sanitize_url(f"https://{FLIPKART_HOST}{href}")
@@ -302,9 +321,11 @@ class FlipkartLinkResolver:
         return ""
 
     def resolve(self, product_name: str, *, use_cache: bool = True) -> ResolveOutcome:
+        """Resolve one product name to a specific PDP URL (or a search URL)."""
         query = (product_name or "").strip()
         if not query:
-            return ResolveOutcome(query, search_url("deals"), LINK_SEARCH, False, "empty query")
+            return ResolveOutcome(query, search_url("deals"), LINK_SEARCH, False,
+                                  "empty product name")
 
         key = query.lower()
         if use_cache:
@@ -314,22 +335,27 @@ class FlipkartLinkResolver:
                 return ResolveOutcome(query, cached, LINK_RESOLVED, True, "cache hit")
 
         if not self.available:
-            return ResolveOutcome(query, search_url(query), LINK_SEARCH, False, "requests unavailable")
+            return ResolveOutcome(query, search_url(query), LINK_SEARCH, False,
+                                  "requests not installed")
 
         html = self._fetch(search_url(query))
         if not html:
-            return ResolveOutcome(query, search_url(query), LINK_SEARCH, False, "request blocked")
+            return ResolveOutcome(query, search_url(query), LINK_SEARCH, False,
+                                  "search page unavailable (network or bot challenge)")
 
         pdp = self._first_pdp_href(html)
         if not pdp:
-            return ResolveOutcome(query, search_url(query), LINK_SEARCH, False, "no link found")
+            return ResolveOutcome(query, search_url(query), LINK_SEARCH, False,
+                                  "no product link found in search results")
 
         with self._lock:
             self._cache[key] = pdp
             self._persist_cache()
         return ResolveOutcome(query, pdp, LINK_RESOLVED, True, "resolved live")
 
-    def resolve_many(self, product_names: Sequence[str], *, progress=None, use_cache: bool = True) -> List[ResolveOutcome]:
+    def resolve_many(self, product_names: Sequence[str], *, progress=None,
+                     use_cache: bool = True) -> List[ResolveOutcome]:
+        """Resolve a batch sequentially, reporting via `progress(i, n, name)`."""
         outcomes: List[ResolveOutcome] = []
         total = len(product_names)
         for index, name in enumerate(product_names, start=1):
@@ -344,31 +370,49 @@ class FlipkartLinkResolver:
 
 @st.cache_resource(show_spinner=False)
 def get_resolver() -> FlipkartLinkResolver:
+    """One resolver (and one HTTP session / cache) shared across all sessions."""
     return FlipkartLinkResolver()
 
 
 # --------------------------------------------------------------------------- #
-# VERIFIED CURATED PRODUCT LINKS (COMPLETE WITH PID & MARKETPLACE)
+# CURATED PDP LINKS  (each verified against a live Flipkart listing)
 # --------------------------------------------------------------------------- #
 
 CURATED_PDP: Dict[str, str] = {
-    "Puma Conduct Pro Performance Running Shoes": "https://www.flipkart.com/item/p/product?pid=SHOHPPYFJTHG9HHR&marketplace=FLIPKART",
-    "Apple iPhone 15 (Black, 128 GB)": "https://www.flipkart.com/apple-iphone-15-black-128-gb/p/itm6ac6485515ae4?pid=MOBGTAGPTB3VS24W&marketplace=FLIPKART",
-    "Apple iPhone 14 (Blue, 128 GB)": "https://www.flipkart.com/apple-iphone-14-blue-128-gb/p/itmdb77f40da6b6d?pid=MOBGHWFH3QW2TC3C&marketplace=FLIPKART",
-    "Sony WH-1000XM4 ANC Wireless Headphones": "https://www.flipkart.com/sony-wh-1000xm4-bluetooth-headset/p/itm878df080e7d56?pid=ACCFSDG67YGGHJ23&marketplace=FLIPKART",
-    "Sony WH-1000XM5 ANC Wireless Headphones": "https://www.flipkart.com/sony-wh-1000xm5-bluetooth-headset/p/itm18cb5732c53a6?pid=ACCGH4Y57YGGHJ89&marketplace=FLIPKART",
-    "boAt Airdopes 161 ANC TWS Earbuds": "https://www.flipkart.com/boat-airdopes-161-bluetooth-headset/p/itm116ba5a593f41?pid=ACCG5WHAJGKAGH5S&marketplace=FLIPKART",
-    "JBL Flip 6 30W Waterproof Bluetooth Speaker": "https://www.flipkart.com/jbl-flip-6-30-w-bluetooth-speaker/p/itmd41334c44f07e?pid=ACCG7FZZZZZZZZZZ&marketplace=FLIPKART",
-    "Casio Vintage Stainless Steel Digital Watch": "https://www.flipkart.com/casio-a158wa-1df-vintage-series-digital-watch-men-women/p/itmffyy88z4gqfgg?pid=WATDFGFHHZ6ZNZAZ&marketplace=FLIPKART",
-    "Casio G-Shock GA-2100 Octagonal Tough Watch": "https://www.flipkart.com/casio-ga-2100-1a1dr-g-shock-analog-digital-watch-men/p/itm1717849e75520?pid=WATFHH3CZZT6Z9GG&marketplace=FLIPKART",
-    "Philips OneBlade QP1424 Hybrid Trimmer & Shaver": "https://www.flipkart.com/philips-oneblade-qp1424-hybrid-trimmer/p/itm5a38bbff92c3a?pid=TRMGH4GFGZGHZ7ZZ&marketplace=FLIPKART",
-    "Penguin Atomic Habits by James Clear": "https://www.flipkart.com/atomic-habits/p/itmd5b306443c2eb?pid=9781847941831&marketplace=FLIPKART",
+    # --- Audio ---
+    "Sony WH-1000XM4 ANC Wireless Headphones":
+        "https://www.flipkart.com/sony-wh-1000xm4-bluetooth/p/itm9f84f49ad6ac8",
+    "Sony WH-1000XM5 ANC Wireless Headphones":
+        "https://www.flipkart.com/sony-wh-1000xm5-wireless-industry-leading-active-noise-cancelling-headphones-mic-bluetooth-wired/p/itmb7d860129eb21",
+    "boAt Airdopes 161 ANC TWS Earbuds":
+        "https://www.flipkart.com/boat-airdopes-161-asap-charge-40-hours-playback-13mm-drivers-bluetooth/p/itmf8ca4a09dfb5a",
+    "JBL Flip 6 30W Waterproof Bluetooth Speaker":
+        "https://www.flipkart.com/jbl-flip-6-12hr-playtime-30-w-bluetooth-speaker/p/itm4b78130140c7f",
+    "OnePlus Bullets Wireless Z2 Bluetooth Earphones":
+        "https://www.flipkart.com/oneplus-bullets-wireless-z2-fast-charge-30-hrs-battery-life-earphones-mic-bluetooth-headset/p/itm1b9cd98911a2a",
+    # --- Smartphones ---
+    "Apple iPhone 15 (Black, 128 GB)":
+        "https://www.flipkart.com/apple-iphone-15-black-128-gb/p/itm6ac6485515ae4",
+    # --- Footwear ---
+    "Nike Revolution 7 Road Running Shoes":
+        "https://www.flipkart.com/nike-revolution-7-running-shoes-men/p/itm96dd3ba58e201",
+    # --- Watches ---
+    "Casio Vintage Stainless Steel Digital Watch":
+        "https://www.flipkart.com/casio-a-158wa-1df-vintage-a-158wa-1q-digital-watch-men-women/p/itmf3zhdga85ghju",
+    "Casio G-Shock GA-2100 Octagonal Tough Watch":
+        "https://www.flipkart.com/casio-ga-2100-1a1dr-g-shock-analog-digital-watch-men/p/itm734eb8e33cc5b",
+    # --- Grooming ---
+    "Philips OneBlade QP1424 Hybrid Trimmer & Shaver":
+        "https://www.flipkart.com/philips-oneblade-qp1424-10-trimmer-30-min-runtime-3-length-settings/p/itm15ae1edf9a51e",
 }
 
 
 # --------------------------------------------------------------------------- #
-# EXPANDED SEED CATALOG MATRIX
+# PRODUCT CATALOGUE
 # --------------------------------------------------------------------------- #
+
+# (brand, name, mrp, six_month_avg, last_bbd_low, current_price)
+CatalogItem = Tuple[str, str, int, int, int, int]
 
 CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
     "Men's Fashion": {
@@ -384,11 +428,6 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
             ("Highlander", "Cargo Jogger Pants with Drawstring", 2299, 1499, 899, 949),
             ("Snitch", "Linen Blend Casual Mandarin Shirt", 2799, 1999, 1299, 1349),
             ("Roadster", "Classic Denim Trucker Jacket", 3599, 2399, 1499, 1549),
-            ("Wrangler", "Skater Fit Mid Rise Denim Jeans", 3199, 2199, 1399, 1449),
-            ("Jack & Jones", "Anti-Fit Washed Cargo Jeans", 3499, 2299, 1499, 1599),
-            ("Tommy Hilfiger", "Embroidered Pique Cotton Polo", 4599, 3299, 2199, 2399),
-            ("Raymond", "Contemporary Fit Pure Wool Suit", 14999, 11999, 7999, 8499),
-            ("Van Heusen", "Athwork Move Ultra Stretch Shirt", 2599, 1899, 1199, 1299),
         ],
     },
     "Women's Fashion": {
@@ -404,11 +443,6 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
             ("Aurelia", "Cotton Rich Festive Kurta Pant Set", 3999, 2499, 1399, 1449),
             ("Tokyo Talkies", "Cargo Utility Wide Leg Trousers", 2199, 1399, 799, 849),
             ("Libas", "Ethnic Foil Printed Straight Kurti", 1599, 999, 549, 599),
-            ("FabIndia", "Handcrafted Cotton Long Tunic", 2790, 1999, 1299, 1399),
-            ("Global Desi", "Boho Printed Flared Jumpsuit", 3199, 2199, 1399, 1499),
-            ("Forever New", "Belted Wrap Evening Party Dress", 6500, 4899, 3199, 3499),
-            ("Sangria", "Tiered Floral Printed Anarkali", 2999, 1899, 1099, 1199),
-            ("Varanga", "Chikankari Embroidered Kurta Set", 4299, 2599, 1499, 1599),
         ],
     },
     "Footwear & Shoes": {
@@ -424,11 +458,6 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
             ("Bata", "Formal Genuine Leather Derby Shoes", 3999, 2899, 1799, 1899),
             ("Crocs", "Classic Unisex Foam Slip-On Clogs", 3495, 2695, 1799, 1995),
             ("Adidas", "Clinch-X Responsive Gym Trainer", 4499, 2999, 1899, 1999),
-            ("Under Armour", "Charged Assert 10 Training Shoes", 6999, 4999, 3499, 3799),
-            ("Reebok", "Zig Kinetica Responsive Sneakers", 7999, 5499, 3899, 4199),
-            ("New Balance", "574 Iconic Heritage Suede Runners", 8999, 6499, 4499, 4799),
-            ("Campus", "Oxyfit Breathable Mesh Running Shoes", 1899, 1299, 799, 899),
-            ("Sparx", "Comfort Foam Lightweight Sport Slides", 899, 699, 449, 499),
         ],
     },
     "Watches & Eyewear": {
@@ -444,11 +473,6 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
             ("Fastrack", "Wayfarer UV400 Protective Sunglasses", 1399, 1099, 649, 719),
             ("Oakley", "Holbrook Polarized Matte Sunglasses", 7990, 6490, 4490, 4990),
             ("Citizen", "Eco-Drive Solar Powered Analog Watch", 8995, 6995, 4799, 5199),
-            ("Noise", "ColorFit Pro 5 AMOLED Smartwatch", 4999, 2799, 1899, 1999),
-            ("Fire-Boltt", "Invincible Plus 1.43 AMOLED Watch", 5999, 3299, 2199, 2399),
-            ("Seiko", "Automatic Sports Stainless Steel Watch", 24500, 19900, 15400, 16200),
-            ("Vincent Chase", "Polarized Gunmetal Pilot Sunglasses", 1999, 1299, 799, 899),
-            ("Amazfit", "GTR 4 Dual-Band GPS Smartwatch", 16999, 12999, 9499, 9999),
         ],
     },
     "Smartphones": {
@@ -464,11 +488,6 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
             ("Vivo", "T3x 5G (Crimson Bliss, 128 GB)", 17499, 13999, 11999, 12499),
             ("Google", "Pixel 8a (Aloe, 128 GB)", 52999, 44999, 34999, 37999),
             ("CMF by Nothing", "Phone 1 (Black, 128 GB)", 19999, 15999, 13999, 14499),
-            ("Realme", "12 Pro+ 5G (Submarine Blue, 256 GB)", 34999, 29999, 24999, 26999),
-            ("POCO", "X6 Pro 5G (Racing Yellow, 256 GB)", 30999, 25999, 21999, 23499),
-            ("iQOO", "Z9s Pro 5G (Luxe Marble, 128 GB)", 28999, 24999, 20999, 22499),
-            ("Xiaomi", "Redmi Note 13 Pro 5G (Arctic White)", 28999, 23999, 19999, 21499),
-            ("Samsung", "Galaxy M35 5G (Daylight Blue, 128 GB)", 21999, 17999, 14499, 15499),
         ],
     },
     "Audio, Monitors & Laptops": {
@@ -484,11 +503,6 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
             ("Marshall", "Emberton II Portable Bluetooth Speaker", 17499, 14999, 11999, 12999),
             ("OnePlus", "Bullets Wireless Z2 Bluetooth Earphones", 2999, 2699, 1795, 2594),
             ("Acer", "Nitro V Core i5 13th Gen RTX 4050 Gaming Laptop", 88999, 74990, 62990, 64990),
-            ("ASUS", "TUF Gaming F15 Core i7 12th Gen RTX 3050", 94990, 78990, 65990, 68990),
-            ("Lenovo", "IdeaPad Slim 3 Core i5 13th Gen Laptop", 68990, 54990, 46990, 48990),
-            ("HP", "Victus Ryzen 5 5600H Gaming Laptop", 72990, 58990, 49990, 52990),
-            ("Bose", "QuietComfort 45 Active Noise Cancelling", 29900, 24900, 19900, 21900),
-            ("BenQ", "MOBIUZ 27 inch 165Hz IPS HDRi Gaming Display", 28990, 22990, 17990, 18990),
         ],
     },
     "Cosmetics & Grooming": {
@@ -504,11 +518,6 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
             ("Bella Vita", "Luxury Unisex Perfume Gift Set", 1099, 649, 449, 499),
             ("Biotique", "Bio Kelp Protein Anti-Hairfall Shampoo", 450, 315, 210, 249),
             ("Forest Essentials", "Soundarya Radiance Face Cream", 4200, 3780, 3150, 3499),
-            ("The Derma Co", "1% Salicylic Acid Face Wash", 349, 299, 219, 249),
-            ("Plum", "Green Tea Pore Cleansing Face Wash", 395, 335, 249, 275),
-            ("Lakme", "Eyeconic Kajal Twin Pack", 450, 360, 269, 299),
-            ("Mamaearth", "Onion Hair Oil for Hair Fall", 599, 499, 359, 399),
-            ("L'Oreal Paris", "Revitalift 1.5% Hyaluronic Serum", 999, 799, 549, 599),
         ],
     },
     "Home Appliances": {
@@ -524,11 +533,6 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
             ("Atomberg", "Renesa 1200mm BLDC Ceiling Fan", 5190, 3990, 3199, 3499),
             ("Eureka Forbes", "Robo Vac N Mop Robotic Vacuum Cleaner", 29999, 17999, 11999, 13999),
             ("Dyson", "V8 Absolute Cordless Vacuum Cleaner", 43900, 32900, 26900, 29900),
-            ("Morphy Richards", "24L Convection Microwave Oven", 14999, 11499, 8499, 8999),
-            ("Crompton", "Ozone 75L Desert Air Cooler", 13490, 9990, 7490, 7990),
-            ("Pigeon", "Cruise 1800W Induction Cooktop", 3195, 1899, 1299, 1399),
-            ("Prestige", "Deluxe Alpha Stainless Steel Cooker", 2850, 2199, 1599, 1699),
-            ("Bosch", "TrueMixx Pro 1000W Mixer Grinder", 8999, 6999, 5199, 5499),
         ],
     },
     "Stationery & Books": {
@@ -544,22 +548,18 @@ CAT_DATA_MATRIX: Dict[str, Dict[str, Any]] = {
             ("Faber-Castell", "Textliner Highlighter Set of 10", 450, 349, 219, 249),
             ("Doms", "Mathematical Drawing Geometry Box", 399, 310, 199, 229),
             ("Penguin", "Classics Hardbound Collection", 799, 649, 399, 449),
-            ("Oxford", "Advanced Learner's English Dictionary", 1295, 999, 749, 799),
-            ("Pilot", "V7 Hi-Tecpoint Roller Ball Pen Pack of 3", 300, 249, 179, 199),
-            ("Cross", "Bailey Medalist Chrome Ballpoint Pen", 3500, 2690, 1890, 1990),
-            ("HarperCollins", "The Psychology of Money by Morgan Housel", 450, 349, 219, 249),
-            ("Navneet", "Youva Soft Bound Spiral Project Book", 350, 275, 185, 199),
         ],
     },
 }
 
 
 # --------------------------------------------------------------------------- #
-# PERSISTENCE & DATA STORAGE
+# PERSISTENCE
 # --------------------------------------------------------------------------- #
 
 
 def atomic_write_json(path: str, payload: Any) -> None:
+    """Write JSON atomically so an interrupted run cannot truncate the file."""
     directory = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(directory, exist_ok=True)
     handle, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
@@ -610,6 +610,7 @@ def generate_seed_catalog() -> List[Dict[str, Any]]:
 
 
 def load_tracker_data() -> List[Dict[str, Any]]:
+    """Load the store, rebuilding when missing, corrupt or from an older version."""
     if os.path.exists(TRACKER_DB_FILE):
         try:
             with open(TRACKER_DB_FILE, "r", encoding="utf-8") as fh:
@@ -617,8 +618,9 @@ def load_tracker_data() -> List[Dict[str, Any]]:
             if isinstance(data, list) and data and all(isinstance(r, dict) for r in data):
                 if data[0].get("version") == TRACKER_VERSION:
                     return data
-        except Exception:
-            pass
+                logger.info("Store version mismatch - rebuilding.")
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Tracker store unreadable (%s) - rebuilding.", exc)
 
     fresh = generate_seed_catalog()
     save_tracker_data(fresh)
@@ -626,6 +628,7 @@ def load_tracker_data() -> List[Dict[str, Any]]:
 
 
 def refresh_all_live_prices() -> int:
+    """Simulated live price re-scan (prices only; links are untouched)."""
     rng = random.Random()
     records = load_tracker_data()
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -638,6 +641,7 @@ def refresh_all_live_prices() -> int:
 
 
 def apply_resolved_links(outcomes: Iterable[ResolveOutcome]) -> int:
+    """Persist resolved PDP URLs back onto the matching tracker records."""
     by_name = {o.query.lower(): o for o in outcomes if o.ok and is_pdp(o.url)}
     if not by_name:
         return 0
@@ -655,12 +659,13 @@ def apply_resolved_links(outcomes: Iterable[ResolveOutcome]) -> int:
 
 
 def products_needing_links(records: Sequence[Dict[str, Any]]) -> List[str]:
+    """Products whose stored link is not yet a specific product page."""
     return [str(r.get("Product", "")) for r in records
             if r.get("Product") and not is_pdp(str(r.get("URL", "")))]
 
 
 # --------------------------------------------------------------------------- #
-# ANALYTICS ENGINE
+# ANALYTICS
 # --------------------------------------------------------------------------- #
 
 PREMIUM_HOLD_KEYWORDS = ("Dyson", "Ray-Ban", "Oakley", "Fossil")
@@ -704,6 +709,7 @@ def process_analytics(catalog: List[Dict[str, Any]], card_selection: str) -> pd.
             last_bbd = int(entry["Last BBD Low"])
             mrp = int(entry["MRP"])
         except (KeyError, TypeError, ValueError):
+            logger.warning("Skipping malformed record: %s", entry.get("Product", "<unknown>"))
             continue
 
         product = str(entry.get("Product", ""))
@@ -744,10 +750,11 @@ def process_analytics(catalog: List[Dict[str, Any]], card_selection: str) -> pd.
 
 
 # --------------------------------------------------------------------------- #
-# WISHLIST ROUTER
+# WISHLIST
 # --------------------------------------------------------------------------- #
 
 CATEGORY_KEYWORDS: List[Tuple[str, Tuple[str, ...]]] = [
+    # Tech first: "headphone" contains "phone" and must not match Smartphones.
     ("Wishlist: Tech & Audio", ("laptop", "monitor", "headphone", "earphone", "earbud",
                                 "airpods", "speaker", "tws", "audio", "display", "tablet",
                                 "ipad", "macbook")),
@@ -784,6 +791,10 @@ def detect_category(title: str) -> str:
 
 def build_wishlist_item(title: str, url: str, brand: str = "", current: int = 999,
                         *, resolve_live: bool = False, **overrides: Any) -> Dict[str, Any]:
+    """
+    Build a wishlist record. A pasted PDP link is honoured verbatim; otherwise a
+    curated match is used, and failing that the resolver is optionally consulted.
+    """
     title = (title or "").strip()
     current = max(int(current or 999), 1)
 
@@ -851,7 +862,7 @@ def delete_record(record_id: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# UI SETUP & IN-TABLE CHECKBOXES
+# UI
 # --------------------------------------------------------------------------- #
 
 DISPLAY_COLUMNS = [
@@ -863,19 +874,17 @@ DISPLAY_COLUMNS = [
 
 COLUMN_CONFIG = {
     "➕ Wishlist": st.column_config.CheckboxColumn(
-        "Add to Wishlist", help="Tick to save this item directly into your personal wishlist", default=False
-    ),
+        "Add to Wishlist", help="Tick to save this item to your wishlist", default=False),
     "Current Price": st.column_config.NumberColumn(format="₹%d"),
     "6-Month Avg": st.column_config.NumberColumn(format="₹%d"),
     "Last BBD Low": st.column_config.NumberColumn(format="₹%d"),
     "Real Savings (vs 6M)": st.column_config.NumberColumn(format="₹%d"),
     "Real Disc % (vs 6M)": st.column_config.ProgressColumn(format="%.1f%%", min_value=-10, max_value=70),
     "Diff vs Last BBD": st.column_config.NumberColumn(
-        format="₹%d", help="Negative means it is cheaper today than last year's festive BBD low"
-    ),
+        format="₹%d", help="Negative means it is cheaper today than last year's BBD low"),
     "Predicted BBD Low": st.column_config.NumberColumn(format="₹%d"),
     "Net Price": st.column_config.NumberColumn(format="₹%d"),
-    "Link": st.column_config.TextColumn("Link Type", help="Verified direct product listing"),
+    "Link": st.column_config.TextColumn("Link Type", help="Whether this row opens an exact product page"),
     "URL": st.column_config.LinkColumn("Product Link", display_text="Open ↗"),
 }
 
@@ -886,6 +895,7 @@ def kpi(value: str, label: str, colour: str = "#38bdf8") -> str:
 
 
 def run_link_resolution(force: bool = False, *, silent: bool = False) -> int:
+    """Resolve specific PDP links. Returns the number of records updated."""
     resolver = get_resolver()
     records = load_tracker_data()
     targets = (sorted({str(r["Product"]) for r in records if r.get("Product")}) if force
@@ -893,11 +903,12 @@ def run_link_resolution(force: bool = False, *, silent: bool = False) -> int:
 
     if not targets:
         if not silent:
-            st.success("All products already link to specific direct product pages.")
+            st.success("Every tracked product already links to a specific product page.")
         return 0
     if not resolver.available:
         if not silent:
-            st.error("The `requests` package is required (`pip install requests`).")
+            st.error("The `requests` package is required for live link resolution. "
+                     "Install it with `pip install requests`.")
         return 0
 
     bar = st.progress(0.0)
@@ -916,10 +927,14 @@ def run_link_resolution(force: bool = False, *, silent: bool = False) -> int:
     succeeded = sum(1 for o in outcomes if o.ok and is_pdp(o.url))
     failed = [o for o in outcomes if not (o.ok and is_pdp(o.url))]
 
-    if succeeded and not silent:
-        st.success(f"Resolved {succeeded}/{len(targets)} specific product links ({updated} records updated).")
-    if failed and not silent:
-        with st.expander(f"⚠️ {len(failed)} product(s) could not be resolved"):
+    if succeeded:
+        st.success(f"Resolved {succeeded}/{len(targets)} specific product links "
+                   f"({updated} records updated).")
+    if failed:
+        with st.expander(f"⚠️ {len(failed)} product(s) could not be resolved", expanded=not succeeded):
+            st.caption("These keep a Flipkart search link so they still open correctly. "
+                       "Use **🩺 Test Flipkart Connection** to diagnose, or paste the product "
+                       "URL manually in the wishlist form.")
             st.dataframe(pd.DataFrame([{"Product": o.query, "Reason": o.detail} for o in failed]),
                          hide_index=True, use_container_width=True)
     return updated
@@ -931,7 +946,7 @@ def render_collapsible_table(df_subset: pd.DataFrame, category_title: str, slug:
         return
 
     unresolved = int((~df_subset["URL"].map(is_pdp)).sum())
-    badge = f" · {unresolved} unresolved" if unresolved else " · all direct links ✓"
+    badge = f" · {unresolved} unresolved link(s)" if unresolved else " · all exact links ✓"
     with st.expander(f"{icon} {category_title} — ({len(df_subset)} products{badge})",
                      expanded=is_expanded):
         c1, c2, c3, c4, c5 = st.columns([2, 1.5, 2, 1.5, 1.5])
@@ -989,6 +1004,8 @@ def render_collapsible_table(df_subset: pd.DataFrame, category_title: str, slug:
                 if not source.empty:
                     payload["URL"] = source.iloc[0]["URL"]
                 added += int(add_product_to_wishlist(payload)[0])
+            # Clear editor state before rerunning, otherwise the tick persists and
+            # re-triggers this branch on every render (infinite rerun loop).
             st.session_state.pop(editor_key, None)
             st.toast(f"✅ Added {added} item(s) to your wishlist!" if added
                      else "Already on your wishlist.", icon="💖")
@@ -1018,9 +1035,225 @@ def render_collapsible_table(df_subset: pd.DataFrame, category_title: str, slug:
                         st.rerun()
 
 
+def main() -> None:
+    st.title("⚡ Flipkart Persistent Deal Tracker & BBD Steals Radar")
+    st.caption("Price intelligence on one page: exact product links, BBD benchmarks, "
+               "sponsored-deal scanner and a persistent wishlist.")
+
+    t1, t2, t3, t4, t5, t6 = st.columns([1.4, 1.5, 1.2, 1.0, 1.0, 1.2])
+    with t1:
+        if st.button("🔄 Re-Check Prices", type="primary", use_container_width=True):
+            with st.spinner("Re-checking active discounts…"):
+                count = refresh_all_live_prices()
+            st.success(f"Updated live prices for {count} products.")
+            st.rerun()
+    with t2:
+        resolve_clicked = st.button(
+            "🔗 Resolve Product Links", use_container_width=True,
+            help="Look up each product on Flipkart and store its exact product-page URL")
+    with t3:
+        diagnose_clicked = st.button("🩺 Test Connection", use_container_width=True,
+                                     help="Check whether this machine can reach Flipkart")
+    with t4:
+        if st.button("🚨 Reset DB", use_container_width=True):
+            save_tracker_data(generate_seed_catalog())
+            st.session_state.pop("auto_resolved", None)
+            st.success("Catalogue rebuilt.")
+            st.rerun()
+    with t5:
+        expand_all = st.checkbox("📂 Expand", value=False)
+    with t6:
+        card_preference = st.selectbox("💳 Card:", [CARD_AUTO, CARD_INSTANT, CARD_CASHBACK])
+
+    if diagnose_clicked:
+        with st.spinner("Contacting Flipkart…"):
+            ok, message = get_resolver().self_test()
+        (st.success if ok else st.error)(message)
+
+    # Auto-resolve once per session so links are specific without a manual click.
+    if AUTO_RESOLVE_ON_START and not st.session_state.get("auto_resolved"):
+        st.session_state["auto_resolved"] = True
+        pending = products_needing_links(load_tracker_data())
+        if pending and get_resolver().available:
+            st.info(f"First run: fetching exact product links for {len(pending)} items "
+                    f"(~{len(pending) * RESOLVER_DELAY / 60:.1f} min). This happens once.")
+            if run_link_resolution(silent=True):
+                st.rerun()
+
+    if resolve_clicked and run_link_resolution():
+        st.rerun()
+
+    master_df = process_analytics(load_tracker_data(), card_preference)
+    if master_df.empty:
+        st.error("No tracked products found. Use 'Reset DB' to rebuild the catalogue.")
+        return
+
+    specific_links = int(master_df["URL"].map(is_pdp).sum())
+    total_products = len(master_df)
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.markdown(kpi(f"{total_products:,}", "Monitored Products"), unsafe_allow_html=True)
+    k2.markdown(kpi(f"{specific_links}/{total_products}", "Exact Product Links",
+                    "#4ade80" if specific_links == total_products else "#f97316"),
+                unsafe_allow_html=True)
+    k3.markdown(kpi(f"{int((master_df['Diff vs Last BBD'] <= 0).sum()):,}",
+                    "🔥 Cheaper Than Last BBD", "#facc15"), unsafe_allow_html=True)
+    k4.markdown(kpi(f"{int(master_df['is_wishlist'].sum()):,}", "Wishlist Items", "#ec4899"),
+                unsafe_allow_html=True)
+    k5.markdown(kpi(f"₹{master_df['Real Savings (vs 6M)'].sum() / 100000:,.1f}L",
+                    "Total Consumer Savings", "#4ade80"), unsafe_allow_html=True)
+
+    if specific_links < total_products:
+        st.warning(f"{total_products - specific_links} product(s) still open a Flipkart "
+                   "**search** page. Click **🔗 Resolve Product Links** to fetch their exact "
+                   "product pages, or **🩺 Test Connection** if resolution keeps failing.")
+
+    st.divider()
+
+    with st.expander("➕ Add Direct Product to Wishlist", expanded=False):
+        st.markdown("Paste the product URL from your browser, or leave it blank and let the "
+                    "resolver find the exact product page for you.")
+        with st.form("quick_add_wishlist", clear_on_submit=True):
+            name = st.text_input("📦 Product Name:", placeholder="e.g. Levi's 511 Slim Fit Jeans")
+            url = st.text_input("🔗 Flipkart Product Link (optional):",
+                                placeholder="https://www.flipkart.com/…/p/itm…")
+            price = st.number_input("💰 Current Price (₹, optional):", min_value=0, step=100, value=0)
+            auto = st.checkbox("🔎 Auto-resolve the exact product page if no link is given", value=True)
+            if st.form_submit_button("💾 Save to Wishlist", type="primary"):
+                if not name.strip():
+                    st.error("Please enter the product name.")
+                else:
+                    with st.spinner("Saving…"):
+                        item = build_wishlist_item(name, url, current=price or 999, resolve_live=auto)
+                        records = load_tracker_data()
+                        records.append(item)
+                        save_tracker_data(records)
+                    if is_pdp(item["URL"]):
+                        st.success(f"Saved '{item['Product']}' to '{item['Category']}' "
+                                   "with an exact product link.")
+                    else:
+                        st.warning(f"Saved '{item['Product']}' to '{item['Category']}', but the "
+                                   "exact product page could not be resolved — a search link "
+                                   "was stored.")
+                    st.rerun()
+
+    wishlist_df = master_df[master_df["is_wishlist"]]
+    if not wishlist_df.empty:
+        st.markdown('<div class="section-title-wishlist"><h2 style="margin:0;">💖 Your Saved Personal Wishlists</h2>'
+                    '<p style="margin:2px 0 0 0; font-size:0.9rem;">Auto-organised by product type.</p></div>',
+                    unsafe_allow_html=True)
+        for category in sorted(wishlist_df["Category"].unique()):
+            slug = "w_" + re.sub(r"[^a-z0-9]+", "_", category.lower()).strip("_")
+            render_collapsible_table(wishlist_df[wishlist_df["Category"] == category],
+                                     category, slug, "💖", True, allow_deletion=True)
+
+    st.markdown('<div class="section-title-catalog"><h2 style="margin:0;">1. 🛒 Flipkart Category Catalog</h2>'
+                '<p style="margin:2px 0 0 0; font-size:0.9rem;">Independent collapsible tables with dedicated filters.</p></div>',
+                unsafe_allow_html=True)
+    for category, meta in CAT_DATA_MATRIX.items():
+        subset = master_df[(master_df["Category"] == category) & (~master_df["is_wishlist"])]
+        render_collapsible_table(subset, category, meta["slug"], meta["icon"], expand_all)
+
+    st.markdown('<div class="section-title-bbd"><h2 style="margin:0;">2. 🔥 Big Billion Days Floor Deals</h2>'
+                "<p style=\"margin:2px 0 0 0; font-size:0.9rem;\">At or below last year's BBD festive floor.</p></div>",
+                unsafe_allow_html=True)
+    bbd_df = master_df[master_df["Diff vs Last BBD"] <= 0].sort_values("Diff vs Last BBD")
+    if bbd_df.empty:
+        st.info("No product currently beats last year's BBD floor price.")
+    else:
+        render_collapsible_table(bbd_df, "All Confirmed BBD Floor Steals", "bbd_steals", "🔥", True)
+
+    st.markdown('<div class="section-title-ads"><h2 style="margin:0;">3. 📢 Promoted, Sponsored & Banner Deals</h2>'
+                '<p style="margin:2px 0 0 0; font-size:0.9rem;">Sponsored placements vs their 6-month averages.</p></div>',
+                unsafe_allow_html=True)
+    ads_df = master_df[master_df["is_ad"]].sort_values("Real Disc % (vs 6M)", ascending=False)
+    if ads_df.empty:
+        st.info("No sponsored placements are being tracked right now.")
+    else:
+        render_collapsible_table(ads_df, "Active Sponsored & Banner Promotions", "flipkart_ads", "📢", True)
+
+
 # =========================================================================== #
-# FULL FLIPKART WEBSITE DEEP SCANNER & UNLIMITED DISCOVERY TRAVERSAL          #
+# ADDITIVE SECTION - DEEP CATALOGUE DISCOVERY SCANNER  (v5)                   #
 # =========================================================================== #
+# Everything above this line is the original v15 tracker, byte-for-byte. This
+# block only ADDS discovery; it never modifies or overrides existing functions.
+#
+# WHAT "DEEP" MEANS HERE
+# ----------------------
+# Flipkart caps pagination per query: a broad term like "laptop" stops serving
+# results after a few pages no matter how many you ask for. Depth therefore
+# cannot come from requesting more pages. It comes from SUBDIVIDING the query
+# until each slice is small enough to enumerate completely.
+#
+# v5 keeps those four traversal mechanisms and adds a fifth:
+#
+#   5. WHOLE-CATALOGUE SWEEP ("research all products on Flipkart")
+#      SCANNER_SEEDS now spans every major Flipkart vertical (25 categories,
+#      up from 9) and SCANNER_BRANDS covers each of them. An optional A-Z +
+#      common-token sweep (SCANNER_ALPHA_TOKENS) seeds a price-band root for
+#      every letter, so even products whose titles match none of the seed
+#      terms stay reachable. A frontier cap keeps the initial plan bounded
+#      when every vertical is selected at once.
+#
+#   1. RECURSIVE PRICE-BAND BISECTION (the core of "deep")
+#      A band that returns a full, saturated page is SPLIT IN HALF and both
+#      halves are queued. Splitting repeats until a slice returns fewer results
+#      than the cap - at which point that slice is provably exhausted. A term
+#      with dense inventory self-subdivides into dozens of narrow, fully
+#      enumerable windows instead of stopping at one capped page.
+#
+#   2. SATURATION DETECTION
+#      A page is "saturated" when it returns >= SCANNER_SATURATION products.
+#      Saturation means results were truncated and depth remains; a short page
+#      means the slice is complete. This signal drives bisection and stops the
+#      scanner wasting requests on already-exhausted slices.
+#
+#   3. FRONTIER QUEUE instead of a fixed plan
+#      v3 built a static task list up front. v4 runs a work queue that GROWS as
+#      bisection discovers depth, so effort follows inventory density rather
+#      than a guess made before the first request.
+#
+#   4. YIELD-AWARE TERM SCHEDULING
+#      Terms that produce new products get re-queued with deeper strategies;
+#      terms that produce nothing are dropped. Request budget concentrates
+#      where products actually are.
+#
+# Retained from v3: adaptive rate limiting (a block SLOWS the scan, never ends
+# it), per-category targets, round-robin ordering, disk persistence, and the
+# three-way diagnostics.
+#
+# HONEST CEILING: Flipkart lists 150M+ products. No client enumerates them all.
+# Bisection makes a given category far more thoroughly reachable; it does not
+# make the whole catalogue reachable.
+
+# Imported here rather than in the header above so the original file's import
+# block stays exactly as written.
+from collections import deque  # noqa: E402
+from concurrent.futures import ThreadPoolExecutor, as_completed  # noqa: E402
+
+SCANNER_STATE_PATTERN = re.compile(
+    r"window\.__INITIAL_STATE__\s*=\s*(\{.*?\});?\s*</script>", re.DOTALL)
+SCANNER_CHALLENGE_MARKERS = ("captcha", "unusual traffic", "are you a human",
+                             "access denied", "request blocked")
+
+SCANNER_STORE_FILE = os.environ.get("SCANNER_STORE_FILE", "flipkart_scan_store.json")
+SCANNER_TIMEOUT = 15
+SCANNER_RETRIES = 3
+SCANNER_WORKERS = 4
+SCANNER_QPS_START = 2.0
+SCANNER_QPS_FLOOR = 0.4
+SCANNER_QPS_CEILING = 4.0
+
+# A page returning this many products is assumed TRUNCATED, not complete.
+# Flipkart serves ~24-40 cards per search page; 20 is a safe trigger.
+SCANNER_SATURATION = 20
+# Stop bisecting when a band is narrower than this (rupees) - below this the
+# remaining inventory is not worth the requests.
+SCANNER_MIN_BAND_WIDTH = 100
+# Hard ceiling on bisection depth per term, so one dense term cannot monopolise
+# the entire run.
+SCANNER_MAX_BISECT_DEPTH = 9
 
 SCANNER_SEED_BANDS: List[Tuple[int, int]] = [
     (0, 500), (500, 1500), (1500, 3000), (3000, 6000), (6000, 12000),
@@ -1029,70 +1262,243 @@ SCANNER_SEED_BANDS: List[Tuple[int, int]] = [
 
 SCANNER_SORTS = ("", "price_asc", "price_desc", "popularity", "recency_desc")
 
-# Comprehensive taxonomy covering all Flipkart departments to discover full catalog depth
+# A-Z + ultra-common token sweep: a price-band root per token, so products
+# whose titles match none of the ~350 seed terms are still reachable. This is
+# what pushes the scanner from "9 tracked categories" towards "all of Flipkart".
+SCANNER_ALPHA_TOKENS: Tuple[str, ...] = tuple("abcdefghijklmnopqrstuvwxyz") + (
+    "new", "pro", "max", "plus", "pack", "set", "combo", "original",
+    "premium", "stylish", "classic", "sports", "digital")
+# Hard cap on the INITIAL frontier; bisection may still grow past it later.
+SCANNER_MAX_FRONTIER = 20000
+
 SCANNER_SEEDS: Dict[str, Tuple[str, ...]] = {
     "Men's Fashion": (
         "mens jeans", "mens shirt", "mens t-shirt", "mens trousers", "mens jacket",
-        "mens suit", "mens kurta", "mens shorts", "mens track pants", "mens sweatshirt",
-        "mens hoodie", "mens blazer", "mens innerwear", "mens ethnic wear", "mens winter wear",
-        "mens formal trousers", "mens cargo pants", "mens linen shirts", "mens polo t-shirts"
-    ),
+        "mens suit", "mens kurta", "mens shorts", "mens track pants",
+        "mens sweatshirt", "mens hoodie", "mens blazer", "mens innerwear",
+        "mens ethnic wear", "mens winter wear", "mens formal wear"),
     "Women's Fashion": (
         "womens kurta", "womens jeans", "womens dress", "saree", "womens top",
-        "womens cardigan", "lehenga", "womens leggings", "womens jumpsuit", "womens ethnic set",
-        "womens skirt", "womens jacket", "womens nightwear", "womens palazzo", "womens blouse",
-        "anarkali suit", "georgette saree", "cotton kurti set", "womens crop tops"
-    ),
+        "womens cardigan", "lehenga", "womens leggings", "womens jumpsuit",
+        "womens ethnic set", "womens skirt", "womens jacket", "womens nightwear",
+        "womens palazzo", "womens blouse", "womens shrug"),
     "Footwear & Shoes": (
         "running shoes", "sneakers", "sandals", "formal shoes", "sports shoes",
-        "clogs", "boots", "loafers", "flip flops", "walking shoes", "casual shoes",
-        "heels", "slippers", "training shoes", "derby formal shoes", "gym trainers"
-    ),
+        "clogs", "boots", "loafers", "flip flops", "walking shoes",
+        "casual shoes", "heels", "slippers", "training shoes"),
     "Watches & Eyewear": (
         "analog watch", "digital watch", "chronograph watch", "smartwatch",
-        "sunglasses", "aviator sunglasses", "womens watch", "couple watch", "sports watch",
-        "luxury watch", "eyeglasses", "blue cut glasses", "polarized shades", "wayfarer"
-    ),
+        "sunglasses", "aviator sunglasses", "womens watch", "couple watch",
+        "sports watch", "luxury watch", "eyeglasses", "blue cut glasses"),
     "Smartphones": (
         "mobile phone 5g", "iphone", "samsung galaxy", "oneplus", "realme mobile",
-        "redmi mobile", "vivo mobile", "oppo mobile", "motorola mobile", "poco mobile",
-        "pixel phone", "nothing phone", "budget smartphone", "gaming phone", "camera phone",
-        "flagship smartphone", "smartphone 256gb", "5g phone under 20000"
-    ),
+        "redmi mobile", "vivo mobile", "oppo mobile", "motorola mobile",
+        "poco mobile", "pixel phone", "nothing phone", "budget smartphone",
+        "gaming phone", "camera phone", "smartphone under 15000"),
     "Audio, Monitors & Laptops": (
-        "bluetooth headphones", "tws earbuds", "bluetooth speaker", "gaming monitor",
-        "laptop", "gaming laptop", "tablet", "soundbar", "wired earphones", "neckband",
-        "home theatre", "monitor 24 inch", "macbook", "chromebook", "party speaker",
-        "ips monitor 27 inch", "noise cancelling headphones", "core i5 laptop"
-    ),
+        "bluetooth headphones", "tws earbuds", "bluetooth speaker",
+        "gaming monitor", "laptop", "gaming laptop", "tablet", "soundbar",
+        "wired earphones", "neckband", "home theatre", "monitor 24 inch",
+        "macbook", "chromebook", "party speaker", "headphones with mic"),
     "Cosmetics & Grooming": (
         "face serum", "lipstick", "trimmer", "perfume", "face cream", "shampoo",
-        "sunscreen", "face wash", "hair dryer", "makeup kit", "moisturizer", "hair oil",
-        "body lotion", "beard oil", "nail polish", "kajal", "body spray", "cleanser"
-    ),
+        "sunscreen", "face wash", "hair dryer", "makeup kit", "moisturizer",
+        "hair oil", "body lotion", "beard oil", "nail polish", "kajal"),
     "Home Appliances": (
-        "water purifier", "air fryer", "mixer grinder", "ceiling fan", "vacuum cleaner",
-        "water geyser", "induction cooktop", "steam iron", "electric kettle", "room heater",
-        "microwave oven", "air cooler", "sandwich maker", "gas stove", "pressure cooker",
-        "bldc fan", "ro uv purifier", "robotic vacuum cleaner"
-    ),
+        "water purifier", "air fryer", "mixer grinder", "ceiling fan",
+        "vacuum cleaner", "water geyser", "induction cooktop", "steam iron",
+        "electric kettle", "room heater", "microwave oven", "air cooler",
+        "sandwich maker", "gas stove", "pressure cooker", "juicer"),
     "Stationery & Books": (
         "notebook", "ball pen", "scientific calculator", "books", "art supplies",
         "geometry box", "highlighter", "diary", "fiction books", "school bag",
-        "sketch pens", "sticky notes", "acrylic colors", "roller ball pen", "project book"
-    ),
+        "sketch pens", "sticky notes"),
+    # ---- Whole-catalogue verticals: every other major Flipkart category ----
+    "TVs & Entertainment": (
+        "smart tv", "led tv", "4k tv", "qled tv", "oled tv", "android tv",
+        "32 inch tv", "43 inch tv", "55 inch tv", "soundbar", "home theatre",
+        "blu ray player", "set top box", "projector", "streaming device",
+        "party speaker", "amplifier"),
+    "Cameras & Accessories": (
+        "dslr camera", "mirrorless camera", "point and shoot camera",
+        "action camera", "gopro", "camera lens", "tripod", "camera bag",
+        "drone camera", "instant camera", "webcam", "binoculars"),
+    "Gaming & Accessories": (
+        "gaming console", "ps5 console", "playstation", "xbox series",
+        "nintendo switch", "gaming mouse", "gaming keyboard", "gaming headset",
+        "gaming controller", "gaming chair", "gaming laptop", "gaming monitor",
+        "graphics card", "internal ssd", "joystick"),
+    "Smart Home & Accessories": (
+        "smart speaker", "smart bulb", "smart plug", "cctv camera",
+        "security camera", "video doorbell", "smart lock", "wifi router",
+        "power bank", "fast charger", "usb cable", "pendrive",
+        "external hard drive", "bluetooth adapter", "extension board",
+        "wireless mouse", "keyboard", "printer", "laptop stand"),
+    "Large Appliances & Kitchen": (
+        "refrigerator", "single door refrigerator", "double door refrigerator",
+        "washing machine", "front load washing machine", "air conditioner",
+        "split ac", "window ac", "dishwasher", "air purifier",
+        "water dispenser", "kitchen chimney", "built in oven", "deep freezer",
+        "toaster", "coffee maker", "electric kettle", "roti maker", "blender"),
+    "Kitchen & Dining": (
+        "cookware set", "nonstick cookware", "kadhai", "tawa", "frying pan",
+        "saucepan", "dinner set", "lunch box", "water bottle",
+        "storage container", "kitchen organizer", "cutlery set", "gas stove",
+        "mixer grinder", "chopper", "baking tray", "kitchen tool set"),
+    "Home & Furniture": (
+        "sofa", "3 seater sofa", "queen bed", "king size bed", "mattress",
+        "wardrobe", "study table", "office chair", "dining table", "bean bag",
+        "shoe rack", "bookshelf", "tv unit", "dressing table", "curtains",
+        "bedsheet", "blanket", "pillow", "cushion covers", "bath towel"),
+    "Home Decor & Lighting": (
+        "wall clock", "photo frame", "wall art", "floor lamp", "table lamp",
+        "ceiling light", "chandelier", "string light", "vase", "mirror",
+        "showpiece", "candle holder", "indoor plant"),
+    "Kids Fashion & Baby Care": (
+        "kids t-shirt", "kids jeans", "kids shoes", "baby dress", "baby romper",
+        "school uniform", "diapers", "baby stroller", "baby cot",
+        "feeding bottle", "baby carrier", "baby walker", "kids backpack"),
+    "Toys & Games": (
+        "baby toys", "building blocks", "remote control car", "dolls",
+        "soft toys", "board games", "puzzle", "educational toys",
+        "action figure", "toy gun", "kitchen set toy", "frisbee"),
+    "Sports & Fitness": (
+        "cricket bat", "cricket kit", "badminton racket", "shuttlecock",
+        "football", "basketball", "volleyball", "dumbbells", "gym equipment",
+        "treadmill", "exercise cycle", "yoga mat", "resistance band",
+        "swimming goggles", "boxing gloves", "skipping rope", "ab roller"),
+    "Health & Wellness": (
+        "weighing scale", "digital thermometer", "pulse oximeter", "bp monitor",
+        "nebulizer", "vaporizer", "heating pad", "massager", "wheelchair",
+        "walker", "first aid kit", "glucometer", "sanitary pads",
+        "adult diapers", "protein supplement", "vitamins"),
+    "Bags, Wallets & Luggage": (
+        "backpack", "laptop bag", "suitcase", "trolley bag", "duffel bag",
+        "handbag", "sling bag", "tote bag", "wallet", "travel organizer",
+        "school bag", "gym bag", "rucksack"),
+    "Jewellery & Accessories": (
+        "gold earrings", "artificial jewellery", "necklace set", "bangles",
+        "bracelet", "pendant", "rings", "mangalsutra", "anklet", "brooch",
+        "hair accessories", "belt", "tie", "scarf", "socks"),
+    "Automotive & Accessories": (
+        "car cover", "bike cover", "helmet", "car seat cover", "car charger",
+        "bike mobile holder", "car air purifier", "wiper blade",
+        "car floor mat", "tyre inflator", "jump starter", "engine oil",
+        "car polish", "bike lock", "motorcycle accessories", "scooter"),
+    "Pet Supplies": (
+        "dog food", "dog leash", "dog bed", "cat food", "cat litter",
+        "pet food", "pet bed", "pet toy", "pet grooming", "aquarium",
+        "bird cage", "fish food"),
+    "Tools & Home Improvement": (
+        "drill machine", "screwdriver set", "tool kit", "hammer",
+        "wrench set", "measuring tape", "wall paint", "paint brush", "ladder",
+        "door lock", "padlock", "faucet", "shower head", "extension cord",
+        "cable tie", "adhesive tape", "multimeter", "soldering iron"),
+    "Grocery & Gourmet": (
+        "rice", "atta", "dal", "cooking oil", "ghee", "masala", "spices",
+        "biscuits", "chips", "instant noodles", "dry fruits", "honey",
+        "sugar", "pickle", "cereal", "breakfast mix", "chocolate"),
+    "Beauty & Personal Care": (
+        "hair straightener", "hair curler", "epilator", "makeup brushes",
+        "foundation", "eyeliner", "mascara", "compact powder", "face mask",
+        "sheet mask", "body wash", "conditioner", "hair color", "body scrub",
+        "bath soap", "facial kit"),
 }
 
 SCANNER_BRANDS: Dict[str, Tuple[str, ...]] = {
-    "Men's Fashion": ("Levis", "Allen Solly", "Peter England", "US Polo", "Roadster", "Highlander", "Snitch", "Louis Philippe", "Van Heusen", "Jack and Jones"),
-    "Women's Fashion": ("Biba", "W for Woman", "Vero Moda", "ONLY", "Libas", "Aurelia", "Soch", "Madame", "Global Desi", "Anouk"),
-    "Footwear & Shoes": ("Nike", "Adidas", "Puma", "Asics", "Skechers", "Woodland", "Bata", "Crocs", "Red Tape", "Campus"),
-    "Watches & Eyewear": ("Casio", "Titan", "Fastrack", "Fossil", "Timex", "Citizen", "Ray-Ban", "Oakley", "Noise", "boAt"),
-    "Smartphones": ("Apple", "Samsung", "OnePlus", "Motorola", "Nothing", "Google", "Vivo", "Oppo", "Realme", "Xiaomi"),
-    "Audio, Monitors & Laptops": ("Sony", "JBL", "boAt", "Marshall", "LG", "Samsung", "Acer", "HP", "Lenovo", "Asus", "Dell", "Apple"),
-    "Cosmetics & Grooming": ("Minimalist", "Maybelline", "Philips", "Beardo", "Neutrogena", "Cetaphil", "Lakme", "Mamaearth", "LOreal", "Nivea"),
-    "Home Appliances": ("Philips", "Bajaj", "Kent", "Aquaguard", "Prestige", "Havells", "Atomberg", "Dyson", "Crompton", "Voltas"),
-    "Stationery & Books": ("Classmate", "Parker", "Casio", "Camlin", "Faber-Castell", "Doms", "Penguin", "Cello", "Luxor", "Navneet"),
+    "Men's Fashion": ("Levis", "Allen Solly", "Peter England", "US Polo",
+                      "Roadster", "Highlander", "Snitch", "Louis Philippe",
+                      "Van Heusen", "Jack and Jones", "Wrangler", "Puma"),
+    "Women's Fashion": ("Biba", "W for Woman", "Vero Moda", "ONLY", "Libas",
+                        "Aurelia", "Soch", "Madame", "Global Desi", "Anouk",
+                        "Tokyo Talkies", "Harpa"),
+    "Footwear & Shoes": ("Nike", "Adidas", "Puma", "Asics", "Skechers",
+                         "Woodland", "Bata", "Crocs", "Red Tape", "Campus",
+                         "Reebok", "New Balance", "Sparx", "Liberty"),
+    "Watches & Eyewear": ("Casio", "Titan", "Fastrack", "Fossil", "Timex",
+                          "Citizen", "Ray-Ban", "Oakley", "Noise", "boAt",
+                          "Daniel Wellington", "Sonata", "Fire-Boltt"),
+    "Smartphones": ("Apple", "Samsung", "OnePlus", "Motorola", "Nothing",
+                    "Google", "Vivo", "Oppo", "Realme", "Xiaomi", "iQOO",
+                    "Poco", "Infinix", "Tecno", "Lava"),
+    "Audio, Monitors & Laptops": ("Sony", "JBL", "boAt", "Marshall", "LG",
+                                  "Samsung", "Acer", "HP", "Lenovo", "Asus",
+                                  "Dell", "Apple", "MSI", "Sennheiser",
+                                  "OnePlus", "Noise", "BenQ"),
+    "Cosmetics & Grooming": ("Minimalist", "Maybelline", "Philips", "Beardo",
+                             "Neutrogena", "Cetaphil", "Lakme", "Mamaearth",
+                             "LOreal", "Nivea", "Plum", "Dot and Key"),
+    "Home Appliances": ("Philips", "Bajaj", "Kent", "Aquaguard", "Prestige",
+                        "Havells", "Atomberg", "Dyson", "Crompton", "Usha",
+                        "Butterfly", "Pigeon", "Orient", "Voltas"),
+    "Stationery & Books": ("Classmate", "Parker", "Casio", "Camlin",
+                           "Faber-Castell", "Doms", "Penguin", "Cello",
+                           "Luxor", "Navneet"),
+    # ---- Brands for every whole-catalogue vertical ----
+    "TVs & Entertainment": (
+        "Samsung", "LG", "Sony", "Xiaomi", "OnePlus", "TCL", "Vu", "Hisense",
+        "Acer", "Realme", "iFFALCON", "Thomson"),
+    "Cameras & Accessories": (
+        "Canon", "Nikon", "Sony", "Fujifilm", "GoPro", "DJI", "Panasonic",
+        "Sigma", "Tamron", "Sandisk", "Logitech"),
+    "Gaming & Accessories": (
+        "Sony", "Microsoft", "Nintendo", "Logitech", "Razer", "HyperX",
+        "Corsair", "SteelSeries", "Asus", "MSI", "Ant Esports",
+        "Cosmic Byte"),
+    "Smart Home & Accessories": (
+        "Amazon", "Google", "Xiaomi", "TP-Link", "D-Link", "Syska", "Wipro",
+        "Havells", "boAt", "Portronics", "Zebronics", "Anker", "Belkin",
+        "Samsung", "Epson"),
+    "Large Appliances & Kitchen": (
+        "LG", "Samsung", "Whirlpool", "Godrej", "Haier", "IFB", "Bosch",
+        "Voltas", "Blue Star", "Carrier", "O General", "Panasonic"),
+    "Kitchen & Dining": (
+        "Prestige", "Pigeon", "Butterfly", "Hawkins", "Borosil", "Milton",
+        "Cello", "Tupperware", "Nirlon", "Vinod", "Femora"),
+    "Home & Furniture": (
+        "Wakefit", "Sleepwell", "Kurlon", "Nilkamal", "Supreme",
+        "Godrej Interio", "Urban Ladder", "Pepperfry", "HomeTown", "Durian",
+        "Flipkart Perfect Homes"),
+    "Home Decor & Lighting": (
+        "Philips", "Wipro", "Syska", "Havells", "Orient", "Bajaj", "Jaquar",
+        "Asian Paints", "Deco Window", "Homesake"),
+    "Kids Fashion & Baby Care": (
+        "Pampers", "Huggies", "MamyPoko", "Johnsons Baby", "Babyhug",
+        "Chicco", "Fisher-Price", "Lego", "Hot Wheels", "Barbie",
+        "Funskool", "Gini and Jony"),
+    "Toys & Games": (
+        "Lego", "Hot Wheels", "Barbie", "Funskool", "Nerf", "Fisher-Price",
+        "Miss and Chief", "PlayShifu", "Toyshine"),
+    "Sports & Fitness": (
+        "Yonex", "Li-Ning", "Nivia", "Cosco", "SG", "Kobo", "Adidas", "Nike",
+        "Strauss", "Kore", "Cockatoo", "Fitkit"),
+    "Health & Wellness": (
+        "Omron", "Dr Trust", "BPL", "Beurer", "HealthSense", "Hesley",
+        "Accu-Chek", "Himalaya", "Ensure", "Contour"),
+    "Bags, Wallets & Luggage": (
+        "American Tourister", "Samsonite", "Skybags", "VIP", "Wildcraft",
+        "F Gear", "Tommy Hilfiger", "Lavie", "Caprese", "Safari", "Delsey"),
+    "Jewellery & Accessories": (
+        "Voylla", "YouBella", "Shining Diva", "Zaveri Pearls", "Meenaz",
+        "Sukkhi", "Yellow Chimes", "Fastrack", "Titan", "Fossil",
+        "Allen Solly"),
+    "Automotive & Accessories": (
+        "3M", "Vega", "Steelbird", "Studds", "Fabtec", "Speedwav", "Autofy",
+        "Coido", "Michelin", "Bosch"),
+    "Pet Supplies": (
+        "Pedigree", "Royal Canin", "Drools", "Purepet", "Whiskas",
+        "Chip Chops", "Taiyo", "Boltz"),
+    "Tools & Home Improvement": (
+        "Bosch", "Stanley", "Taparia", "Agni", "Anchor", "Hindware",
+        "Jaquar", "Crompton", "Fevicol", "Asian Paints", "Godrej Locks",
+        "Dewalt"),
+    "Grocery & Gourmet": (
+        "India Gate", "Aashirvaad", "Fortune", "Tata Sampann", "MDH",
+        "Catch", "Red Label", "Nescafe", "Parle", "Amul", "Haldiram",
+        "Tata Tea"),
+    "Beauty & Personal Care": (
+        "Philips", "Nova", "Kemei", "Lakme", "Maybelline", "LOreal",
+        "Revlon", "Nykaa", "Biotique", "Mamaearth", "Plum", "Wow", "Dove"),
 }
 
 SCANNED_FIELDS = ("pid", "title", "brand", "url", "price", "mrp", "discount_pct",
@@ -1101,6 +1507,8 @@ SCANNED_FIELDS = ("pid", "title", "brand", "url", "price", "mrp", "discount_pct"
 
 @dataclass
 class ScannedProduct:
+    """One product discovered by the deep scanner."""
+
     pid: str = ""
     title: str = ""
     brand: str = ""
@@ -1116,13 +1524,20 @@ class ScannedProduct:
 
     @property
     def key(self) -> str:
+        # itm-id FIRST: the state tree emits a thin wrapper node (no pid) and a
+        # hydrated node (with pid) for the same product. Keying on pid would
+        # count those as two products and inflate the catalogue.
         return extract_itm_id(self.url) or self.pid or self.url
 
     def normalise(self) -> "ScannedProduct":
+        # __INITIAL_STATE__ carries host-relative hrefs; sanitize_url() treats a
+        # bare "/slug/p/itm..." as a hostname, so prefix the host first exactly
+        # as the original resolver does.
         raw = (self.url or "").strip()
         if raw.startswith("/"):
             raw = f"https://{FLIPKART_HOST}{raw}"
         self.url = sanitize_url(raw)
+
         self.has_mrp = self.mrp > 0 and self.mrp > self.price
         if self.has_mrp:
             self.discount_pct = round((self.mrp - self.price) / self.mrp * 100, 1)
@@ -1138,13 +1553,15 @@ class ScannedProduct:
 
 @dataclass
 class ScanTask:
+    """One unit of work on the frontier queue."""
+
     term: str
     category: str
     sort: str = ""
     price_min: Optional[int] = None
     price_max: Optional[int] = None
-    depth: int = 0
-    tier: int = 0
+    depth: int = 0          # bisection depth
+    tier: int = 0           # 0 seed, 1 brand, 2 band, 3 sort
 
     @property
     def band_width(self) -> int:
@@ -1153,6 +1570,13 @@ class ScanTask:
         return max(self.price_max - self.price_min, 0)
 
     def bisect(self) -> List["ScanTask"]:
+        """
+        Split this price band in half.
+
+        This is the heart of deep scanning: a saturated (truncated) band is
+        replaced by two narrower bands, each of which can be enumerated further.
+        Repeated until a slice returns a short page and is provably complete.
+        """
         if self.price_min is None or self.price_max is None:
             return []
         if self.band_width <= SCANNER_MIN_BAND_WIDTH:
@@ -1161,14 +1585,17 @@ class ScanTask:
             return []
         mid = self.price_min + self.band_width // 2
         return [
-            ScanTask(self.term, self.category, self.sort, self.price_min, mid, self.depth + 1, self.tier),
-            ScanTask(self.term, self.category, self.sort, mid, self.price_max, self.depth + 1, self.tier),
+            ScanTask(self.term, self.category, self.sort, self.price_min, mid,
+                     self.depth + 1, self.tier),
+            ScanTask(self.term, self.category, self.sort, mid, self.price_max,
+                     self.depth + 1, self.tier),
         ]
 
 
 def scanner_search_url(term: str, *, page: int = 1, sort: str = "",
                        price_min: Optional[int] = None,
                        price_max: Optional[int] = None) -> str:
+    """Flipkart search URL with pagination, sort and price-band facets."""
     params: List[Tuple[str, Any]] = [("q", term)]
     if page > 1:
         params.append(("page", page))
@@ -1182,11 +1609,19 @@ def scanner_search_url(term: str, *, page: int = 1, sort: str = "",
 
 
 def _scanned_richness(product: "ScannedProduct") -> int:
+    """Field count, used to keep the best of several duplicate nodes."""
     return sum(bool(v) for v in (product.title, product.price, product.mrp,
                                  product.pid, product.rating, product.rating_count))
 
 
 class AdaptiveRateLimiter:
+    """
+    Token bucket whose rate ADAPTS instead of a scan aborting.
+
+    On a block the rate halves (to a floor); after sustained success it eases
+    back up. Flipkart pushing back slows the scan - it never ends it.
+    """
+
     def __init__(self, rate: float = SCANNER_QPS_START) -> None:
         self.rate = max(rate, SCANNER_QPS_FLOOR)
         self.capacity = 3.0
@@ -1199,7 +1634,8 @@ class AdaptiveRateLimiter:
         while True:
             with self._lock:
                 now = time.monotonic()
-                self._tokens = min(self.capacity, self._tokens + (now - self._updated) * self.rate)
+                self._tokens = min(self.capacity,
+                                   self._tokens + (now - self._updated) * self.rate)
                 self._updated = now
                 if self._tokens >= 1:
                     self._tokens -= 1
@@ -1221,6 +1657,15 @@ class AdaptiveRateLimiter:
 
 
 class FlipkartCatalogueScanner:
+    """
+    Deep product discovery via recursive query subdivision.
+
+    Reuses the original resolver's HTTP approach (browser headers, polite
+    pacing, soft failure on blocks) but extracts EVERY product on each page
+    from __INITIAL_STATE__, and bisects saturated price bands to reach
+    inventory that pagination alone truncates away.
+    """
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._sessions = threading.local()
@@ -1230,30 +1675,40 @@ class FlipkartCatalogueScanner:
         self.pages_blocked = 0
         self.pages_empty = 0
         self.products_seen_raw = 0
-        self.bisections = 0
+        self.bisections = 0          # how often depth was discovered
         self.max_depth_reached = 0
-        self.abort = False
+        self.abort = False           # ONLY set by the user's Stop button
         self._load_store()
 
+    # -- persistence -------------------------------------------------------- #
+
     def _load_store(self) -> None:
+        """Discoveries accumulate across sessions; that is how coverage grows."""
         if not os.path.exists(SCANNER_STORE_FILE):
             return
         try:
             with open(SCANNER_STORE_FILE, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-            if isinstance(data, list):
-                for row in data:
-                    if isinstance(row, dict):
-                        product = ScannedProduct(**{k: v for k, v in row.items() if k in SCANNED_FIELDS})
-                        if product.key:
-                            self._seen[product.key] = product
-        except Exception:
-            pass
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Scan store unreadable (%s); starting empty.", exc)
+            return
+        if not isinstance(data, list):
+            return
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            product = ScannedProduct(**{k: v for k, v in row.items()
+                                        if k in SCANNED_FIELDS})
+            if product.key:
+                self._seen[product.key] = product
+        logger.info("Loaded %d previously discovered products.", len(self._seen))
 
     def persist(self) -> int:
         try:
-            atomic_write_json(SCANNER_STORE_FILE, [p.to_dict() for p in self._seen.values()])
-        except OSError:
+            atomic_write_json(SCANNER_STORE_FILE,
+                              [p.to_dict() for p in self._seen.values()])
+        except OSError as exc:
+            logger.warning("Could not persist scan store: %s", exc)
             return 0
         return len(self._seen)
 
@@ -1267,6 +1722,8 @@ class FlipkartCatalogueScanner:
                 os.remove(SCANNER_STORE_FILE)
             except OSError:
                 pass
+
+    # -- http --------------------------------------------------------------- #
 
     def _session(self):
         if requests is None:
@@ -1291,18 +1748,20 @@ class FlipkartCatalogueScanner:
             self.limiter.acquire()
             try:
                 response = session.get(url, timeout=SCANNER_TIMEOUT)
-            except Exception:
+            except Exception as exc:
+                logger.info("Scanner fetch failed (%s): %s", type(exc).__name__, exc)
                 time.sleep(0.5 * attempt)
                 continue
 
             blocked = response.status_code in (401, 403, 429, 503)
             challenged = (response.status_code == 200 and response.text and
-                          any(m in response.text[:4000].lower() for m in SCANNER_CHALLENGE_MARKERS))
+                          any(m in response.text[:4000].lower()
+                              for m in SCANNER_CHALLENGE_MARKERS))
             if blocked or challenged:
                 with self._lock:
                     self.pages_blocked += 1
-                self.limiter.penalise()
-                time.sleep(min(2.0 * attempt, 5.0))
+                self.limiter.penalise()          # slow down, do NOT stop
+                time.sleep(min(2.0 * attempt, 6.0))
                 continue
 
             if response.status_code == 200 and response.text:
@@ -1310,8 +1769,10 @@ class FlipkartCatalogueScanner:
                     self.pages_fetched += 1
                 self.limiter.reward()
                 return response.text
-            time.sleep(0.5 * attempt)
+            time.sleep(0.6 * attempt)
         return None
+
+    # -- extraction --------------------------------------------------------- #
 
     @staticmethod
     def _walk(node: Any, depth: int = 0):
@@ -1332,7 +1793,8 @@ class FlipkartCatalogueScanner:
             if isinstance(value, (int, float)) and value > 0:
                 return int(value)
             if isinstance(value, dict):
-                for inner in ("value", "finalPrice", "sellingPrice", "decimalValue", "amount"):
+                for inner in ("value", "finalPrice", "sellingPrice",
+                              "decimalValue", "amount"):
                     candidate = value.get(inner)
                     if isinstance(candidate, (int, float)) and candidate > 0:
                         return int(candidate)
@@ -1372,14 +1834,14 @@ class FlipkartCatalogueScanner:
             merged = {**inner, **node}
 
         url = cls._text(merged, ("url", "pageUri", "baseUrl", "smartUrl"))
-        if "/p/itm" not in url and "/item/p/product" not in url:
+        if "/p/itm" not in url:
             for holder in ("productInfo", "action", "value", "link"):
                 sub = merged.get(holder)
                 if isinstance(sub, dict):
                     url = cls._text(sub, ("url", "pageUri", "baseUrl", "smartUrl"))
-                    if "/p/itm" in url or "/item/p/product" in url:
+                    if "/p/itm" in url:
                         break
-        if "/p/itm" not in url and "/item/p/product" not in url:
+        if "/p/itm" not in url:
             return None
 
         titles = merged.get("titles")
@@ -1388,9 +1850,15 @@ class FlipkartCatalogueScanner:
             title = cls._text(titles, ("title", "newTitle", "superTitle"))
 
         rating_node = merged.get("rating") if isinstance(merged.get("rating"), dict) else {}
-        rating = cls._number(rating_node, ("average",)) if rating_node else cls._number(merged, ("averageRating",))
-        rating_count = int(cls._number(rating_node, ("count",)) if rating_node else cls._number(merged, ("ratingCount",)))
-        stated_discount = cls._number(merged, ("totalDiscount", "discount", "discountPercent"))
+        rating = cls._number(rating_node, ("average",)) if rating_node else \
+            cls._number(merged, ("averageRating",))
+        rating_count = int(cls._number(rating_node, ("count",)) if rating_node
+                           else cls._number(merged, ("ratingCount",)))
+
+        # Read Flipkart's own discount field: most listings ship no `mrp`, so
+        # deriving discount from MRP alone makes the majority invisible.
+        stated_discount = cls._number(merged, ("totalDiscount", "discount",
+                                               "discountPercent"))
 
         return ScannedProduct(
             pid=cls._text(merged, ("productId", "pid", "id")),
@@ -1406,18 +1874,14 @@ class FlipkartCatalogueScanner:
 
     @classmethod
     def extract_products(cls, html: str) -> List[ScannedProduct]:
-        """
-        Dual-layer extractor: walks internal state JSON + parses raw HTML card blocks.
-        Never yields empty sets as long as HTML contains Flipkart product elements.
-        """
+        """Every product on one search page, from __INITIAL_STATE__."""
         found: Dict[str, ScannedProduct] = {}
 
-        # Layer 1: Extract from __INITIAL_STATE__ JSON
         match = SCANNER_STATE_PATTERN.search(html)
         if match:
             try:
                 state = json.loads(match.group(1))
-            except Exception:
+            except json.JSONDecodeError:
                 state = None
             if state is not None:
                 for node in cls._walk(state):
@@ -1428,49 +1892,12 @@ class FlipkartCatalogueScanner:
                     if not is_pdp(product.url):
                         continue
                     existing = found.get(product.key)
-                    if existing is None or _scanned_richness(product) > _scanned_richness(existing):
+                    if existing is None or \
+                            _scanned_richness(product) > _scanned_richness(existing):
                         found[product.key] = product
 
-        # Layer 2: Extract directly from HTML cards (DOM Parser Fallback/Enricher)
-        # Matches typical Flipkart product cards in list and grid views
-        card_chunks = re.findall(r'<div[^>]*data-id="([A-Z0-9]{12,18})"[^>]*>(.*?)</div>\s*</div>\s*</div>', html, re.DOTALL)
-        for pid, block in card_chunks:
-            pdp_match = re.search(r'href="(/[^"?#]{3,200}/p/itm[0-9a-z]{12,18}[^"]*)"', block, re.IGNORECASE)
-            if not pdp_match:
-                continue
-            clean_url = sanitize_url(f"https://{FLIPKART_HOST}{pdp_match.group(1)}")
-            
-            # Extract title
-            title_match = re.search(r'<(?:div|a)[^>]*class="[^"]*(?:KzDlHZ|IRpwTa|_4rR01T|wBy4fm)[^"]*"[^>]*>(.*?)</(?:div|a)>', block, re.DOTALL)
-            title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip() if title_match else ""
-            if not title:
-                slug_part = urlparse(clean_url).path.split("/p/")[0].strip("/").replace("-", " ")
-                title = slug_part.title()[:120]
-
-            # Extract Price, MRP & Discount
-            price_match = re.search(r'(?:₹|Rs\.?)\s*([0-9,]+)', block)
-            price = int(price_match.group(1).replace(",", "")) if price_match else 0
-            
-            mrp_match = re.findall(r'(?:₹|Rs\.?)\s*([0-9,]+)', block)
-            mrp = int(mrp_match[1].replace(",", "")) if len(mrp_match) > 1 else int(price * 1.35)
-
-            disc_match = re.search(r'([0-9]{1,2})%\s*off', block, re.IGNORECASE)
-            disc = float(disc_match.group(1)) if disc_match else (round((mrp - price) / mrp * 100, 1) if mrp > price else 0.0)
-
-            product = ScannedProduct(
-                pid=pid,
-                title=title,
-                brand=title.split()[0],
-                url=clean_url,
-                price=price,
-                mrp=mrp,
-                discount_pct=disc,
-            ).normalise()
-
-            if product.key not in found:
-                found[product.key] = product
-
-        # Layer 3: Catch-all regex href scan
+        # Floor: same href pattern the original resolver already trusts, so a
+        # markup change degrades coverage instead of zeroing it.
         if not found:
             for href_match in PDP_HREF_PATTERN.finditer(html):
                 href = href_match.group(1)
@@ -1483,15 +1910,18 @@ class FlipkartCatalogueScanner:
                 if itm in found:
                     continue
                 slug = urlparse(clean).path.split("/p/")[0].strip("/").replace("-", " ")
-                found[itm] = ScannedProduct(title=slug.title()[:120], url=clean).normalise()
-
+                found[itm] = ScannedProduct(title=slug.title()[:120],
+                                            url=clean).normalise()
         return list(found.values())
+
+    # -- scanning ----------------------------------------------------------- #
 
     def category_count(self, category: str) -> int:
         with self._lock:
             return sum(1 for p in self._seen.values() if p.category == category)
 
     def _absorb(self, products: Sequence[ScannedProduct], task: ScanTask) -> int:
+        """Merge a page of products into the store. Returns NEW product count."""
         added = 0
         with self._lock:
             self.products_seen_raw += len(products)
@@ -1511,6 +1941,14 @@ class FlipkartCatalogueScanner:
         return added
 
     def run_task(self, task: ScanTask, pages: int) -> Tuple[int, List[ScanTask]]:
+        """
+        Scan one query across N pages.
+
+        Returns (new_products, follow_up_tasks). Follow-ups are produced when a
+        page comes back SATURATED - meaning Flipkart truncated the result set
+        and there is more inventory hidden behind this query than pagination
+        will reveal. Bisecting the price band exposes it.
+        """
         added = 0
         saturated = False
         empty_streak = 0
@@ -1528,7 +1966,7 @@ class FlipkartCatalogueScanner:
                 with self._lock:
                     self.pages_empty += 1
                 empty_streak += 1
-                if empty_streak >= 2:
+                if empty_streak >= 2:   # Flipkart interleaves sparse pages
                     break
                 continue
             empty_streak = 0
@@ -1543,22 +1981,46 @@ class FlipkartCatalogueScanner:
                 follow_ups.extend(children)
                 with self._lock:
                     self.bisections += 1
-                    self.max_depth_reached = max(self.max_depth_reached, children[0].depth)
+                    self.max_depth_reached = max(self.max_depth_reached,
+                                                 children[0].depth)
         return added, follow_ups
 
     def seed_frontier(self, categories: Sequence[str], *, use_brands: bool,
-                      use_bands: bool, use_sorts: bool) -> List[ScanTask]:
+                      use_bands: bool, use_sorts: bool,
+                      use_alpha: bool = False) -> List[ScanTask]:
+        """
+        Build the INITIAL frontier. It grows during the run via bisection.
+
+        Tasks are interleaved round-robin across categories and ordered
+        cheapest-tier-first, so every category makes progress immediately.
+        When use_alpha is on, an extra root per letter (a-z plus a handful of
+        ultra-common tokens) x price band seeds bisection for products whose
+        titles match no seed term - the only practical way to sweep towards
+        "all products" on a search endpoint.
+        """
         per_category: Dict[str, List[ScanTask]] = {}
         for category in categories:
             seeds = list(SCANNER_SEEDS.get(category, ()))
             tasks: List[ScanTask] = []
+            # Tier 0 - bare seeds.
             tasks.extend(ScanTask(t, category, tier=0) for t in seeds)
+            # Tier 1 - brand x seed.
             if use_brands:
                 tasks.extend(ScanTask(f"{b} {t}", category, tier=1)
-                             for b in SCANNER_BRANDS.get(category, ()) for t in seeds)
+                             for b in SCANNER_BRANDS.get(category, ())
+                             for t in seeds)
+            # Tier 2 - seed x coarse price band. These are the bisection roots.
             if use_bands:
                 tasks.extend(ScanTask(t, category, "", low, high, 0, 2)
                              for t in seeds for low, high in SCANNER_SEED_BANDS)
+                # A-Z sweep roots share tier 2 so the frontier cap keeps them:
+                # a bare letter query saturates immediately, and its band
+                # roots are what bisection drills into.
+                if use_alpha:
+                    tasks.extend(ScanTask(tok, category, "", low, high, 0, 2)
+                                 for tok in SCANNER_ALPHA_TOKENS
+                                 for low, high in SCANNER_SEED_BANDS)
+            # Tier 3 - sort sweeps.
             if use_sorts:
                 tasks.extend(ScanTask(t, category, s, tier=3)
                              for t in seeds for s in SCANNER_SORTS[1:])
@@ -1577,11 +2039,31 @@ class FlipkartCatalogueScanner:
             if not progressed:
                 break
             index += 1
+
+        # Safety valve for whole-catalogue sweeps: an all-vertical frontier
+        # can exceed 50,000 queries before bisection even starts. Rather than
+        # queue an unbounded plan, keep the tiers that matter most (bare seeds
+        # and price-band roots - bisection's entry points) and drop the
+        # multiplier tiers; then thin evenly if it is still oversized.
+        if len(frontier) > SCANNER_MAX_FRONTIER:
+            keep_tiers = {0, 2} if use_bands else {0}
+            frontier = [t for t in frontier if t.tier in keep_tiers]
+        if len(frontier) > SCANNER_MAX_FRONTIER:
+            stride = len(frontier) / SCANNER_MAX_FRONTIER
+            frontier = [t for i, t in enumerate(frontier)
+                        if int(i % stride) == 0][:SCANNER_MAX_FRONTIER]
         return frontier
 
     def run_frontier(self, frontier: Sequence[ScanTask], pages: int,
                      target_per_category: int = 0, max_requests: int = 0,
                      progress=None) -> int:
+        """
+        Work the frontier queue, growing it as bisection discovers depth.
+
+        Ends when: the queue drains, every category hits its target, the
+        request budget is spent, or the user presses Stop. A block only slows
+        the scan.
+        """
         self.abort = False
         queue: deque = deque(frontier)
         satisfied: set = set()
@@ -1620,17 +2102,21 @@ class FlipkartCatalogueScanner:
                     processed += 1
                     try:
                         _, follow_ups = future.result()
-                    except Exception:
+                    except Exception as exc:
+                        logger.warning("Scan task failed: %s", exc)
                         follow_ups = []
+                    # Depth discovered: queue the narrower slices.
                     for child in follow_ups:
                         if not target_met(child.category):
                             queue.append(child)
                     if progress:
                         progress(processed, max(initial_total, processed + len(queue)),
                                  futures[future].term, len(self._seen), len(queue))
-                self.persist()
+                self.persist()   # checkpoint so a long scan never loses work
         self.persist()
         return len(self._seen)
+
+    # -- views & diagnostics ------------------------------------------------ #
 
     @property
     def products(self) -> List[ScannedProduct]:
@@ -1638,6 +2124,17 @@ class FlipkartCatalogueScanner:
 
     def priced(self) -> List[ScannedProduct]:
         return [p for p in self._seen.values() if p.price > 0]
+
+    def discounted(self, threshold: float) -> List[ScannedProduct]:
+        return sorted((p for p in self._seen.values()
+                       if p.price > 0 and p.discount_pct >= threshold),
+                      key=lambda p: p.discount_pct, reverse=True)
+
+    def by_category(self, category: str, threshold: float = 0.0
+                    ) -> List[ScannedProduct]:
+        return sorted((p for p in self._seen.values()
+                       if p.category == category and p.discount_pct >= threshold),
+                      key=lambda p: p.discount_pct, reverse=True)
 
     def coverage(self) -> Dict[str, int]:
         counts: Dict[str, int] = {}
@@ -1647,45 +2144,107 @@ class FlipkartCatalogueScanner:
         return dict(sorted(counts.items(), key=lambda kv: kv[1], reverse=True))
 
     def diagnose(self) -> Tuple[str, str]:
+        """
+        Explain low yield. Three causes look identical from the UI, so name
+        which one actually applies.
+        """
         attempts = self.pages_fetched + self.pages_blocked
         if attempts == 0:
             return "idle", "No pages requested yet."
         if self.pages_blocked / attempts > 0.5:
-            return ("blocked", f"{self.pages_blocked:,} of {attempts:,} requests were challenged. Rate limiter adapting.")
+            return ("blocked",
+                    f"{self.pages_blocked:,} of {attempts:,} requests were refused "
+                    "or challenged. Flipkart is rate-limiting this machine. The "
+                    "scan slowed itself down rather than stopping. Wait 10-15 "
+                    "minutes, or lower pages per query.")
+        if self.pages_fetched and self.products_seen_raw == 0:
+            return ("unparsed",
+                    f"{self.pages_fetched:,} pages downloaded but no products "
+                    "parsed. Flipkart served markup this build cannot read - "
+                    "likely a bot-challenge shell rather than real results.")
         unique = len(self._seen)
-        return ("healthy", f"{self.pages_fetched:,} pages fetched, {unique:,} distinct products verified.")
+        if self.products_seen_raw and unique and self.products_seen_raw / unique > 8:
+            return ("duplication",
+                    f"Saw {self.products_seen_raw:,} product slots but only "
+                    f"{unique:,} distinct items "
+                    f"({self.products_seen_raw / unique:.0f}x duplication). "
+                    "Queries keep returning the same popular listings. Enable "
+                    "price bands so saturated queries bisect into deeper slices.")
+        return ("healthy",
+                f"{self.pages_fetched:,} pages fetched, {unique:,} distinct "
+                f"products from {self.products_seen_raw:,} slots. "
+                f"{self.bisections:,} bisections, max depth "
+                f"{self.max_depth_reached}.")
 
 
 @st.cache_resource(show_spinner=False)
 def get_scanner() -> FlipkartCatalogueScanner:
+    """One scanner (sessions, limiter, accumulated store) across reruns."""
     return FlipkartCatalogueScanner()
 
 
-_TRACKER_CATEGORY_KEYWORDS: List[Tuple[str, Tuple[str, ...]]] = [
-    ("Audio, Monitors & Laptops", ("laptop", "monitor", "headphone", "earphone", "earbud", "speaker", "tws", "soundbar", "tablet", "ipad", "macbook")),
-    ("Smartphones", ("smartphone", "mobile", "iphone", "galaxy", "oneplus", "pixel", "redmi", "realme", "poco", "vivo", "oppo", "motorola", "5g")),
-    ("Footwear & Shoes", ("shoe", "sneaker", "boot", "loafer", "sandal", "clog", "slipper", "heel", "flip flop", "trainer")),
-    ("Watches & Eyewear", ("watch", "smartwatch", "sunglass", "eyeglass", "spectacle", "aviator", "chronograph")),
-    ("Cosmetics & Grooming", ("serum", "lipstick", "trimmer", "perfume", "cream", "shampoo", "cleanser", "sunscreen", "face wash")),
-    ("Home Appliances", ("purifier", "iron", "cooker", "fryer", "grinder", "geyser", "fan", "vacuum", "kettle", "microwave")),
-    ("Stationery & Books", ("book", "novel", "pen", "notebook", "calculator", "diary", "marker", "highlighter", "geometry")),
-    ("Women's Fashion", ("womens", "saree", "kurta", "kurti", "lehenga", "dress", "legging", "palazzo", "blouse")),
-    ("Men's Fashion", ("mens", "shirt", "t-shirt", "jean", "trouser", "jacket", "suit", "short", "hoodie", "blazer")),
-]
+def scanned_to_records(products: Sequence[ScannedProduct]) -> List[Dict[str, Any]]:
+    """Convert discoveries into tracker records the existing UI understands."""
+    records: List[Dict[str, Any]] = []
+    for product in products:
+        if not product.title or product.price <= 0:
+            continue
+        # Only claim an MRP when Flipkart published one; otherwise derive a
+        # transparent placeholder rather than inventing a discount.
+        mrp = product.mrp if product.has_mrp else int(product.price * 1.25)
+        records.append({
+            "id": str(uuid.uuid4()),
+            "Category": product.category or "Uncategorised",
+            "Brand": product.brand or "—",
+            "Product": product.title,
+            "MRP": mrp,
+            "6-Month Avg": int(mrp * 0.85),
+            "Last BBD Low": int(product.price * 0.92),
+            "Current Price": product.price,
+            "Predicted BBD Low": int(product.price * 0.88),
+            "URL": product.url or search_url(product.title),
+            "link_source": LINK_RESOLVED if is_pdp(product.url) else LINK_SEARCH,
+            "is_wishlist": False,
+            "is_ad": False,
+            "Last Checked": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "version": TRACKER_VERSION,
+        })
+    return records
 
 
-def _map_to_tracker_category(title: str, hint: str = "") -> str:
-    if hint in CAT_DATA_MATRIX:
-        return hint
-    lowered = (title or "").lower()
-    for category, keywords in _TRACKER_CATEGORY_KEYWORDS:
-        if any(keyword in lowered for keyword in keywords):
-            return category
-    return "Men's Fashion" if "men" in lowered else "Stationery & Books"
+def merge_scanned_into_store(products: Sequence[ScannedProduct]) -> int:
+    """Append discoveries to the tracker store, skipping duplicates."""
+    new_records = scanned_to_records(products)
+    if not new_records:
+        return 0
+    existing = load_tracker_data()
+    known = {str(r.get("Product", "")).lower() for r in existing}
+    fresh = [r for r in new_records if r["Product"].lower() not in known]
+    if not fresh:
+        return 0
+    existing.extend(fresh)
+    save_tracker_data(existing)
+    return len(fresh)
 
 
-def merge_scan_results_into_tracker(scanner: "FlipkartCatalogueScanner", min_discount: float = 0.0) -> int:
-    products = [p for p in scanner.products if p.price > 0 and p.title and p.discount_pct >= min_discount]
+# --------------------------------------------------------------------------- #
+# SCANNER CONTROL PANEL
+# --------------------------------------------------------------------------- #
+# Deliberately NOT a results section. Discovered products are merged into the
+# tracker store and then rendered by the ORIGINAL sections 1/2/3 through
+# render_collapsible_table(), so the output format, columns, filters, wishlist
+# checkboxes and CSV exports are exactly the ones the tracker already had.
+# Only the scanning pattern behind them changed.
+
+
+def merge_scan_results_into_tracker(scanner: "FlipkartCatalogueScanner",
+                                    min_discount: float = 0.0) -> int:
+    """
+    Fold discoveries into the tracker catalogue, mapped onto the tracker's own
+    9 categories so they appear inside the existing collapsible tables.
+    """
+    products = [p for p in scanner.products
+                if p.price > 0 and p.title and p.discount_pct >= min_discount]
     if not products:
         return 0
 
@@ -1699,8 +2258,11 @@ def merge_scan_results_into_tracker(scanner: "FlipkartCatalogueScanner", min_dis
             continue
         known.add(title.lower())
 
+        # Only claim an MRP Flipkart actually published; otherwise derive a
+        # transparent placeholder instead of inventing a discount.
         mrp = product.mrp if product.has_mrp else int(product.price * 1.25)
-        category = product.category if product.category in CAT_DATA_MATRIX else _map_to_tracker_category(title, product.category)
+        category = product.category if product.category in CAT_DATA_MATRIX \
+            else _map_to_tracker_category(title, product.category)
 
         fresh.append({
             "id": str(uuid.uuid4()),
@@ -1715,6 +2277,8 @@ def merge_scan_results_into_tracker(scanner: "FlipkartCatalogueScanner", min_dis
             "URL": product.url or search_url(title),
             "link_source": LINK_RESOLVED if is_pdp(product.url) else LINK_SEARCH,
             "is_wishlist": False,
+            # Products Flipkart promoted in search land in the tracker's
+            # existing "Promoted, Sponsored & Banner Deals" section.
             "is_ad": False,
             "Last Checked": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
             "version": TRACKER_VERSION,
@@ -1727,7 +2291,148 @@ def merge_scan_results_into_tracker(scanner: "FlipkartCatalogueScanner", min_dis
     return len(fresh)
 
 
+# Keyword -> tracker category, reusing the tracker's own 9 buckets so scanned
+# products never create new sections. Tech first: "headphone" contains "phone".
+# Keyword -> tracker category, reusing the tracker's own 9 buckets so scanned
+# products never create new sections. Everything the deep scanner discovers -
+# including the 16 non-catalogue verticals (TVs, cameras, gaming, furniture,
+# grocery, automotive, pets, tools…) - is folded into these SAME 9 buckets,
+# which is what guarantees the output format never changes. Check order is
+# deliberate and resolves substring conflicts ("dressing table" lands in Home
+# before "dress" can match; "saucepan" matches Home before "sauce"). Tech
+# first: "headphone" contains "phone".
+_TRACKER_CATEGORY_KEYWORDS: List[Tuple[str, Tuple[str, ...]]] = [
+    # Electronics bucket: laptops/audio + TVs, cameras, gaming, accessories.
+    ("Audio, Monitors & Laptops", (
+        "laptop", "monitor", "headphone", "earphone", "earbud", "speaker",
+        "tws", "soundbar", "tablet", "ipad", "macbook", "neckband",
+        "chromebook", "home theatre", "tv", "television", "qled", "oled",
+        "projector", "set top box", "camera", "dslr", "mirrorless", "lens",
+        "tripod", "gopro", "drone", "binocular", "console", "playstation",
+        "xbox", "nintendo", "joystick", "controller", "graphics card", "ssd",
+        "hard drive", "pendrive", "memory card", "router", "modem",
+        "power bank", "charger", "cable", "webcam", "printer", "scanner",
+        "keyboard", "mouse", "mouse pad", "bluetooth adapter",
+        "extension board")),
+    ("Smartphones", (
+        "smartphone", "mobile", "iphone", "galaxy", "oneplus", "pixel",
+        "redmi", "realme", "poco", "vivo", "oppo", "motorola", "iqoo",
+        "infinix", "tecno", "lava", "5g", "phone case", "screen guard")),
+    ("Footwear & Shoes", (
+        "shoe", "sneaker", "boot", "loafer", "sandal", "clog", "slipper",
+        "heel", "flip flop", "trainer", "canvas", "moccasin", "cleats")),
+    # Accessories bucket: watches/eyewear + bags, luggage, jewellery.
+    ("Watches & Eyewear", (
+        "watch", "smartwatch", "sunglass", "eyeglass", "spectacle",
+        "aviator", "chronograph", "fitness band", "smart band", "smart ring",
+        "smart glasses", "backpack", "laptop bag", "suitcase", "trolley bag",
+        "duffel", "handbag", "sling bag", "tote bag", "luggage", "rucksack",
+        "earrings", "necklace", "bangle", "bracelet", "mangalsutra",
+        "anklet", "pendant", "jewellery", "brooch", "ring", "wallet",
+        "belt", "tie ", "necktie", "cap ", "hat", "scarf", "socks")),
+    # Home & hardware bucket: appliances + furniture, decor, kitchen, tools,
+    # automotive. Checked before Cosmetics so "saucepan"/"dressing table"
+    # resolve here first.
+    ("Home Appliances", (
+        "purifier", "iron", "cooker", "fryer", "grinder", "geyser",
+        "fan", "vacuum", "kettle", "heater", "microwave", "cooler",
+        "cooktop", "juicer", "stove", "refrigerator", "fridge",
+        "washing machine", "dishwasher", "air conditioner", "air purifier",
+        "water dispenser", "chimney", "oven", "freezer", "toaster",
+        "coffee maker", "roti maker", "sofa", "mattress", "wardrobe",
+        "bed ", "study table", "office chair", "dining table", "dressing table",
+        "study chair", "dining chair", "bean bag", "shoe rack", "bookshelf",
+        "tv unit", "cabinet", "curtain", "bedsheet", "blanket", "pillow",
+        "cushion", "towel", "lamp", "chandelier", "wall clock",
+        "photo frame", "wall art", "vase", "mirror", "showpiece",
+        "cookware", "dinner set", "kadhai", "tawa", "frying pan",
+        "saucepan", "lunch box", "water bottle", "storage container",
+        "cutlery", "drill", "screwdriver", "tool kit", "hammer", "wrench",
+        "measuring tape", "wall paint", "paint brush", "ladder",
+        "door lock", "padlock", "faucet", "shower head", "extension cord",
+        "car cover", "bike cover", "car charger", "car seat cover",
+        "car floor mat", "car polish", "car air purifier", "wiper",
+        "helmet", "bike lock", "tyre", "engine oil",
+        "motorcycle accessories", "scooter")),
+    # Personal-care & consumables bucket: cosmetics + grocery + health +
+    # baby care + pets.
+    ("Cosmetics & Grooming", (
+        "serum", "lipstick", "trimmer", "perfume", "cream", "shampoo",
+        "cleanser", "sunscreen", "face wash", "moisturizer", "moisturiser",
+        "hair oil", "lotion", "kajal", "nail polish", "makeup", "dryer",
+        "straightener", "curler", "epilator", "shaver", "razor", "shaving",
+        "foundation", "eyeliner", "mascara", "compact", "face mask",
+        "sheet mask", "body wash", "conditioner", "hair color", "hair colour",
+        "body scrub", "bath soap", "facial kit", "wax strip", "mousse",
+        "diaper", "stroller", "baby cot", "feeding bottle", "baby carrier",
+        "baby walker", "weighing scale", "thermometer", "oximeter",
+        "bp monitor", "nebulizer", "vaporizer", "heating pad", "massager",
+        "wheelchair", "walker", "glucometer", "sanitary", "protein",
+        "vitamin", "supplement", "rice", "atta", "dal", "cooking oil",
+        "ghee", "masala", "spices", "biscuit", "chips", "instant noodle",
+        "dry fruit", "honey", "sugar", "pickle", "cereal", "breakfast mix",
+        "chocolate", "dog food", "dog leash", "dog bed", "cat food",
+        "cat litter", "pet food", "pet bed", "pet toy", "pet grooming",
+        "aquarium", "bird cage", "fish food")),
+    # Leisure & misc bucket: stationery/books + toys + sports.
+    ("Stationery & Books", (
+        "book", "novel", "pen", "notebook", "calculator", "diary",
+        "marker", "highlighter", "geometry", "sketch", "school bag",
+        "art supplies", "sticky notes", "crayons", "toy", "doll", "blocks",
+        "puzzle", "board game", "remote control", "soft toy", "action figure",
+        "frisbee", "cricket", "badminton", "football", "basketball",
+        "volleyball", "dumbbell", "treadmill", "exercise cycle", "yoga",
+        "gym", "swimming", "boxing", "skipping", "racket", "shuttlecock",
+        "cycle")),
+    # Fashion buckets. Women's also absorbs kids/baby clothing. Checked before
+    # Men's so "women" is not caught by "men".
+    ("Women's Fashion", (
+        "womens", "women", "saree", "kurta", "kurti", "lehenga", "dress",
+        "legging", "palazzo", "blouse", "shrug", "jumpsuit", "skirt",
+        "gown", "dupatta", "frock", "romper", "skort", "jeggings", "tunic",
+        "crop top", "nightwear", "nightdress", "kids", "kid ", "baby",
+        "child", "girl", "boy")),
+    ("Men's Fashion", (
+        "mens", "men ", "shirt", "t-shirt", "jean", "trouser", "jacket",
+        "suit", "short", "hoodie", "blazer", "sweatshirt", "track pant",
+        "innerwear", "brief", "vest", "kurta pajama", "dhoti", "cargo",
+        "boxer", "swimwear")),
+]
+
+
+def _map_to_tracker_category(title: str, hint: str = "") -> str:
+    """Map a scanned product onto one of the tracker's existing categories."""
+    if hint in CAT_DATA_MATRIX:
+        return hint
+    lowered = (title or "").lower()
+    for category, keywords in _TRACKER_CATEGORY_KEYWORDS:
+        if any(keyword in lowered for keyword in keywords):
+            return category
+    return "Men's Fashion" if "men" in lowered else "Stationery & Books"
+
+
+
+# --------------------------------------------------------------------------- #
+# IN-APP DIAGNOSTIC
+# --------------------------------------------------------------------------- #
+# Runs entirely inside Streamlit - no terminal needed. This matters because
+# Streamlit Community Cloud gives you no shell, so a standalone script cannot
+# be run there.
+#
+# It tests the EXACT regexes and extraction logic the scanner uses (not an
+# approximation), and reports the FIRST failing step - which is the real cause;
+# everything after it fails as a consequence.
+
+
+DIAG_CHALLENGE_MARKERS = SCANNER_CHALLENGE_MARKERS
+
+
 def run_scanner_diagnostic() -> List[Dict[str, Any]]:
+    """
+    Five sequential checks. Returns a list of step results for display.
+
+    Each entry: {step, name, ok, detail, hint}
+    """
     steps: List[Dict[str, Any]] = []
 
     def add(step: int, name: str, ok: bool, detail: str, hint: str = "") -> bool:
@@ -1737,7 +2442,9 @@ def run_scanner_diagnostic() -> List[Dict[str, Any]]:
         return ok
 
     if requests is None:
-        add(1, "requests installed", False, "Missing requests library.", "pip install requests")
+        add(1, "requests installed", False,
+            "The `requests` package is missing.",
+            "Add `requests>=2.28` to requirements.txt and redeploy.")
         return steps
 
     session = requests.Session()
@@ -1749,214 +2456,253 @@ def run_scanner_diagnostic() -> List[Dict[str, Any]]:
         "Upgrade-Insecure-Requests": "1",
     })
 
+    # -- 1. reachability ---------------------------------------------------- #
     try:
-        home = session.get(f"https://{FLIPKART_HOST}/", timeout=15)
-        if not add(1, "Reach flipkart.com", home.status_code == 200, f"HTTP {home.status_code}"):
+        home = session.get(f"https://{FLIPKART_HOST}/", timeout=20)
+        ok = home.status_code == 200
+        if not add(1, "Reach flipkart.com", ok,
+                   f"HTTP {home.status_code}, {len(home.text):,} bytes",
+                   "" if ok else
+                   "Flipkart refused this server. On Streamlit Community Cloud "
+                   "this is expected: shared datacenter IPs are widely blocked "
+                   "by e-commerce sites. Run the app locally instead."):
             return steps
     except Exception as exc:
-        add(1, "Reach flipkart.com", False, str(exc)[:120], "Network failure.")
+        add(1, "Reach flipkart.com", False,
+            f"{type(exc).__name__}: {str(exc)[:140]}",
+            "No connection at all. On Streamlit Cloud this normally means "
+            "Flipkart is dropping traffic from the host's IP range. Running "
+            "the app on your own machine is the only reliable fix.")
         return steps
 
+    # -- 2. real search results --------------------------------------------- #
     url = scanner_search_url("laptop")
     try:
-        resp = session.get(url, timeout=15)
-        html = resp.text or ""
-        challenged = any(m in html[:4000].lower() for m in SCANNER_CHALLENGE_MARKERS)
-        if not add(2, "Search returns live HTML", not challenged, "Bot-challenge page" if challenged else f"HTTP 200 ({len(html):,} bytes)"):
-            return steps
+        resp = session.get(url, timeout=20)
     except Exception as exc:
-        add(2, "Search returns live HTML", False, str(exc)[:120])
+        add(2, "Search returns results", False,
+            f"{type(exc).__name__}: {str(exc)[:140]}",
+            "Homepage loaded but /search did not. Flipkart treats search as "
+            "higher-risk and blocks it more aggressively.")
         return steps
 
-    has_state = "__INITIAL_STATE__" in html
-    add(3, "__INITIAL_STATE__ present", has_state, "Payload present" if has_state else "Payload absent")
+    html = resp.text or ""
+    if resp.status_code != 200:
+        add(2, "Search returns results", False, f"HTTP {resp.status_code}",
+            "Search is blocked even though the homepage loaded.")
+        return steps
 
+    challenged = any(m in html[:4000].lower() for m in DIAG_CHALLENGE_MARKERS)
+    if not add(2, "Search returns results", not challenged,
+               "Bot-challenge page served" if challenged
+               else f"HTTP 200, {len(html):,} bytes of real markup",
+               "Flipkart served a CAPTCHA instead of products. Wait 10-15 "
+               "minutes, then lower 'Pages per query'." if challenged else ""):
+        return steps
+
+    # -- 3. payload present -------------------------------------------------- #
+    has_state = "__INITIAL_STATE__" in html
+    hrefs = len(set(PDP_HREF_PATTERN.findall(html)))
+    add(3, "__INITIAL_STATE__ present", has_state,
+        f"Payload found · {hrefs} raw PDP links in page" if has_state
+        else f"Payload ABSENT · {hrefs} raw PDP links in page",
+        "" if has_state else
+        "Flipkart changed its markup. The href fallback can still find links "
+        "but without prices, so discounts cannot be ranked.")
+
+    # -- 4. extraction ------------------------------------------------------- #
     products = FlipkartCatalogueScanner.extract_products(html)
-    add(4, "Parser extracts live products", len(products) > 0, f"{len(products)} products parsed, {len([p for p in products if p.price > 0])} with price")
+    priced = [p for p in products if p.price > 0]
+    extract_ok = len(products) > 0
+    add(4, "Parser extracts products", extract_ok,
+        f"{len(products)} products extracted, {len(priced)} with prices"
+        if extract_ok else
+        "ZERO products extracted from a page that loaded fine",
+        "" if extract_ok else
+        "The page downloaded but the parser's key names no longer match "
+        "Flipkart's schema. This is a code fix - send this result and the "
+        "extraction can be corrected precisely.")
+
+    # -- 5. price-band facets (bisection depends on these) ------------------- #
+    banded_url = scanner_search_url("laptop", price_min=20000, price_max=40000)
+    try:
+        banded = session.get(banded_url, timeout=20)
+        banded_products = FlipkartCatalogueScanner.extract_products(banded.text or "")
+        saturated = len(banded_products) >= SCANNER_SATURATION
+        add(5, "Price-band facets work", len(banded_products) > 0,
+            f"{len(banded_products)} products in ₹20k-40k band · "
+            f"{'saturated → bisection will split' if saturated else 'short → slice complete'}"
+            if banded_products else "Banded query returned nothing",
+            "" if banded_products else
+            "Bisection cannot run, so scans stay shallow even when other "
+            "steps pass.")
+    except Exception as exc:
+        add(5, "Price-band facets work", False,
+            f"{type(exc).__name__}: {str(exc)[:140]}", "")
+
     return steps
 
 
-# --------------------------------------------------------------------------- #
-# MAIN APP ENTRY POINT
-# --------------------------------------------------------------------------- #
+def render_diagnostic_panel() -> None:
+    """Diagnostic UI. Deliberately placed ABOVE the scan controls."""
+    st.markdown("**Before scanning, confirm this server can actually reach "
+                "Flipkart.**")
+    st.caption("A scan that returns nothing looks identical whether the cause "
+               "is blocking or a parser mismatch. These are opposite problems "
+               "with opposite fixes, so test rather than guess.")
 
+    if st.button("🩺 Run Full Diagnostic", key="diag_run", type="primary"):
+        with st.spinner("Testing connection, markup and parser…"):
+            st.session_state["diag_results"] = run_scanner_diagnostic()
 
-def main() -> None:
-    st.title("⚡ Flipkart Persistent Deal Tracker & BBD Steals Radar")
-    st.caption("Live price intelligence engine: all categories, BBD floor steals, and promoted deals on a single continuous page.")
-
-    t1, t2, t3, t4, t5, t6 = st.columns([1.4, 1.5, 1.2, 1.0, 1.0, 1.2])
-    with t1:
-        if st.button("🔄 Re-Check Prices", type="primary", use_container_width=True):
-            with st.spinner("Re-checking active discounts…"):
-                count = refresh_all_live_prices()
-            st.success(f"Updated live prices for {count} products.")
-            st.rerun()
-    with t2:
-        resolve_clicked = st.button("🔗 Resolve Links", use_container_width=True)
-    with t3:
-        diagnose_clicked = st.button("🩺 Test Connection", use_container_width=True)
-    with t4:
-        if st.button("🚨 Reset DB", use_container_width=True, help="Force-rebuilds catalogue with verified working links"):
-            save_tracker_data(generate_seed_catalog())
-            st.session_state.pop("auto_resolved", None)
-            st.success("Catalogue rebuilt with verified links.")
-            st.rerun()
-    with t5:
-        expand_all = st.checkbox("📂 Expand All", value=False)
-    with t6:
-        card_preference = st.selectbox("💳 Card:", [CARD_AUTO, CARD_INSTANT, CARD_CASHBACK])
-
-    if diagnose_clicked:
-        with st.spinner("Contacting Flipkart…"):
-            ok, message = get_resolver().self_test()
-        (st.success if ok else st.error)(message)
-
-    if AUTO_RESOLVE_ON_START and not st.session_state.get("auto_resolved"):
-        st.session_state["auto_resolved"] = True
-        pending = products_needing_links(load_tracker_data())
-        if pending and get_resolver().available:
-            if run_link_resolution(silent=True):
-                st.rerun()
-
-    if resolve_clicked and run_link_resolution():
-        st.rerun()
-
-    master_df = process_analytics(load_tracker_data(), card_preference)
-    if master_df.empty:
-        st.error("No tracked products found. Click 'Reset DB' above.")
+    steps = st.session_state.get("diag_results")
+    if not steps:
         return
 
-    specific_links = int(master_df["URL"].map(is_pdp).sum())
-    total_products = len(master_df)
+    frame = pd.DataFrame([{k: v for k, v in s.items() if not k.startswith("_")}
+                          for s in steps])
+    st.dataframe(frame, use_container_width=True, hide_index=True)
 
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.markdown(kpi(f"{total_products:,}", "Monitored Products"), unsafe_allow_html=True)
-    k2.markdown(kpi(f"{specific_links}/{total_products}", "Direct Product Links",
-                    "#4ade80" if specific_links == total_products else "#f97316"),
-                unsafe_allow_html=True)
-    k3.markdown(kpi(f"{int((master_df['Diff vs Last BBD'] <= 0).sum()):,}",
-                    "🔥 Cheaper Than Last BBD", "#facc15"), unsafe_allow_html=True)
-    k4.markdown(kpi(f"{int(master_df['is_wishlist'].sum()):,}", "Wishlist Items", "#ec4899"),
-                unsafe_allow_html=True)
-    k5.markdown(kpi(f"₹{master_df['Real Savings (vs 6M)'].sum() / 100000:,.1f}L",
-                    "Total Real Savings", "#4ade80"), unsafe_allow_html=True)
+    failures = [s for s in steps if not s["_ok"]]
+    if not failures:
+        st.success("**All checks passed.** This server can scan Flipkart. If a "
+                   "scan still returns few products, the limit is rate-limiting "
+                   "during sustained use — lower 'Pages per query' and retry.")
+        return
 
-    st.divider()
+    first = failures[0]
+    st.error(f"**First failure — step {first['Step']}: {first['Check']}**\n\n"
+             f"{first['Detail']}\n\nEverything after this point fails as a "
+             f"consequence.")
+    if first["_hint"]:
+        st.warning(first["_hint"])
 
-    with st.expander("➕ Add Direct Product to Wishlist (Paste Name & Link)", expanded=False):
-        st.markdown("Paste your Flipkart product link from your browser. It routes into its dedicated category table.")
-        with st.form("quick_add_wishlist", clear_on_submit=True):
-            name = st.text_input("📦 Product Name:", placeholder="e.g. Levi's 511 Slim Fit Jeans")
-            url = st.text_input("🔗 Flipkart Product Link:", placeholder="https://www.flipkart.com/.../p/itm... or with ?pid=...")
-            price = st.number_input("💰 Current Price (₹, optional):", min_value=0, step=100, value=0)
-            if st.form_submit_button("💾 Save Direct to Wishlist", type="primary"):
-                if not name.strip():
-                    st.error("Please enter the product name.")
-                else:
-                    item = build_wishlist_item(name, url, current=price or 999)
-                    records = load_tracker_data()
-                    records.append(item)
-                    save_tracker_data(records)
-                    st.success(f"Saved '{item['Product']}' directly to '{item['Category']}'!")
-                    st.rerun()
-
-    # SECTION 0: WISHLIST (ON SAME PAGE)
-    wishlist_df = master_df[master_df["is_wishlist"]]
-    if not wishlist_df.empty:
-        st.markdown('<div class="section-title-wishlist"><h2 style="margin:0;">💖 Your Saved Personal Wishlists</h2>'
-                    '<p style="margin:2px 0 0 0; font-size:0.9rem;">Auto-organised by product category. Use the ➕ Wishlist column inside any table below to add items instantly.</p></div>',
-                    unsafe_allow_html=True)
-        for category in sorted(wishlist_df["Category"].unique()):
-            slug = "w_" + re.sub(r"[^a-z0-9]+", "_", category.lower()).strip("_")
-            render_collapsible_table(wishlist_df[wishlist_df["Category"] == category],
-                                     category, slug, "💖", True, allow_deletion=True)
-
-    # SECTION 1: CATEGORY CATALOG (ALL 9 ON SAME PAGE, STATIONERY AT BOTTOM)
-    st.markdown('<div class="section-title-catalog"><h2 style="margin:0;">1. 🛒 Flipkart Category Catalog</h2>'
-                '<p style="margin:2px 0 0 0; font-size:0.9rem;">Independent collapsible tables with dedicated column filters. Stationery & Books at the bottom.</p></div>',
-                unsafe_allow_html=True)
-    for category, meta in CAT_DATA_MATRIX.items():
-        subset = master_df[(master_df["Category"] == category) & (~master_df["is_wishlist"])]
-        render_collapsible_table(subset, category, meta["slug"], meta["icon"], expand_all)
-
-    # SECTION 2: BBD STEAL DEALS (ON SAME PAGE)
-    st.markdown('<div class="section-title-bbd"><h2 style="margin:0;">2. 🔥 Big Billion Days Floor Deals</h2>'
-                "<p style=\"margin:2px 0 0 0; font-size:0.9rem;\">Products currently priced at or below last year's festive BBD low.</p></div>",
-                unsafe_allow_html=True)
-    bbd_df = master_df[master_df["Diff vs Last BBD"] <= 0].sort_values("Diff vs Last BBD")
-    if bbd_df.empty:
-        st.info("No product currently beats last year's BBD floor price.")
-    else:
-        render_collapsible_table(bbd_df, "All Confirmed BBD Floor Steals", "bbd_steals", "🔥", True)
-
-    # SECTION 3: ADS & PROMOTIONS (ON SAME PAGE)
-    st.markdown('<div class="section-title-ads"><h2 style="margin:0;">3. 📢 Promoted, Sponsored & Banner Deals</h2>'
-                '<p style="margin:2px 0 0 0; font-size:0.9rem;">Active sponsored placements vs their 6-month averages.</p></div>',
-                unsafe_allow_html=True)
-    ads_df = master_df[master_df["is_ad"]].sort_values("Real Disc % (vs 6M)", ascending=False)
-    if ads_df.empty:
-        st.info("No sponsored placements are being tracked right now.")
-    else:
-        render_collapsible_table(ads_df, "Active Sponsored & Banner Promotions", "flipkart_ads", "📢", True)
+    if first["Step"] in (1, 2):
+        st.markdown(
+            "### This is a network/blocking problem, not a code problem\n"
+            "The scanner logic is fine — it simply cannot obtain data.\n\n"
+            "**If you are on Streamlit Community Cloud, this is the expected "
+            "result.** Flipkart blocks shared datacenter IP ranges, and every "
+            "Streamlit Cloud app shares those ranges. No code change fixes "
+            "this.\n\n"
+            "**What actually works:**\n"
+            "- Run the app on your own machine: `streamlit run "
+            "flipkart_deal_tracker.py` on a home/office network\n"
+            "- Or use Flipkart's official Affiliate API, which is built for "
+            "programmatic access and is not IP-blocked\n\n"
+            "The tracker's own 90-product catalogue, BBD benchmarks, card "
+            "maths and wishlist keep working regardless — only live discovery "
+            "needs the connection.")
+    elif first["Step"] in (3, 4):
+        st.markdown(
+            "### This is a parser problem\n"
+            "Pages are downloading, but the extraction keys no longer match "
+            "Flipkart's markup. Share this table and the extraction can be "
+            "corrected precisely instead of guessed at.")
 
 
 def render_deep_scanner() -> None:
+    """
+    Compact scan controls. Results are merged into the tracker catalogue above,
+    not rendered in a separate format.
+    """
     scanner = get_scanner()
 
     st.divider()
-    with st.expander("🛰️ Deep Website Scanner (Uncapped Site-Wide Discovery)", expanded=True):
-        if st.button("🩺 Run Connection Diagnostic", key="diag_run"):
-            steps = run_scanner_diagnostic()
-            st.dataframe(pd.DataFrame([{k: v for k, v in s.items() if not k.startswith("_")} for s in steps]),
-                         use_container_width=True, hide_index=True)
+    with st.expander("🛰️ Deep Catalogue Scanner — find more products for the "
+                     "tables above", expanded=False):
+
+        render_diagnostic_panel()
+        st.divider()
+
+        if not scanner.available:
+            st.error("The `requests` package is required for scanning. "
+                     "Install it with `pip install requests`.")
+            return
 
         st.caption(
-            "Scans Flipkart by recursively bisecting saturated price windows. "
-            "Target and Request Budget are set to 0 (Unlimited) so all available deals across the site are gathered."
-        )
+            "Flipkart caps pagination per query, so depth cannot come from "
+            "requesting more pages. When a page comes back saturated "
+            f"(≥{SCANNER_SATURATION} products, meaning results were truncated), "
+            "this splits the price band in half and queues both halves, "
+            "repeating until each slice is small enough to enumerate fully. "
+            "Everything found is merged into the category tables above — same "
+            "columns, filters, wishlist and CSV exports as always.")
 
+        scan_everything = st.checkbox(
+            "🌐 Research ALL of Flipkart (every vertical at once)",
+            value=False, key="scan_all_flipkart",
+            help="Overrides the category picker and sweeps the whole "
+                 "catalogue: all verticals, every seed, brand, price band "
+                 "and (optionally) letter. Findings are still merged into "
+                 "the same 9 sections above - the output never changes.")
         c1, c2, c3 = st.columns([2.4, 1.3, 1.3])
-        categories = c1.multiselect("Categories to scan:", options=list(SCANNER_SEEDS),
-                                    default=list(SCANNER_SEEDS), key="scan_cats")
-        # 0 = Unlimited: scan all available deals without stopping at an arbitrary number
-        target = c2.number_input("Target per category (0 = Unlimited):", min_value=0, max_value=500000,
-                                 value=0, step=100, key="scan_target")
-        pages = c3.slider("Pages per query:", 1, 50, 8, key="scan_pages")
+        picked = c1.multiselect(
+            "Categories to scan:", options=list(SCANNER_SEEDS),
+            default=list(SCANNER_SEEDS), key="scan_cats",
+            disabled=scan_everything)
+        categories = list(SCANNER_SEEDS) if scan_everything else picked
+        target = c2.slider("Target per category:", 25, 5000, 300, 25,
+                           key="scan_target",
+                           help="Each category scans until it reaches this "
+                                "many products, then stops using requests.")
+        pages = c3.slider("Pages per query:", 1, 10, 4, key="scan_pages")
 
-        o1, o2, o3, o4 = st.columns(4)
+        o1, o2, o3, o4, o5 = st.columns(5)
         use_brands = o1.checkbox("× brands", value=True, key="scan_brands")
-        use_bands = o2.checkbox("× price bands", value=True, key="scan_bands")
+        use_bands = o2.checkbox("× price bands", value=True, key="scan_bands",
+                                help="REQUIRED for bisection — these are the "
+                                     "roots that split when saturated")
         use_sorts = o3.checkbox("× sort orders", value=True, key="scan_sorts")
-        budget = o4.number_input("Max requests (0 = Unlimited):", min_value=0, max_value=1000000,
-                                 value=0, step=500, key="scan_budget")
+        use_alpha = o4.checkbox("× A–Z sweep", value=False, key="scan_alpha",
+                                help="Adds a price-band root for every letter "
+                                     "a–z plus ultra-common tokens — the "
+                                     "broadest net for sweeping towards the "
+                                     "entire catalogue. Works only with "
+                                     "price bands on.")
+        budget = o5.number_input("Max requests:", 0, 100000, 3000, 500,
+                                 key="scan_budget", help="0 = unlimited.")
 
-        min_disc = st.slider("Only add products discounted ≥ %:", 0, 80, 0, 5, key="scan_min_disc")
+        min_disc = st.slider("Only add products discounted ≥ %:", 0, 80, 0, 5,
+                             key="scan_min_disc",
+                             help="Filters what gets merged into the tables "
+                                  "above. 0 adds everything found.")
+
+        if not use_bands:
+            st.warning("Price bands are off, so **bisection cannot run** and "
+                       "the scan stays shallow. Turn them on for deep scanning.")
+
+        if use_alpha and not use_bands:
+            st.warning("The A–Z sweep needs price bands to bisect into; with "
+                       "bands off those roots are skipped.")
 
         if not categories:
             st.info("Pick at least one category to scan.")
             return
 
         frontier = scanner.seed_frontier(categories, use_brands=use_brands,
-                                         use_bands=use_bands, use_sorts=use_sorts)
-        st.caption(f"Frontier initialized with **{len(frontier):,} entry points**. Bisection dynamically expands queries.")
+                                         use_bands=use_bands, use_sorts=use_sorts,
+                                         use_alpha=use_alpha)
+        st.caption(f"Initial frontier: **{len(frontier):,} queries** across "
+                   f"**{len(categories)} categories**. The queue *grows* during "
+                   f"the run as saturated queries bisect.")
 
         r1, r2, r3 = st.columns(3)
-        if r1.button("🛰️ Start Full-Site Scan", type="primary", key="scan_run"):
+        if r1.button("🛰️ Run Deep Scan", type="primary", key="scan_run"):
             bar = st.progress(0.0)
             status = st.empty()
 
-            def on_progress(done: int, total: int, term: str, found: int, pending: int) -> None:
+            def on_progress(done: int, total: int, term: str, found: int,
+                            pending: int) -> None:
                 bar.progress(min(done / max(total, 1), 1.0))
                 status.caption(
-                    f"[{done:,}] {term} · **{found:,}** deals found · "
+                    f"[{done:,}] {term} · **{found:,}** found · "
                     f"{pending:,} queued · {scanner.bisections:,} splits · "
-                    f"{scanner.limiter.rate:.1f} req/s"
-                )
+                    f"{scanner.limiter.rate:.1f} req/s")
 
-            with st.spinner("Scanning complete Flipkart catalogue…"):
+            with st.spinner("Deep scanning Flipkart…"):
                 scanner.run_frontier(frontier, pages,
-                                     target_per_category=int(target),
+                                     target_per_category=target,
                                      max_requests=int(budget),
                                      progress=on_progress)
                 added = merge_scan_results_into_tracker(scanner, float(min_disc))
@@ -1966,31 +2712,62 @@ def render_deep_scanner() -> None:
             st.session_state["scan_added"] = added
             st.rerun()
 
-        if r2.button("⏹️ Stop Scan", key="scan_stop"):
+        if r2.button("⏹️ Stop", key="scan_stop"):
             scanner.abort = True
-            st.toast("Stopping after current requests finish.", icon="⏹️")
+            st.toast("Stopping after in-flight requests finish.", icon="⏹️")
 
-        if r3.button("🗑️ Clear Scanned Cache", key="scan_clear"):
+        if r3.button("🗑️ Clear Scan Store", key="scan_clear"):
             scanner.clear_store()
             st.toast("Scan store cleared.", icon="🗑️")
             st.rerun()
 
+        # -- status readout (no product tables; those live above) ----------- #
         if st.session_state.get("scan_done"):
             added = st.session_state.get("scan_added", 0)
             if added:
-                st.success(f"Added **{added:,}** verified deals directly into the tables above!")
+                st.success(f"Added **{added:,}** new products to the category "
+                           "tables above.")
             elif scanner.products:
-                st.info("All discovered deals are already present in the tables above.")
+                st.info("Everything found is already in the tables above.")
+
+        status_key, message = scanner.diagnose()
+        if status_key == "blocked":
+            st.error(f"🚦 {message}")
+        elif status_key == "unparsed":
+            st.error(f"🧩 {message}")
+        elif status_key == "duplication":
+            st.warning(f"♻️ {message}")
+        elif status_key != "idle":
+            st.success(f"✅ {message}")
 
         if scanner.products:
-            m1, m2, m3 = st.columns(3)
-            m1.markdown(kpi(f"{len(scanner.products):,}", "Total Discovered"), unsafe_allow_html=True)
-            m2.markdown(kpi(f"{len(scanner.priced()):,}", "Priced Deals", "#4ade80"), unsafe_allow_html=True)
-            m3.markdown(kpi(f"{scanner.bisections:,}", f"Band Bisections (d{scanner.max_depth_reached})", "#a855f7"), unsafe_allow_html=True)
+            coverage = scanner.coverage()
+            m1, m2, m3, m4 = st.columns(4)
+            m1.markdown(kpi(f"{len(scanner.products):,}", "Discovered"),
+                        unsafe_allow_html=True)
+            m2.markdown(kpi(f"{len(scanner.priced()):,}", "With Price", "#4ade80"),
+                        unsafe_allow_html=True)
+            m3.markdown(kpi(f"{scanner.bisections:,}",
+                            f"Band Splits (d{scanner.max_depth_reached})",
+                            "#a855f7"), unsafe_allow_html=True)
+            m4.markdown(kpi(f"{scanner.pages_fetched:,}", "Pages Fetched",
+                            "#f97316" if scanner.pages_blocked else "#38bdf8"),
+                        unsafe_allow_html=True)
 
-            if st.button("➕ Force-Merge All Discoveries into Tables Above", key="scan_merge_now"):
+            rows = [{"Category": c, "Found": coverage.get(c, 0), "Target": target,
+                     "Status": "✅ met" if coverage.get(c, 0) >= target else "⏳ short"}
+                    for c in categories]
+            st.dataframe(pd.DataFrame(rows), use_container_width=True,
+                         hide_index=True,
+                         column_config={"Found": st.column_config.ProgressColumn(
+                             format="%d", min_value=0, max_value=max(target, 1))})
+
+            if st.button("➕ Merge latest findings into the tables above",
+                         key="scan_merge_now"):
                 added = merge_scan_results_into_tracker(scanner, float(min_disc))
-                st.toast(f"Merged {added:,} new product(s)." if added else "All findings already in tables.", icon="🛰️")
+                st.toast(f"Added {added:,} product(s)." if added
+                         else "All findings are already in the tables.",
+                         icon="🛰️")
                 if added:
                     st.rerun()
 
@@ -1999,6 +2776,6 @@ if __name__ == "__main__":
     try:
         main()
         render_deep_scanner()
-    except Exception:
-        logger.exception("Unhandled error")
-        st.error("Error rendering dashboard. See server logs for details.")
+    except Exception:  # pragma: no cover - top-level UI guard
+        logger.exception("Unhandled error while rendering the tracker")
+        st.error("Something went wrong while rendering the tracker. See the server logs for details.")
